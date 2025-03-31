@@ -13,8 +13,9 @@ class LitModule(pl.LightningModule):
     def __init__(self, full_model, loss_fn, lit_config=LitConfig()):
         super().__init__()
         self.full_model = full_model
-        self.model = full_model.model
-        self.guide = full_model.guide
+        self.loss_fn = loss_fn
+        self.model = loss_fn.model
+        self.guide = loss_fn.guide
     
         self.lr = lit_config.lr
         self.weight_decay = lit_config.weight_decay
@@ -23,7 +24,6 @@ class LitModule(pl.LightningModule):
         self.weight_l1 = lit_config.weight_l1
         
         self.predictive = Predictive(self.model, guide=self.guide, num_samples=1)
-        self.loss_fn = loss_fn
     
     def forward(self, *args):
         return self.predictive(*args)
