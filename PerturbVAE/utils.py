@@ -6,6 +6,7 @@ class HyperparamConfig:
   latent_rank: int= 10
   n_conditions: int = 5
   expert_dim: int = 16
+  cond_latent_dim: int = 16
   c_embed_dim: int = 64
   p_embed_dim: int = 64
   hidden_dims: list = [128,]
