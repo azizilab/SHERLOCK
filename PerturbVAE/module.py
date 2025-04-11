@@ -10,7 +10,7 @@ class Dense_NN(nn.Module):
         out_dims,
         activation=nn.GELU(),
         add_dropout=False,
-        dropout_p=0.5
+        dropout_p=0.5,
     ):
         super().__init__()
 
@@ -46,7 +46,7 @@ class Dense_NN(nn.Module):
         if len(self.param_dims) == 1:
             return H
         else:
-            return torch.split(H, self.param_dims, dim=1)
+            return torch.split(H, self.param_dims, dim=-1)
 
 # MoE to learn gene grouping. One expert per latent dim, agg over genes
 class MoE_Encoder(nn.Module):

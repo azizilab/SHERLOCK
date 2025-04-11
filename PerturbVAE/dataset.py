@@ -12,6 +12,7 @@ class PerturbDataset(Dataset):
             anndata: AnnData object containing the data matrix (X) and metadata (obs).
         """
         self.X = anndata.X.toarray() if hasattr(anndata.X, "toarray") else anndata.X
+        self.X = self.X.astype(np.float32)
 
         # Extract perturbation (P) and condition (C) from obs
         self.P = anndata.obs['top_sg'].values

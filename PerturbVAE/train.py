@@ -25,6 +25,11 @@ class LitModule(pl.LightningModule):
         
         self.predictive = Predictive(self.model, guide=self.guide, num_samples=1)
     
+    def get_all_parameters(self):
+        #torch_params = list(self.full_model.parameters())
+        pyro_params = list(pyro.get_param_store().values())
+        return pyro.get_param_store().named_parameters()
+    
     def forward(self, *args):
         return self.predictive(*args)
     
@@ -38,7 +43,7 @@ class LitModule(pl.LightningModule):
     
     # linear kernel HSIC
     def HSIC_reg(self, x, y):
-        N = x.shape(0)
+        N = x.shape[0]
         K = x @ x.T
         L = y @ y.T
         H = torch.eye(N, device=x.device) - (1.0/N) * torch.ones(N, N, device=x.device)
@@ -52,9 +57,10 @@ class LitModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         elbo_loss = self.loss_fn(*batch)
         reg_div = self.weight_div * self.diversity_reg(self.full_model.z_enc.group_logits)
-        reg_hsic = self.HSIC_reg(self.full_model.lin_, self.full_model.nonlin_)
-        reg_l1 = self.weight_l1 * (self.sparsity_reg(self.full_model.A) + self.sparsity_reg(self.full_model.B) + self.sparsity_reg(self.full_model.Q))
-        reg = reg_div + reg_hsic + reg_l1
+        #reg_hsic = self.HSIC_reg(self.full_model.lin_, self.full_model.nonlin_)
+        reg_hsic = 0
+        reg_l1 = self.weight_l1 * (self.sparsity_reg(self.full_model.A) + self.sparsity_reg(self.full_model.B)) #+ self.sparsity_reg(self.full_model.Q))
+        reg = reg_div + reg_l1 + reg_hsic
         loss = elbo_loss + reg 
         self.log("train_loss", loss)
         self.log("train_elbo", elbo_loss)
@@ -67,7 +73,8 @@ class LitModule(pl.LightningModule):
         pass
         
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.loss_fn.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        all_params = self.get_all_parameters()
+        return torch.optim.AdamW(all_params, lr=self.lr, weight_decay=self.weight_decay)
 
 
 def train_(full_model, lit_config, train_dataloader, val_loader, seed=1234, project='bruh', trainer_config=TrainerConfig()):
@@ -77,11 +84,14 @@ def train_(full_model, lit_config, train_dataloader, val_loader, seed=1234, proj
     np.random.seed(seed)
     torch.manual_seed(seed)
     
+    full_model.to(full_model.device)
+    
     one_batch = next(iter(train_dataloader))
+    one_batch = [x.to(full_model.device) for x in one_batch]
     loss_fn = Trace_ELBO()(model=full_model.model, guide=full_model.guide)
-    lit_obj = LitModule(full_model, loss_fn=loss_fn, lit_config=lit_config)
     # run one batch to initialize params
     loss_fn(*one_batch)
+    lit_obj = LitModule(full_model, loss_fn=loss_fn, lit_config=lit_config)
     
     wandb_logger = WandbLogger(project=project, log_model=True)
     wandb.init()

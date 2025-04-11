@@ -14,7 +14,7 @@ class HyperparamConfig:
 class LitConfig:
   lr: float = 0.001
   weight_decay: float = 1e-4
-  weight_div: float = 1e-3
+  weight_div: float = 1e3
   weight_hsic: float = 1e-3
   weight_l1: float = 1e-3
 
