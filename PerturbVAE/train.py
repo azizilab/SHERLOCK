@@ -67,6 +67,13 @@ class LitModule(pl.LightningModule):
         self.log("train_diversity_reg", reg_div)
         self.log("train_hsic", reg_hsic)
         self.log("train_total_L1", reg_l1)
+
+        X_input = batch[0].to('cpu')
+        with torch.no_grad():
+            recon_mean = self.full_model.nb_logger
+            mse = torch.nn.functional.mse_loss(recon_mean, X_input)
+        self.log("train_mse", mse)
+
         return loss
     
     def validation_step(self, batch, batch_idx):
@@ -83,14 +90,20 @@ def train_(full_model, lit_config, train_dataloader, val_loader, seed=1234, proj
     pyro.set_rng_seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
     
-    full_model.to(full_model.device)
+    # full_model.to(full_model.device)
     
     one_batch = next(iter(train_dataloader))
-    one_batch = [x.to(full_model.device) for x in one_batch]
-    loss_fn = Trace_ELBO()(model=full_model.model, guide=full_model.guide)
+    # one_batch = [x.to(full_model.device) for x in one_batch]
+
     # run one batch to initialize params
+    full_model.device = torch.device('cpu')
+    loss_fn = Trace_ELBO()(model=full_model.model, guide=full_model.guide)
     loss_fn(*one_batch)
+
+    # move back to gpu
+    full_model.device = torch.device('cuda')
     lit_obj = LitModule(full_model, loss_fn=loss_fn, lit_config=lit_config)
     
     wandb_logger = WandbLogger(project=project, log_model=True)
