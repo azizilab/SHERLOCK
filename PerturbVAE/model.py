@@ -35,8 +35,6 @@ class PerturbVAE(nn.Module):
         self.beta = config.beta
         self.eps = 5.0e-3
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-        self.nb_logger = None
         
         # embedding layers
         self.emb_c = nn.Embedding(self.n_conditions, self.latent_dim)
@@ -50,7 +48,7 @@ class PerturbVAE(nn.Module):
         self.g_dec = Dense_NN(self.p_embed_dim, self.hidden_dims, [1] * 2)
         self.g_enc = Dense_NN(self.n_genes + self.n_modules + self.latent_dim, self.hidden_dims, [self.latent_dim] * 2)
 
-        self.module_z_encoder = Dense_NN(self.n_genes, self.hidden_dims, [self.n_modules] * 2)
+        self.module_z_encoder = Dense_NN(self.n_genes+self.latent_dim, self.hidden_dims, [self.n_modules] * 2)
         self.module_z0_encoder = Dense_NN(self.n_genes+self.latent_dim, self.hidden_dims, [self.n_modules] * 2)
         
         # graphs
@@ -141,7 +139,6 @@ class PerturbVAE(nn.Module):
         logits = (x_mu+EPS).log() - (theta+EPS).log()
 
         nb_dist = dist.NegativeBinomial(total_count=theta, logits=logits)
-        self.nb_logger = nb_dist.mean.to("cpu").detach()
         pyro.sample("X", nb_dist.to_event(), obs=X)
 
     
@@ -167,9 +164,12 @@ class PerturbVAE(nn.Module):
             pyro.sample("z0", dist.Normal(z0_mean, torch.exp(z0_logvar)).to_event(0))
 
             # q(z|x)
-            z_mean, z_logvar = self.module_z_encoder(x) 
+            z_mean, z_logvar = self.module_z_encoder(torch.cat([x, E_p], dim=-1)) # (b, n_modules)
             z = pyro.sample("z", dist.Normal(z_mean, torch.exp(z_logvar)).to_event(0)) # (b, n_modules)
         
+            # categorial z to perturbation label
+            
+
             # q(rho|x, z, p)
             with pyro.plate("pertubations", self.n_perturb, dim=-1), poutine.scale(scale=self.beta):
 
