@@ -62,6 +62,8 @@ class PerturbVAE(nn.Module):
         self.phi = nn.GELU()
         self.psi = Dense_NN(self.n_perturb, self.hidden_dims, [self.n_modules], activation=activation)
         
+        self.pertubation_head = Dense_NN(self.n_modules, self.hidden_dims, [self.n_conditions], activation=activation)
+
         # learned embeddings
         self.lin_ = None
         self.nonlin_ = None
@@ -115,23 +117,23 @@ class PerturbVAE(nn.Module):
 
         
         with pyro.plate("cells", len(X), dim=-2):
-            with pyro.plate("pertubations", self.n_perturb, dim=-1):
-                rho = pyro.sample("rho", dist.Normal(rho_mean, rho_var).to_event(1)) # B x n_perturb x latent_dim
+            # with pyro.plate("pertubations", self.n_perturb, dim=-1):
+            #     rho = pyro.sample("rho", dist.Normal(rho_mean, rho_var).to_event(1)) # B x n_perturb x latent_dim
                             
             # control cells
-            z_0 = pyro.sample("z0", dist.Normal(z0_mean[C], z0_var[C]).to_event(0)) # B x n_modules
+            z_0 = pyro.sample("z0", dist.Normal(torch.zeros([X.size(0), self.n_modules], device=self.device), torch.ones([X.size(0), self.n_modules], device=self.device)).to_event(0)) # B x n_modules
             
             # perturbed cells
-            lin_shift, nonlin_shift = self.perturbation_effect(rho)
-            self.lin_ = lin_shift
-            self.nonlin_ = nonlin_shift
-            z_mean = z_0 + lin_shift + nonlin_shift
-            G_z = self.A @ self.A.T
+            # lin_shift, nonlin_shift = self.perturbation_effect(rho)
+            # self.lin_ = lin_shift
+            # self.nonlin_ = nonlin_shift
+            # z_mean = z_0 + lin_shift + nonlin_shift
+            # G_z = self.A @ self.A.T
             #G_z_norm = self.normalize_adj(G_z)
-            z_mean = z_mean + F.gelu(z_mean @ G_z) # graph conv with residual 
-            z = pyro.sample("z", dist.Normal(z_mean, z_var).to_event(0))
+            # z_mean = z_mean #+ F.gelu(z_mean @ G_z) # graph conv with residual 
+            # z = pyro.sample("z", dist.Normal(z_mean, z_var).to_event(0))
     
-        mu = self.z_dec(z)
+        mu = self.z_dec(z_0)
 
         mu = torch.softmax(mu, dim=-1)
         x_mu = l * mu
@@ -164,21 +166,21 @@ class PerturbVAE(nn.Module):
             pyro.sample("z0", dist.Normal(z0_mean, torch.exp(z0_logvar)).to_event(0))
 
             # q(z|x)
-            z_mean, z_logvar = self.module_z_encoder(torch.cat([x, E_p], dim=-1)) # (b, n_modules)
-            z = pyro.sample("z", dist.Normal(z_mean, torch.exp(z_logvar)).to_event(0)) # (b, n_modules)
+            # z_mean, z_logvar = self.module_z_encoder(torch.cat([x, E_p], dim=-1)) # (b, n_modules)
+            # z = pyro.sample("z", dist.Normal(z_mean, torch.exp(z_logvar)).to_event(0)) # (b, n_modules)
         
             # categorial z to perturbation label
             
 
             # q(rho|x, z, p)
-            with pyro.plate("pertubations", self.n_perturb, dim=-1), poutine.scale(scale=self.beta):
+            # with pyro.plate("pertubations", self.n_perturb, dim=-1), poutine.scale(scale=self.beta):
 
-                # Expand x and z along a new dimension corresponding to perturbations.
-                x_expanded = x.unsqueeze(1).expand(len(X), self.n_perturb, x.size(-1))
-                z_expanded = z.unsqueeze(1).expand(len(X), self.n_perturb, z.size(-1))
+            #     # Expand x and z along a new dimension corresponding to perturbations.
+            #     x_expanded = x.unsqueeze(1).expand(len(X), self.n_perturb, x.size(-1))
+            #     z_expanded = z.unsqueeze(1).expand(len(X), self.n_perturb, z.size(-1))
 
-                # The result will be of shape: [batch, n_perturb, n_genes + n_modules + p_embed_dim]
-                x_rho = torch.cat([x_expanded, z_expanded, E_all], dim=-1)
+            #     # The result will be of shape: [batch, n_perturb, n_genes + n_modules + p_embed_dim]
+            #     x_rho = torch.cat([x_expanded, z_expanded, E_all], dim=-1)
 
-                rho_mean, rho_logvar = self.g_enc(x_rho) 
-                pyro.sample("rho", dist.Normal(rho_mean, torch.exp(rho_logvar)).to_event(1)) # (b, n_perturb, latent_dim)
+            #     rho_mean, rho_logvar = self.g_enc(x_rho) 
+            #     pyro.sample("rho", dist.Normal(rho_mean, torch.exp(rho_logvar)).to_event(1)) # (b, n_perturb, latent_dim)

@@ -66,6 +66,10 @@ class LitModule(pl.LightningModule):
 
         elbo_loss = - (model_trace.log_prob_sum() -
                        guide_trace.log_prob_sum()) / len(X)
+        
+        z = guide_trace.nodes["z0"]["value"]
+        logits = self.full_model.pertubation_head(z)
+        cls_loss = F.cross_entropy(logits, C)
 
         # elbo_loss = self.loss_fn(*batch)
         # reg_div = self.weight_div * self.diversity_reg(self.full_model.z_enc.group_logits)
@@ -74,14 +78,15 @@ class LitModule(pl.LightningModule):
         reg_l1 = self.weight_l1 * (self.sparsity_reg(self.full_model.A) + self.sparsity_reg(self.full_model.B)) #+ self.sparsity_reg(self.full_model.Q))
         # reg = reg_div + reg_l1 + reg_hsic
         reg = reg_l1
-        loss = elbo_loss + reg 
+        loss = elbo_loss + reg + cls_loss
         self.log("train_loss", loss)
         self.log("train_elbo", elbo_loss)
         # self.log("train_diversity_reg", reg_div)
         # self.log("train_hsic", reg_hsic)
         self.log("train_total_L1", reg_l1)
+        self.log("train_cls_loss", cls_loss)
 
-        z = guide_trace.nodes["z"]["value"]
+        
         mu = self.full_model.z_dec(z)
 
         l = X.sum(axis=-1, keepdim=True)
