@@ -151,14 +151,15 @@ class VAE(nn.Module):
             pyro.sample("p_label",
                 dist.Categorical(logits=logits_p),
                 obs=p.long())                  
-
-            logits_c = self.z0_prediction_head(z0)      
-            pyro.sample("c_label",
-                dist.Categorical(logits=logits_c),
-                obs=c.long())  
             
-            ll = dist.Categorical(logits=logits_p).log_prob(p) + dist.Categorical(logits=logits_c).log_prob(c)
-            pyro.factor("classification_loss", -ll.mean())
+            T = 5.0
+            CE_p  = F.cross_entropy(logits_p / T, p.long(), reduction="sum")
+            pyro.factor("cls_p", -CE_p)
+
+            center = pyro.param("perturb_centers",
+                                torch.zeros(self.perturbs, self.latent_dim, device=self.device))
+            loss_ctr = ((z - center[p])**2).sum(1)
+            pyro.factor("center_loss", -1e-2 * loss_ctr.sum())  
             
     def guide(self, x, p, c):
         pyro.module("z_encoder", self.z_encoder)
