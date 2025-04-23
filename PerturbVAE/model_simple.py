@@ -8,7 +8,7 @@ from einops import rearrange
 
 # Define the VAE model
 class VAE(nn.Module):
-    def __init__(self, input_dim, latent_dim, perturbs, conds, beta):
+    def __init__(self, input_dim, latent_dim, perturbs, conds, beta, temperature):
         super(VAE, self).__init__()
 
         self.beta = beta
@@ -16,6 +16,7 @@ class VAE(nn.Module):
         self.latent_dim = latent_dim
         self.conds = conds
         self.perturbs = perturbs
+        self.temperature = temperature
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.p_emb = nn.Embedding(perturbs, latent_dim)
         self.c_emb_mu = nn.Embedding(conds, latent_dim)
@@ -152,12 +153,13 @@ class VAE(nn.Module):
                 dist.Categorical(logits=logits_p),
                 obs=p.long())                  
             
-            T = 5.0
+            T = self.temperature
             CE_p  = F.cross_entropy(logits_p / T, p.long(), reduction="sum")
             pyro.factor("cls_p", -CE_p)
 
-            center = pyro.param("perturb_centers",
-                                torch.zeros(self.perturbs, self.latent_dim, device=self.device))
+            #center = pyro.param("perturb_centers",
+                                #torch.zeros(self.perturbs, self.latent_dim, device=self.device))
+            center = rho_single.detach()
             loss_ctr = ((z - center[p])**2).sum(1)
             pyro.factor("center_loss", -1e-2 * loss_ctr.sum())  
             
