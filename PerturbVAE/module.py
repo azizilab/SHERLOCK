@@ -55,7 +55,8 @@ class GeneModuleEncoder(nn.Module):
                  hidden_dims: list[int],
                  activation=nn.LeakyReLU(),
                  add_dropout: bool = False,
-                 dropout_p: float = 0.5):
+                 dropout_p: float = 0.5,
+                 if_conditional: bool = True):
         super().__init__()
 
         self.module_dict = module_dict           # {module_id: [gene indices]}
@@ -80,18 +81,10 @@ class GeneModuleEncoder(nn.Module):
         ])
 
         # condition network
-        self.cond_net = Dense_NN(
-            input_dim=self.latent_dim,
-            hidden_dims=hidden_dims,
-            out_dims=[self.latent_dim, self.latent_dim],
-            activation=activation,
-            add_dropout=add_dropout,
-            dropout_p=dropout_p
-        )
+        self.conditional = if_conditional
 
     def forward(self, x):
         x_gene, x_cond = x[:, :self.num_genes], x[:, self.num_genes:]
-        assert x_cond.size(-1) == self.latent_dim
 
         z_mean, z_log_var = [], []
 
@@ -107,12 +100,14 @@ class GeneModuleEncoder(nn.Module):
         z_mean = torch.cat(z_mean, dim=-1)   # (B, latent_dim)
         z_log_var = torch.cat(z_log_var, dim=-1)
 
-        # condition branch
-        mu_c, logvar_c = self.cond_net(x_cond)
-
         # fuse gene & condition information
+        if self.conditional:
+            mu_c = x_cond
+        else:
+            mu_c = torch.zeros_like(z_mean)
+            
         z_mean = z_mean + mu_c
-        z_log_var = z_log_var + logvar_c
+        z_log_var = z_log_var
         return z_mean, z_log_var
 
         

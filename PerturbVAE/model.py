@@ -13,7 +13,7 @@ from module import GeneModuleEncoder
 # Define the VAE model
 class VAE(nn.Module):
     def __init__(self, input_dim, latent_dim, perturbs, conds, 
-                 beta, temperature, module_dict, hidden_dims=[512,]):
+                 beta, temperature, module_dict, hidden_dims=[16,]):
         super(VAE, self).__init__()
 
         self.beta = beta
@@ -33,40 +33,30 @@ class VAE(nn.Module):
         self.z_encoder = GeneModuleEncoder(
             num_genes=input_dim,
             module_dict=module_dict,
-            hidden_dims=hidden_dims
+            hidden_dims=hidden_dims,
+            if_conditional=True
         )
 
         # Encoder: q(z0|x,c)
         self.z0_encoder = GeneModuleEncoder(
             num_genes=input_dim,
             module_dict=module_dict,
-            hidden_dims=hidden_dims
+            hidden_dims=hidden_dims,
+            if_conditional=True
         )
 
         # Decoder: p(x|z)
         self.z_decoder = nn.Sequential(
-            nn.Linear(latent_dim, 512),
+            nn.Linear(latent_dim, 128),
             nn.LeakyReLU(),
-            nn.Linear(512, 512),
-            nn.LeakyReLU(),
-            nn.Linear(512, input_dim),
+            nn.Linear(128, input_dim),
         )
         
         # classification heads
         self.z_prediction_head = nn.Sequential(
-            nn.Linear(latent_dim, 512),
-            nn.LeakyReLU(),
-            nn.Linear(512, 512),
-            nn.LeakyReLU(),
-            nn.Linear(512, perturbs)
-        )
-        
-        self.z0_prediction_head = nn.Sequential(
-            nn.Linear(latent_dim, 512),
-            nn.LeakyReLU(),
-            nn.Linear(512, 512),
-            nn.LeakyReLU(),
-            nn.Linear(512, perturbs)
+            nn.Linear(latent_dim, perturbs),
+            #nn.LeakyReLU(),
+            #nn.Linear(128, perturbs),
         )
         
         
@@ -75,6 +65,12 @@ class VAE(nn.Module):
         self.phi = nn.LeakyReLU()
 
         self.rho_dec = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim), 
+            nn.LeakyReLU(),
+            nn.Linear(latent_dim, latent_dim)
+        )
+        
+        self.rho_enc = nn.Sequential(
             nn.Linear(latent_dim, latent_dim), 
             nn.LeakyReLU(),
             nn.Linear(latent_dim, latent_dim)
@@ -117,20 +113,14 @@ class VAE(nn.Module):
             constraint=constraints.positive
         ).to(self.device)
         
-        loc = pyro.param("rho_loc", torch.zeros(self.perturbs, self.latent_dim, device=self.device))
-        factor = pyro.param("rho_factor", 0.01*torch.randn(self.perturbs, self.latent_dim, self.latent_dim//2, device=self.device))
-        diag = pyro.param("rho_diag",   0.1*torch.ones(self.perturbs, self.latent_dim, device=self.device), constraint=constraints.positive)    
-        
-        # rho_single = pyro.sample(
-        #             "rho",                       
-        #             dist.LowRankMultivariateNormal(loc, factor, diag**2).to_event(1)
-        #             )
 
         with pyro.plate("perturbations", self.perturbs):
             rho_single = pyro.sample(
                         "rho",                       
-                        dist.Normal(loc, torch.ones_like(loc)).to_event(1)
+                        dist.Normal(torch.zeros([self.perturbs, self.latent_dim], device=self.device),
+                                    torch.ones([self.perturbs, self.latent_dim], device=self.device)).to_event(1)
                         ).to(self.device)
+            
         A = self.rho_dec(rho_single)/math.sqrt(self.latent_dim)  # (P,d)
 
         # --------- spike-and-slab gates ----------------------
@@ -195,14 +185,14 @@ class VAE(nn.Module):
             pyro.sample("X", nb.to_event(1), obs=x.float())
             
             
-            logits_p = self.z_prediction_head(z)       
-            pyro.sample("p_label",
-                dist.Categorical(logits=logits_p),
-                obs=p.long())                  
+            # logits_p = self.z_prediction_head(z)       
+            # pyro.sample("p_label",
+            #     dist.Categorical(logits=logits_p),
+            #     obs=p.long())                  
             
-            T = self.temperature
-            CE_p  = F.cross_entropy(logits_p / T, p.long(), reduction="sum")
-            pyro.factor("cls_p", -CE_p)
+            # T = self.temperature
+            # CE_p  = F.cross_entropy(logits_p / T, p.long(), reduction="sum")
+            # pyro.factor("cls_p", -CE_p)
             
             center = rho_single.detach()
             loss_ctr = ((z - center[p])**2).sum(1)
@@ -211,14 +201,8 @@ class VAE(nn.Module):
     def guide(self, x, p, c):
         pyro.module("VAE", self)
         
-        q_loc = pyro.param("q_rho_loc",   torch.zeros(self.perturbs, self.latent_dim, device=self.device))     # (P,d)
-        q_factor = pyro.param("q_rho_factor",0.01*torch.randn(self.perturbs, self.latent_dim, self.latent_dim//2, device=self.device))                                # (P,d,r)
-        q_diag = pyro.param("q_rho_diag",  torch.full((self.perturbs, self.latent_dim), 0.1, device=self.device, 
-                                                      requires_grad=True))
-        # pyro.sample(
-        #         "rho",
-        #         dist.LowRankMultivariateNormal(q_loc, q_factor, q_diag**2).to_event(1)
-        #     )
+        q_loc = self.rho_enc(self.p_emb.weight)
+        #q_loc = pyro.param("q_rho_loc",   torch.zeros(self.perturbs, self.latent_dim, device=self.device))     # (P,d)
         with pyro.plate("perturbations", self.perturbs):
             pyro.sample(
                     "rho",
@@ -236,6 +220,7 @@ class VAE(nn.Module):
 
         with pyro.plate("cells", x.size(0)):
             inp = torch.cat([x, self.p_emb(p)], dim=-1)
+            #inp = x
             z_mu, z_logvar = self.z_encoder(inp)
             std = (0.5 * z_logvar).exp()
             pyro.sample("z", dist.Normal(z_mu, std+1e-6).to_event(1))
