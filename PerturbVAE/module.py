@@ -48,34 +48,68 @@ class Dense_NN(nn.Module):
         else:
             return torch.split(H, self.param_dims, dim=-1)
 
-# MoE to learn gene grouping. One expert per latent dim, agg over genes
-class MoE_Encoder(nn.Module):
-    def __init__(self, input_dim, latent_dim, hidden_dims, 
-                 hidden_dim_one_expert=16, n_params=1):
+class GeneModuleEncoder(nn.Module):
+    def __init__(self,
+                 num_genes: int,
+                 module_dict: dict[int, list[int]],
+                 hidden_dims: list[int],
+                 activation=nn.LeakyReLU(),
+                 add_dropout: bool = False,
+                 dropout_p: float = 0.5,
+                 if_conditional: bool = True):
         super().__init__()
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
-        
-        self.group_logits = nn.Parameter(torch.randn(input_dim, latent_dim))
-        self.experts = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(1, hidden_dim_one_expert),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim_one_expert, 1)
-                ) for _ in range(latent_dim)
-            ]
-        )
-        self.net = Dense_NN(latent_dim, hidden_dims, 
-                            [latent_dim]*n_params, add_dropout=False)
-    
+
+        self.module_dict = module_dict           # {module_id: [gene indices]}
+        self.num_genes   = num_genes
+        self.latent_dim  = len(module_dict)      # one latent dim per module
+
+        # ── build a stable order and a reverse lookup ────────────────────────
+        self._module_order        = list(module_dict.keys())   # e.g. [3,7,2]
+        self._id2idx: dict[int,int] = {
+            mid: idx for idx, mid in enumerate(self._module_order)
+        }
+        self.networks = nn.ModuleList([
+            Dense_NN(
+                input_dim=len(module_dict[mid]),
+                hidden_dims=hidden_dims,
+                out_dims=[1, 1],
+                activation=activation,
+                add_dropout=add_dropout,
+                dropout_p=dropout_p
+            )
+            for mid in self._module_order
+        ])
+
+        # condition network
+        self.conditional = if_conditional
+
     def forward(self, x):
-        group_prob = F.softmax(self.group_logits, dim=-1) # (input, latent)
-        o_experts = torch.cat([expert(x.unsqueeze(-1).view(-1, 1)) for expert in self.experts], dim=-1)
-        o_experts = o_experts.view(-1, self.input_dim, self.latent_dim) #(batch, input, latent)
-        group_weights = torch.stack([group_prob] * x.shape[0], dim=0)
-        h = (group_weights * o_experts).sum(dim=1) # (batch, latent)
-        return self.net(h)
+        x_gene, x_cond = x[:, :self.num_genes], x[:, self.num_genes:]
+
+        z_mean, z_log_var = [], []
+
+        # iterate in the same fixed order
+        for mid in self._module_order:          
+            dims = self.module_dict[mid]        
+            sub_in = x_gene[:, dims]            
+            idx   = self._id2idx[mid]           
+            mu, logvar = self.networks[idx](sub_in)
+            z_mean.append(mu)
+            z_log_var.append(logvar)
+
+        z_mean = torch.cat(z_mean, dim=-1)   # (B, latent_dim)
+        z_log_var = torch.cat(z_log_var, dim=-1)
+
+        # fuse gene & condition information
+        if self.conditional:
+            mu_c = x_cond
+        else:
+            mu_c = torch.zeros_like(z_mean)
+            
+        z_mean = z_mean + mu_c
+        z_log_var = z_log_var
+        return z_mean, z_log_var
+
         
         
 

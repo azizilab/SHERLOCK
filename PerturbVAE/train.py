@@ -7,15 +7,15 @@ from utils import *
 import numpy as np
 from pytorch_lightning.loggers import WandbLogger
 import wandb
+import pyro.poutine as poutine
 
 
 class LitModule(pl.LightningModule):
-    def __init__(self, full_model, loss_fn, lit_config=LitConfig()):
+    def __init__(self, full_model, lit_config=LitConfig()):
         super().__init__()
         self.full_model = full_model
-        self.loss_fn = loss_fn
-        self.model = loss_fn.model
-        self.guide = loss_fn.guide
+        self.model = full_model.model
+        self.guide = full_model.guide
     
         self.lr = lit_config.lr
         self.weight_decay = lit_config.weight_decay
@@ -55,18 +55,48 @@ class LitModule(pl.LightningModule):
         return x.abs().sum()
     
     def training_step(self, batch, batch_idx):
-        elbo_loss = self.loss_fn(*batch)
-        reg_div = self.weight_div * self.diversity_reg(self.full_model.z_enc.group_logits)
+
+        X, P, C = batch
+
+        guide_trace = poutine.trace(self.full_model.guide).get_trace(X, P, C)
+
+        model_trace = poutine.trace(
+            poutine.replay(self.full_model.model, guide_trace)
+        ).get_trace(X, P, C)
+
+        elbo_loss = - (model_trace.log_prob_sum() -
+                       guide_trace.log_prob_sum()) / len(X)
+        
+        z = guide_trace.nodes["z0"]["value"]
+        logits = self.full_model.pertubation_head(z)
+        cls_loss = F.cross_entropy(logits, C)
+
+        # elbo_loss = self.loss_fn(*batch)
+        # reg_div = self.weight_div * self.diversity_reg(self.full_model.z_enc.group_logits)
         #reg_hsic = self.HSIC_reg(self.full_model.lin_, self.full_model.nonlin_)
-        reg_hsic = 0
+        # reg_hsic = 0
         reg_l1 = self.weight_l1 * (self.sparsity_reg(self.full_model.A) + self.sparsity_reg(self.full_model.B)) #+ self.sparsity_reg(self.full_model.Q))
-        reg = reg_div + reg_l1 + reg_hsic
-        loss = elbo_loss + reg 
+        # reg = reg_div + reg_l1 + reg_hsic
+        reg = reg_l1
+        loss = elbo_loss + reg + cls_loss
         self.log("train_loss", loss)
         self.log("train_elbo", elbo_loss)
-        self.log("train_diversity_reg", reg_div)
-        self.log("train_hsic", reg_hsic)
+        # self.log("train_diversity_reg", reg_div)
+        # self.log("train_hsic", reg_hsic)
         self.log("train_total_L1", reg_l1)
+        self.log("train_cls_loss", cls_loss)
+
+        
+        mu = self.full_model.z_dec(z)
+
+        l = X.sum(axis=-1, keepdim=True)
+        mu = torch.softmax(mu, dim=-1)
+        x_mu = l * mu
+
+        with torch.no_grad():
+            mse = torch.nn.functional.mse_loss(x_mu, X)
+        self.log("train_mse", mse)
+
         return loss
     
     def validation_step(self, batch, batch_idx):
@@ -83,15 +113,21 @@ def train_(full_model, lit_config, train_dataloader, val_loader, seed=1234, proj
     pyro.set_rng_seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
     
-    full_model.to(full_model.device)
+    # full_model.to(full_model.device)
     
     one_batch = next(iter(train_dataloader))
-    one_batch = [x.to(full_model.device) for x in one_batch]
-    loss_fn = Trace_ELBO()(model=full_model.model, guide=full_model.guide)
+    # one_batch = [x.to(full_model.device) for x in one_batch]
+
     # run one batch to initialize params
+    full_model.device = torch.device('cpu')
+    loss_fn = Trace_ELBO()(model=full_model.model, guide=full_model.guide)
     loss_fn(*one_batch)
-    lit_obj = LitModule(full_model, loss_fn=loss_fn, lit_config=lit_config)
+
+    # move back to gpu
+    full_model.device = torch.device('cuda')
+    lit_obj = LitModule(full_model, lit_config=lit_config)
     
     wandb_logger = WandbLogger(project=project, log_model=True)
     wandb.init()

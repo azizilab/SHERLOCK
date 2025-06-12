@@ -1,136 +1,231 @@
-import torch
-import torch.nn.functional as F
-import torch.nn as nn
-from torch.nn import Parameter
-from torch.distributions import constraints
 import pyro
-from pyro import distributions as dist
-import pyro.poutine as poutine
-from PerturbVAE.module import *
-from PerturbVAE.utils import *
+import torch
+import pyro.distributions as dist
+import torch.nn as nn
+from pyro.distributions import constraints
+import torch.nn.functional as F
+from einops import rearrange
+import math
+from module import GeneModuleEncoder
 
-class PerturbVAE(nn.Module):
-    def __init__(
-        self,
-        config = HyperparamConfig(),
-        activation=nn.GELU()
-    ):
-        super().__init__()
+        
 
-        self.config = config
-        self.n_genes = config.n_genes
-        self.n_conditions = config.n_conditions
-        self.n_perturb = config.n_perturb
-        self.n_modules = config.n_modules
-        self.cond_latent_dim = config.cond_latent_dim
-        self.latent_rank = config.latent_rank
-        self.hidden_dims = config.hidden_dims
-        self.expert_dim = config.expert_dim
-        self.c_embed_dim = config.c_embed_dim
-        self.p_embed_dim = config.p_embed_dim
-        self.beta = config.beta
-        self.eps = 5.0e-3
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+# Define the VAE model
+class VAE(nn.Module):
+    def __init__(self, input_dim, latent_dim, perturbs, conds, 
+                 beta, temperature, module_dict, hidden_dims=[16,]):
+        super(VAE, self).__init__()
+
+        self.beta = beta
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
+        self.conds = conds
+        self.perturbs = perturbs
+        self.temperature = temperature
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.p_emb = nn.Embedding(perturbs, latent_dim)
+        self.c_emb_mu = nn.Embedding(conds, latent_dim)
+        self.c_emb_logvar = nn.Embedding(conds, latent_dim)
+        self.module_dict = module_dict
+        self.hidden_dims = hidden_dims
+
+        # Encoder: q(z|x,p)
+        self.z_encoder = GeneModuleEncoder(
+            num_genes=input_dim,
+            module_dict=module_dict,
+            hidden_dims=hidden_dims,
+            if_conditional=True
+        )
+
+        # Encoder: q(z0|x,c)
+        self.z0_encoder = GeneModuleEncoder(
+            num_genes=input_dim,
+            module_dict=module_dict,
+            hidden_dims=hidden_dims,
+            if_conditional=True
+        )
+
+        # Decoder: p(x|z)
+        self.z_decoder = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            nn.LeakyReLU(),
+            nn.Linear(128, input_dim),
+        )
         
-        # embedding layers
-        self.emb_c = nn.Embedding(self.n_conditions, self.c_embed_dim, padding_idx=0)
-        self.emb_p = nn.Embedding(self.n_perturb, self.p_embed_dim, padding_idx=0)
+        # classification heads
+        self.z_prediction_head = nn.Sequential(
+            nn.Linear(latent_dim, perturbs),
+            #nn.LeakyReLU(),
+            #nn.Linear(128, perturbs),
+        )
         
-        # design mat networks
-        self.f_dec = Dense_NN(self.c_embed_dim, self.hidden_dims, [self.n_modules] * 2)
-        self.f_enc = Dense_NN(self.n_genes + self.n_modules + self.c_embed_dim, self.hidden_dims, [self.n_modules] * 2)
-        self.g_dec = Dense_NN(self.p_embed_dim, self.hidden_dims, [1] * 2)
-        self.g_enc = Dense_NN(self.n_genes + self.n_modules + self.p_embed_dim, self.hidden_dims, [self.n_perturb] * 2)
         
-        # graphs
-        self.A = nn.Parameter(torch.empty(self.n_modules, self.latent_rank))
-        self.B = nn.Parameter(torch.empty(self.n_perturb, self.n_modules))
-        #self.Q = nn.Parameter(torch.empty(self.n_perturb, self.n_perturb))
+        self.effect_pool = nn.Linear(self.latent_dim, 1)
+        self.B = nn.Parameter(torch.empty(perturbs, latent_dim))
+        self.phi = nn.LeakyReLU()
+
+        self.rho_dec = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim), 
+            nn.LeakyReLU(),
+            nn.Linear(latent_dim, latent_dim)
+        )
         
-        # z networks
-        self.z_enc = MoE_Encoder(self.n_genes, self.n_modules, self.hidden_dims, self.expert_dim, n_params=4)
-        self.z_dec = Dense_NN(self.n_modules, self.hidden_dims, [self.n_genes], activation=activation)
-        self.phi = nn.GELU()
-        self.psi = Dense_NN(self.n_perturb, self.hidden_dims, [self.n_modules], activation=activation)
+        self.rho_enc = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim), 
+            nn.LeakyReLU(),
+            nn.Linear(latent_dim, latent_dim)
+        )
+
+        p0 = torch.tensor(0.05)
+        logit_p_prior = torch.log(p0) - torch.log1p(-p0)
+        self.logit_p  = pyro.param(
+            "logit_p", logit_p_prior *
+            torch.ones(self.perturbs, self.latent_dim, device=self.device)
+        ) 
         
-        # learned embeddings
-        self.lin_ = None
-        self.nonlin_ = None
-        
-        self.reset_parameters()
-        
-    def reset_parameters(self):
-        nn.init.xavier_uniform_(self.A)
+
+        # Initialize weights
+        self._initialize_weights()
+
+        self.mu = None
+        self.total_counts = None
+    
+    def _initialize_weights(self):        
         nn.init.xavier_uniform_(self.B)
-        #nn.init.xavier_uniform_(self.Q)
         
-    def normalize_adj(self, G):
-        d = G.shape[0]
-        G = G + torch.eye(d, device=G.device)
-        D = G.sum(dim=1)
-        D_inv_sqrt = torch.diag(1.0 / torch.sqrt(D + 1e-8))
-        G_norm = D_inv_sqrt @ G @ D_inv_sqrt
-        return G_norm
-    
-    def perturbation_effect(self, rho):
-        lin_shift = self.phi(rho @ self.B)
-        #nonlin_shift = self.psi(rho * (rho @ self.Q))
-        return lin_shift, 0
+    def perturbation_effect(self, rho, p_idx):
+        rho_active = rho[torch.arange(rho.shape[0], device=rho.device), p_idx, :]       
+        B_active = self.B[p_idx, :]                                        
+        return self.phi(rho_active) * B_active   
+
+    def model(self, x, p, c):
+        pyro.module("VAE", self)
+
+        theta = pyro.param(
+            "theta",
+            torch.ones(self.input_dim, device=self.device) * 1.0,
+            constraint=constraints.positive,
+        ).to(self.device)
         
-    def model(self, X, P, C):
-        pyro.module("PerturbVAE", self)
-        theta = pyro.param("theta", torch.ones(self.n_genes, device=self.device)*0.3, constraint=constraints.positive)
-        E_c = self.emb_c(C).squeeze() #(batch, 1, d_condition)
-        embeddings = self.emb_p(P).unsqueeze(1)
-        E_p = torch.zeros(X.shape[0], self.n_perturb, self.p_embed_dim, device=self.device, requires_grad=True)
-        indices = P.unsqueeze(1).unsqueeze(2).expand(-1, 1, self.p_embed_dim)  
-        E_p = E_p.scatter(dim=1, index=indices, src=embeddings)
+        z_var = pyro.param(
+            "z_var", 
+            torch.ones(self.latent_dim, device=self.device)*0.1, 
+            constraint=constraints.positive
+        ).to(self.device)
         
-        with pyro.plate("cells", len(X)), poutine.scale(scale=1.0):
-            with poutine.scale(scale=self.beta):
-                z_var = pyro.param("z_var", torch.ones(self.n_modules, device=self.device)*0.1, constraint=constraints.positive)
-                z0_var = pyro.param("z0_var", torch.ones(self.n_modules, device=self.device)*0.1, constraint=constraints.positive)
-                kappa_mean, kappa_var = self.f_dec(E_c)
-                kappa = pyro.sample("kappa", dist.Normal(kappa_mean, F.softplus(kappa_var)).to_event(1))
-                rho_mean, rho_var = self.g_dec(E_p) #(batch, n_perturb, 1)
-                rho = pyro.sample("rho", dist.Normal(rho_mean.squeeze(), F.softplus(rho_var.squeeze())).to_event(1))
-                
-                # control cells
-                z_0 = pyro.sample("z0", dist.Normal(kappa, z0_var).to_event(1))
-                
-                # perturbed cells
-                lin_shift, nonlin_shift = self.perturbation_effect(rho)
-                self.lin_ = lin_shift
-                self.nonlin_ = nonlin_shift
-                z_mean = z_0 + lin_shift + nonlin_shift
-                G_z = self.A @ self.A.T
-                #G_z_norm = self.normalize_adj(G_z)
-                z_mean = z_mean + F.gelu(z_mean @ G_z) # graph conv with residual 
-                z = pyro.sample("z", dist.Normal(z_mean, z_var).to_event(1))
-        
-            x_mean = self.z_dec(z)
-            x_mean = F.relu(x_mean)
-            p = 1/(1 + x_mean * theta)
-            r = 1/theta
-            pyro.sample("X", dist.NegativeBinomial(total_count=r, probs=1-p).to_event(), obs=X)
-    
-    def guide(self, X, P, C):
-        pyro.module("PerturbVAE", self)
-        with pyro.plate("cells", len(X)), poutine.scale(scale=1.0):
-            x = torch.log1p(X)
-            z0_mean, z0_var, z_mean, z_var = self.z_enc(x) # Encoder with shared MoE layer but diff heads
-            z0 = pyro.sample("z0", dist.Normal(z0_mean, F.softplus(z0_var)).to_event(1))
-            z = pyro.sample("z", dist.Normal(z_mean, F.softplus(z_var)).to_event(1))
-            E_c_guide = self.emb_c(C).squeeze() # (b, d_c)
-            E_p_guide = self.emb_p(P).view(x.shape[0], -1) #(b, 2 * d_p)
+
+        with pyro.plate("perturbations", self.perturbs):
+            rho_single = pyro.sample(
+                        "rho",                       
+                        dist.Normal(torch.zeros([self.perturbs, self.latent_dim], device=self.device),
+                                    torch.ones([self.perturbs, self.latent_dim], device=self.device)).to_event(1)
+                        ).to(self.device)
             
-            with poutine.scale(scale=self.beta):
-                # x->z0->kappa
-                x_z0 = torch.cat([x, z0, E_c_guide], dim=-1) # q(k, z0|x, c) = q(k|z0, x, c)q(z0|x)
-                kappa_mean, kappa_var = self.f_enc(x_z0) 
-                pyro.sample("kappa", dist.Normal(kappa_mean, F.softplus(kappa_var)).to_event(1))
-                
-                #x->z->rho
-                x_z_p = torch.cat([x, z, E_p_guide], dim=-1) #q(rho, z|x, p) = q(rho|z, x, p)q(z|x)
-                rho_mean, rho_var = self.g_enc(x_z_p) 
-                pyro.sample("rho", dist.Normal(rho_mean, F.softplus(rho_var)).to_event(1)) 
+        A = self.rho_dec(rho_single)/math.sqrt(self.latent_dim)  # (P,d)
+
+        # --------- spike-and-slab gates ----------------------
+        with pyro.plate("gate_cols", self.latent_dim), pyro.plate("gate_rows", self.perturbs):
+            s_gate = pyro.sample(
+                "s_gate",
+                dist.RelaxedBernoulliStraightThrough(
+                    temperature=torch.tensor(self.temperature),
+                    logits=self.logit_p
+                )
+            ).to(self.device)  # (P,d)                                           
+
+        W = s_gate * A     
+
+        pyro.deterministic("W", W)             
+            
+        with pyro.plate("cells", x.size(0)):
+            # --- expert 1 -----------------------------------------------------------
+            z0_loc   = self.c_emb_mu(c)                                 # μ₁
+            z0_scale = (0.5 * self.c_emb_logvar(c)).exp()               # σ₁  (shape: [B,d])
+            z0_var   = z0_scale.pow(2)
+
+            pyro.sample("z0", dist.Normal(z0_loc, z0_scale).to_event(1))
+
+
+            # --- expert 2 -----------------------------------------------------------
+            lin_shift = W[p]                                            # μ₂  (shape: [B,d])
+            W_scale = pyro.param(
+                "W_scale",
+                torch.ones(self.latent_dim, device=self.device),
+                constraint=dist.constraints.positive,
+            )                                                           # σ₂  (shape: [d])
+            W_var = W_scale.pow(2)
+            
+     
+            # ------------------------------------------------------------------------
+            # product-of-experts: element-wise precision addition
+            precision = 1.0 / z0_var + 1.0 / W_var                    # [B,d]
+            z_var     = 1.0 / precision
+            z_loc     = z_var * (z0_loc / z0_var + lin_shift / W_var) # [B,d]
+            z_scale   = torch.sqrt(z_var)
+
+            z = pyro.sample("z", dist.Normal(z_loc, z_scale).to_event(1))
+
+            logits_gene = self.z_decoder(z)
+
+            mu = torch.softmax(logits_gene, dim=-1)
+
+            total_counts = x.sum(-1, keepdim=True)
+            # _dbg("total_counts", total_counts)
+
+            self.mu = mu.clone().detach().to('cpu').numpy()
+            self.total_counts = total_counts.clone().detach().to('cpu').numpy()
+
+            x_mu = total_counts * mu
+            # _dbg("x_mu", x_mu)
+
+            logits = (x_mu + 1e-6).log() - (theta + 1e-6).log()
+            # _dbg("logits", logits)
+
+            nb = dist.NegativeBinomial(total_count=theta, logits=logits)
+            pyro.sample("X", nb.to_event(1), obs=x.float())
+            
+            
+            # logits_p = self.z_prediction_head(z)       
+            # pyro.sample("p_label",
+            #     dist.Categorical(logits=logits_p),
+            #     obs=p.long())                  
+            
+            # T = self.temperature
+            # CE_p  = F.cross_entropy(logits_p / T, p.long(), reduction="sum")
+            # pyro.factor("cls_p", -CE_p)
+            
+            center = rho_single.detach()
+            loss_ctr = ((z - center[p])**2).sum(1)
+            pyro.factor("center_loss", -1e-2 * loss_ctr.sum())  
+            
+    def guide(self, x, p, c):
+        pyro.module("VAE", self)
+        
+        q_loc = self.rho_enc(self.p_emb.weight)
+        #q_loc = pyro.param("q_rho_loc",   torch.zeros(self.perturbs, self.latent_dim, device=self.device))     # (P,d)
+        with pyro.plate("perturbations", self.perturbs):
+            pyro.sample(
+                    "rho",
+                    dist.Normal(q_loc, torch.ones_like(q_loc)).to_event(1)
+                )
+            
+        with pyro.plate("gate_cols", self.latent_dim), pyro.plate("gate_rows", self.perturbs):
+            pyro.sample(
+                "s_gate",
+                dist.RelaxedBernoulliStraightThrough(
+                    temperature=torch.tensor(self.temperature),
+                    logits=self.logit_p                 
+                )
+            )
+
+        with pyro.plate("cells", x.size(0)):
+            inp = torch.cat([x, self.p_emb(p)], dim=-1)
+            #inp = x
+            z_mu, z_logvar = self.z_encoder(inp)
+            std = (0.5 * z_logvar).exp()
+            pyro.sample("z", dist.Normal(z_mu, std+1e-6).to_event(1))
+
+            inp = torch.cat([x, self.c_emb_mu(c)], dim=-1)
+            z0_mu, z0_logvar = self.z0_encoder(inp)
+            std = (0.5 * z0_logvar).exp()
+            pyro.sample("z0", dist.Normal(z0_mu, std+1e-6).to_event(1))
