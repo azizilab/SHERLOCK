@@ -13,7 +13,7 @@ from module import GeneModuleEncoder
 # Define the VAE model
 class VAE(nn.Module):
     def __init__(self, input_dim, latent_dim, perturbs, conds, 
-                 beta, temperature, module_dict, hidden_dims=[16,]):
+                 beta, temperature, module_dict, hidden_dims=[16,], center_coeff_init=1e-2):
         super(VAE, self).__init__()
 
         self.beta = beta
@@ -22,6 +22,7 @@ class VAE(nn.Module):
         self.conds = conds
         self.perturbs = perturbs
         self.temperature = temperature
+        self.center_coeff_init = center_coeff_init
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.p_emb = nn.Embedding(perturbs, latent_dim)
         self.c_emb_mu = nn.Embedding(conds, latent_dim)
@@ -86,9 +87,11 @@ class VAE(nn.Module):
 
         # Initialize weights
         self._initialize_weights()
-
+        
         self.mu = None
         self.total_counts = None
+        
+        self.register_buffer("center_coeff", torch.tensor(center_coeff_init))
     
     def _initialize_weights(self):        
         nn.init.xavier_uniform_(self.B)
@@ -196,7 +199,7 @@ class VAE(nn.Module):
             
             center = rho_single.detach()
             loss_ctr = ((z - center[p])**2).sum(1)
-            pyro.factor("center_loss", -1e-2 * loss_ctr.sum())  
+            pyro.factor("center_loss", -self.center_coeff * loss_ctr.sum())  
             
     def guide(self, x, p, c):
         pyro.module("VAE", self)
