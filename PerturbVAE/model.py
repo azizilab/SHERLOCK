@@ -124,31 +124,31 @@ class VAE(nn.Module):
                                             torch.ones_like(q_loc)).to_event(1))
 
         # q_pi  (shape P×d) -------------------------------------------
-        # q_pi = pyro.param(
-        #     "q_pi",
-        #     torch.full((self.perturbs, self.latent_dim), 0.05, device=self.device),
-        #     constraint=constraints.unit_interval,
-        # )
-        # tau = pyro.param("tau_temp", torch.tensor(1.0), constraint=constraints.positive)
-        # pyro.sample("pi",   dist.Delta(q_pi).to_event(2))
+        q_pi = pyro.param(
+            "q_pi",
+            torch.full((self.perturbs, self.latent_dim), 0.05, device=self.device),
+            constraint=constraints.unit_interval,
+        )
+        tau = pyro.param("tau_temp", torch.tensor(1.0), constraint=constraints.positive)
+        pi = pyro.sample("pi", dist.Delta(q_pi).to_event(2))
         
-        kappa = 2.0
-        a0 = 0.05 * kappa
-        b0 = 0.95 * kappa
+        # kappa = 2.0
+        # a0 = 0.05 * kappa
+        # b0 = 0.95 * kappa
 
-        q_alpha = pyro.param(
-            "q_alpha",
-            torch.full((self.perturbs, self.latent_dim), a0, device=self.device),
-            constraint=constraints.positive
-        )
-        q_beta  = pyro.param(
-            "q_beta",
-            torch.full((self.perturbs, self.latent_dim), b0, device=self.device),
-            constraint=constraints.positive
-        )
-        tau = pyro.param("tau_temp", torch.tensor(1.0, device=self.device),
-                        constraint=constraints.positive)
-        pi = pyro.sample("pi",   dist.Beta(q_alpha, q_beta).to_event(2))
+        # q_alpha = pyro.param(
+        #     "q_alpha",
+        #     torch.full((self.perturbs, self.latent_dim), a0, device=self.device),
+        #     constraint=constraints.positive
+        # )
+        # q_beta  = pyro.param(
+        #     "q_beta",
+        #     torch.full((self.perturbs, self.latent_dim), b0, device=self.device),
+        #     constraint=constraints.positive
+        # )
+        # tau = pyro.param("tau_temp", torch.tensor(1.0, device=self.device),
+        #                 constraint=constraints.positive)
+        # pi = pyro.sample("pi",   dist.Beta(q_alpha, q_beta).to_event(2))
         pyro.sample("s_gate", dist.RelaxedBernoulliStraightThrough(temperature=tau, probs=pi).to_event(2))
 
     
@@ -189,7 +189,6 @@ class VAE(nn.Module):
         )
 
         #permute variational probabilities of pi
-        store = pyro.get_param_store()
-        for name in ("q_alpha", "q_beta"):
-            if name in store:
-                store[name].copy_(store[name].index_select(-1, perm))
+        q_pi = pyro.param("q_pi")                       # (P,d)
+        pyro.get_param_store()["q_pi"] = q_pi.index_select(-1, perm)
+        

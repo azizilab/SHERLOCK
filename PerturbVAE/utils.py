@@ -292,10 +292,17 @@ def align_z_list(
     return (aligned, Ts) if return_transforms else aligned
 
 
+def get_q_pi() -> torch.Tensor:
+    store = pyro.get_param_store()
+    q_alpha = store["q_alpha"].detach()         # (P,d)
+    q_beta  = store["q_beta" ].detach()         # (P,d)
+    q_pi  = q_alpha / (q_alpha + q_beta)
+    return q_pi
+
 def get_bipartite_graph(mode : Literal["weighted", "threshold", "fdr"] = "weighted",
                         threshold : float = 0.5,
                         fdr_alpha : float = 0.05) -> torch.Tensor:
-    q_pi = pyro.param("q_pi").detach().cpu()      # (P, d)
+    q_pi = get_q_pi()     # (P, d)
     if mode == "weighted":
         return q_pi
 
