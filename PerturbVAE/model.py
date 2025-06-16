@@ -1,234 +1,195 @@
-import pyro
-import torch
+import pyro, torch, math, torch.nn.functional as F
 import pyro.distributions as dist
-import torch.nn as nn
 from pyro.distributions import constraints
-import torch.nn.functional as F
-from einops import rearrange
-import math
 from module import GeneModuleEncoder
+import torch.nn as nn
 
-        
-
-# Define the VAE model
 class VAE(nn.Module):
-    def __init__(self, input_dim, latent_dim, perturbs, conds, 
-                 beta, temperature, module_dict, hidden_dims=[16,], center_coeff_init=1e-2):
-        super(VAE, self).__init__()
-
-        self.beta = beta
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
-        self.conds = conds
-        self.perturbs = perturbs
-        self.temperature = temperature
+    # -----------------------------------------------------------------
+    def __init__(self, input_dim, latent_dim, perturbs, conds,
+                 beta, module_dict, hidden_dims=(16,),
+                 center_coeff_init=1e-2):
+        super().__init__()
+        self.input_dim   = input_dim
+        self.latent_dim  = latent_dim
+        self.perturbs    = perturbs
+        self.conds       = conds
+        self.beta        = beta
         self.center_coeff_init = center_coeff_init
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.p_emb = nn.Embedding(perturbs, latent_dim)
-        self.c_emb_mu = nn.Embedding(conds, latent_dim)
-        self.c_emb_logvar = nn.Embedding(conds, latent_dim)
-        self.module_dict = module_dict
-        self.hidden_dims = hidden_dims
+        self.device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Encoder: q(z|x,p)
-        self.z_encoder = GeneModuleEncoder(
-            num_genes=input_dim,
-            module_dict=module_dict,
-            hidden_dims=hidden_dims,
-            if_conditional=True
-        )
+        # ---- embeddings ---------------------------------------------
+        self.p_emb        = nn.Embedding(perturbs, latent_dim)
+        self.c_emb_mu     = nn.Embedding(conds,    latent_dim)
+        self.c_emb_logvar = nn.Embedding(conds,    latent_dim)
 
-        # Encoder: q(z0|x,c)
-        self.z0_encoder = GeneModuleEncoder(
-            num_genes=input_dim,
-            module_dict=module_dict,
-            hidden_dims=hidden_dims,
-            if_conditional=True
-        )
+        # ---- encoders / decoders ------------------------------------
+        self.z_encoder  = GeneModuleEncoder(input_dim, module_dict, hidden_dims)
+        self.z0_encoder = GeneModuleEncoder(input_dim, module_dict, hidden_dims)
 
-        # Decoder: p(x|z)
-        self.z_decoder = nn.Sequential(
-            nn.Linear(latent_dim, 128),
-            nn.LeakyReLU(),
-            nn.Linear(128, input_dim),
+        self.z_decoder  = nn.Sequential(
+            nn.Linear(latent_dim, 128), nn.LeakyReLU(),
+            nn.Linear(128, input_dim)
         )
-        
-        # classification heads
-        self.z_prediction_head = nn.Sequential(
-            nn.Linear(latent_dim, perturbs),
-            #nn.LeakyReLU(),
-            #nn.Linear(128, perturbs),
-        )
-        
-        
-        self.effect_pool = nn.Linear(self.latent_dim, 1)
-        self.B = nn.Parameter(torch.empty(perturbs, latent_dim))
-        self.phi = nn.LeakyReLU()
 
         self.rho_dec = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim), 
-            nn.LeakyReLU(),
-            nn.Linear(latent_dim, latent_dim)
+            nn.Linear(latent_dim, latent_dim), nn.LeakyReLU(),
+            nn.Linear(latent_dim, latent_dim), nn.Tanh()
         )
-        
         self.rho_enc = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim), 
-            nn.LeakyReLU(),
+            nn.Linear(latent_dim, latent_dim), nn.LeakyReLU(),
             nn.Linear(latent_dim, latent_dim)
         )
+        for m in self.rho_dec.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight); nn.init.zeros_(m.bias)
 
-        p0 = torch.tensor(0.05)
-        logit_p_prior = torch.log(p0) - torch.log1p(-p0)
-        self.logit_p  = pyro.param(
-            "logit_p", logit_p_prior *
-            torch.ones(self.perturbs, self.latent_dim, device=self.device)
-        ) 
-        
-
-        # Initialize weights
-        self._initialize_weights()
-        
-        self.mu = None
-        self.total_counts = None
-        
-        self.register_buffer("center_coeff", torch.tensor(center_coeff_init))
-    
-    def _initialize_weights(self):        
-        nn.init.xavier_uniform_(self.B)
-        
-    def perturbation_effect(self, rho, p_idx):
-        rho_active = rho[torch.arange(rho.shape[0], device=rho.device), p_idx, :]       
-        B_active = self.B[p_idx, :]                                        
-        return self.phi(rho_active) * B_active   
+        self.register_buffer("center_coeff",
+                             torch.tensor(center_coeff_init, dtype=torch.float32))
 
     def model(self, x, p, c):
         pyro.module("VAE", self)
 
-        theta = pyro.param(
-            "theta",
-            torch.ones(self.input_dim, device=self.device) * 1.0,
-            constraint=constraints.positive,
-        ).to(self.device)
-        
-        z_var = pyro.param(
-            "z_var", 
-            torch.ones(self.latent_dim, device=self.device)*0.1, 
-            constraint=constraints.positive
-        ).to(self.device)
-        
+        theta_uncon = pyro.param("theta_uncon",
+                                 torch.zeros(self.input_dim, device=self.device))
+        theta = F.softplus(theta_uncon) + 1e-3
 
+        # ρ prior
         with pyro.plate("perturbations", self.perturbs):
             rho_single = pyro.sample(
-                        "rho",                       
-                        dist.Normal(torch.zeros([self.perturbs, self.latent_dim], device=self.device),
-                                    torch.ones([self.perturbs, self.latent_dim], device=self.device)).to_event(1)
-                        ).to(self.device)
-            
-        A = self.rho_dec(rho_single)/math.sqrt(self.latent_dim)  # (P,d)
+                "rho",
+                dist.Normal(torch.zeros_like(self.p_emb.weight),
+                            torch.ones_like(self.p_emb.weight)).to_event(1)
+            )
+        A = self.rho_dec(rho_single) / math.sqrt(self.latent_dim)  # (P,d)
 
-        # --------- spike-and-slab gates ----------------------
-        with pyro.plate("gate_cols", self.latent_dim), pyro.plate("gate_rows", self.perturbs):
-            s_gate = pyro.sample(
-                "s_gate",
-                dist.RelaxedBernoulliStraightThrough(
-                    temperature=torch.tensor(self.temperature),
-                    logits=self.logit_p
-                )
-            ).to(self.device)  # (P,d)                                           
+        # Beta–Bernoulli gate  (shape P×d) ----------------------------
+        alpha = torch.tensor(2.0, device=self.device)   # broader prior
+        beta  = torch.tensor(8.0, device=self.device)
+        tau = pyro.param("tau_temp", torch.tensor(1.0), constraint=constraints.positive)
+    
+        pi = pyro.sample("pi", dist.Beta(alpha, beta).expand([self.perturbs, self.latent_dim]).to_event(2))          # (P,d)
+        s_gate = pyro.sample("s_gate", dist.RelaxedBernoulliStraightThrough(temperature=tau, probs=pi).to_event(2))
 
-        W = s_gate * A     
+        W = s_gate * A                                                 
+        pyro.deterministic("W", W)
 
-        pyro.deterministic("W", W)             
-            
+        # --- cell likelihood -----------------------------------------
         with pyro.plate("cells", x.size(0)):
-            # --- expert 1 -----------------------------------------------------------
-            z0_loc   = self.c_emb_mu(c)                                 # μ₁
-            z0_scale = (0.5 * self.c_emb_logvar(c)).exp()               # σ₁  (shape: [B,d])
+            z0_loc   = self.c_emb_mu(c)
+            z0_scale = (0.5 * self.c_emb_logvar(c)).exp()
+            z0 = pyro.sample("z0", dist.Normal(z0_loc, z0_scale).to_event(1))
+
+            lin_shift = W[p]                                           # (B,d)
+            W_scale   = pyro.param("W_scale",
+                                   torch.ones(self.latent_dim, device=self.device),
+                                   constraint=constraints.positive)
+            
             z0_var   = z0_scale.pow(2)
 
-            pyro.sample("z0", dist.Normal(z0_loc, z0_scale).to_event(1))
+            lin_shift = W[p]                                 # μ₂
+            W_scale   = pyro.param("W_scale",
+                                torch.ones(self.latent_dim, device=self.device),
+                                constraint=constraints.positive)
+            W_var = W_scale.pow(2)                           # σ₂²
 
-
-            # --- expert 2 -----------------------------------------------------------
-            lin_shift = W[p]                                            # μ₂  (shape: [B,d])
-            W_scale = pyro.param(
-                "W_scale",
-                torch.ones(self.latent_dim, device=self.device),
-                constraint=dist.constraints.positive,
-            )                                                           # σ₂  (shape: [d])
-            W_var = W_scale.pow(2)
-            
-     
-            # ------------------------------------------------------------------------
-            # product-of-experts: element-wise precision addition
-            precision = 1.0 / z0_var + 1.0 / W_var                    # [B,d]
+            # ----- product of experts ------------------------------------
+            precision = 1.0 / z0_var + 1.0 / W_var
             z_var     = 1.0 / precision
-            z_loc     = z_var * (z0_loc / z0_var + lin_shift / W_var) # [B,d]
-            z_scale   = torch.sqrt(z_var)
+            z_loc     = z_var * (z0_loc / z0_var + lin_shift / W_var)
 
-            z = pyro.sample("z", dist.Normal(z_loc, z_scale).to_event(1))
+            z = pyro.sample("z",
+                    dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1))
 
-            logits_gene = self.z_decoder(z)
-
+            logits_gene = self.z_decoder(z).clamp(-8., 8.)
             mu = torch.softmax(logits_gene, dim=-1)
+            total_counts = x.sum(-1, keepdim=True).clamp(min=1.)
+            logits_nb = (total_counts * mu + 1e-6).log() - theta.log()
+            pyro.sample("X",
+                        dist.NegativeBinomial(total_count=theta,
+                                              logits=logits_nb).to_event(1),
+                        obs=x.float())
 
-            total_counts = x.sum(-1, keepdim=True)
-            # _dbg("total_counts", total_counts)
+            # centre loss
+            ctr = ((z - rho_single[p].detach())**2).sum(1)
+            pyro.factor("center_loss", -self.center_coeff * ctr.sum())
 
-            self.mu = mu.clone().detach().to('cpu').numpy()
-            self.total_counts = total_counts.clone().detach().to('cpu').numpy()
-
-            x_mu = total_counts * mu
-            # _dbg("x_mu", x_mu)
-
-            logits = (x_mu + 1e-6).log() - (theta + 1e-6).log()
-            # _dbg("logits", logits)
-
-            nb = dist.NegativeBinomial(total_count=theta, logits=logits)
-            pyro.sample("X", nb.to_event(1), obs=x.float())
-            
-            
-            # logits_p = self.z_prediction_head(z)       
-            # pyro.sample("p_label",
-            #     dist.Categorical(logits=logits_p),
-            #     obs=p.long())                  
-            
-            # T = self.temperature
-            # CE_p  = F.cross_entropy(logits_p / T, p.long(), reduction="sum")
-            # pyro.factor("cls_p", -CE_p)
-            
-            center = rho_single.detach()
-            loss_ctr = ((z - center[p])**2).sum(1)
-            pyro.factor("center_loss", -self.center_coeff * loss_ctr.sum())  
-            
     def guide(self, x, p, c):
         pyro.module("VAE", self)
-        
+
+        # ρ posterior --------------------------------------------------
         q_loc = self.rho_enc(self.p_emb.weight)
-        #q_loc = pyro.param("q_rho_loc",   torch.zeros(self.perturbs, self.latent_dim, device=self.device))     # (P,d)
         with pyro.plate("perturbations", self.perturbs):
-            pyro.sample(
-                    "rho",
-                    dist.Normal(q_loc, torch.ones_like(q_loc)).to_event(1)
-                )
-            
-        with pyro.plate("gate_cols", self.latent_dim), pyro.plate("gate_rows", self.perturbs):
-            pyro.sample(
-                "s_gate",
-                dist.RelaxedBernoulliStraightThrough(
-                    temperature=torch.tensor(self.temperature),
-                    logits=self.logit_p                 
-                )
-            )
+            pyro.sample("rho", dist.Normal(q_loc,
+                                            torch.ones_like(q_loc)).to_event(1))
 
+        # q_pi  (shape P×d) -------------------------------------------
+        # q_pi = pyro.param(
+        #     "q_pi",
+        #     torch.full((self.perturbs, self.latent_dim), 0.05, device=self.device),
+        #     constraint=constraints.unit_interval,
+        # )
+        # tau = pyro.param("tau_temp", torch.tensor(1.0), constraint=constraints.positive)
+        # pyro.sample("pi",   dist.Delta(q_pi).to_event(2))
+        
+        kappa = 2.0
+        a0 = 0.05 * kappa
+        b0 = 0.95 * kappa
+
+        q_alpha = pyro.param(
+            "q_alpha",
+            torch.full((self.perturbs, self.latent_dim), a0, device=self.device),
+            constraint=constraints.positive
+        )
+        q_beta  = pyro.param(
+            "q_beta",
+            torch.full((self.perturbs, self.latent_dim), b0, device=self.device),
+            constraint=constraints.positive
+        )
+        tau = pyro.param("tau_temp", torch.tensor(1.0, device=self.device),
+                        constraint=constraints.positive)
+        pi = pyro.sample("pi",   dist.Beta(q_alpha, q_beta).to_event(2))
+        pyro.sample("s_gate", dist.RelaxedBernoulliStraightThrough(temperature=tau, probs=pi).to_event(2))
+
+    
+
+        # cell-wise factors -------------------------------------------
         with pyro.plate("cells", x.size(0)):
-            inp = torch.cat([x, self.p_emb(p)], dim=-1)
-            #inp = x
-            z_mu, z_logvar = self.z_encoder(inp)
-            std = (0.5 * z_logvar).exp()
-            pyro.sample("z", dist.Normal(z_mu, std+1e-6).to_event(1))
+            z_mu, z_logvar = self.z_encoder(torch.cat([x, self.p_emb(p)], dim=-1))
+            z_std = (0.5 * z_logvar).exp()
+            pyro.sample("z", dist.Normal(z_mu, z_std).to_event(1))
 
-            inp = torch.cat([x, self.c_emb_mu(c)], dim=-1)
-            z0_mu, z0_logvar = self.z0_encoder(inp)
-            std = (0.5 * z0_logvar).exp()
-            pyro.sample("z0", dist.Normal(z0_mu, std+1e-6).to_event(1))
+            z0_mu, z0_logvar = self.z0_encoder(torch.cat([x, self.c_emb_mu(c)], dim=-1))
+            z0_std = (0.5 * z0_logvar).exp()
+            pyro.sample("z0", dist.Normal(z0_mu, z0_std).to_event(1))
+
+    @torch.no_grad()
+    def canonicalise_columns(self):
+        """
+        Re-order every tensor that carries a latent dimension so that
+        latent‐dim `k` corresponds to the k-th smallest module‐ID in
+        `self.z_encoder._module_order`.
+        """
+        module_ids = torch.tensor(self.z_encoder._module_order,
+                                device=self.device)
+        _, perm = torch.sort(module_ids)                # ascending
+
+        def _permute_last(t: torch.Tensor):
+            return t.index_select(-1, perm)
+
+        # permute every parameter whose *last* axis is latent_dim
+        self.p_emb.weight.data        = _permute_last(self.p_emb.weight.data)
+        self.c_emb_mu.weight.data     = _permute_last(self.c_emb_mu.weight.data)
+        self.c_emb_logvar.weight.data = _permute_last(self.c_emb_logvar.weight.data)
+
+        # first Linear(d→d) inside rho_dec: permute rows AND columns
+        w0 = self.rho_dec[0].weight.data
+        self.rho_dec[0].weight.data = (
+            w0.index_select(0, perm).index_select(1, perm)
+        )
+
+        #permute variational probabilities of pi
+        store = pyro.get_param_store()
+        for name in ("q_alpha", "q_beta"):
+            if name in store:
+                store[name].copy_(store[name].index_select(-1, perm))

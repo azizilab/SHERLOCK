@@ -22,7 +22,11 @@ class VAETrainer:
         num_epochs: int = 10,
         init_coeff: float = 1e-2,
         final_coeff: float = 0.0,
+        tau_init: float = 1.0,
+        tau_end: float = 0.1,
+        tau_anneal_steps: Optional[int] = None,
         ramp_steps: Optional[int] = None,
+        verbose: bool = True,
         device: Optional[torch.device] = None,
         seed: int = 0,
     ):
@@ -31,6 +35,10 @@ class VAETrainer:
         self.num_epochs = num_epochs
         self.init_coeff = init_coeff
         self.final_coeff = final_coeff
+        self.tau_init  = tau_init
+        self.tau_end   = tau_end
+        self.tau_anneal_steps = tau_anneal_steps
+        self.verbose = verbose
 
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -66,18 +74,33 @@ class VAETrainer:
     def _to_numpy(t: torch.Tensor) -> np.ndarray:
         return t.detach().cpu().numpy()
 
-    def _update_center_coeff(self):
+    def _update_center_coeff_decay(self):
         """
         Linear decay: init_coeff  →  final_coeff over `self.ramp_steps` steps.
         """
         prog = min(self.global_step / self.ramp_steps, 1.0)  # 0 → 1
         coeff = self.init_coeff - (self.init_coeff - self.final_coeff) * prog
         self.vae.center_coeff.fill_(coeff)
+    
+    def _update_center_coeff_ramp(self):
+        """
+        Linearly ramps the center-loss coefficient *up* from `init_coeff`
+        to `final_coeff` over `self.ramp_steps` training steps.
+        """
+        prog  = min(self.global_step / self.ramp_steps, 1.0)          # 0 → 1
+        coeff = self.init_coeff + (self.final_coeff - self.init_coeff) * prog
+        self.vae.center_coeff.fill_(coeff)
+        
+    def _current_tau(self, step) -> float:
+        """Exponential decay: τ_t = max(τ_min, τ0 * exp(-k*t))."""
+        k = math.log(self.tau_init / self.tau_end) / self.tau_anneal_steps
+        return max(self.tau_end, self.tau_init * math.exp(-k * step))
+
 
     def fit(self):
         print(f"Training VAE on {self.device} …")
         dataset_size = len(self.dataloader.dataset)
-
+        step = 0
         for epoch in range(1, self.num_epochs + 1):
             epoch_loss = 0.0
             actuals, preds = [], []
@@ -94,8 +117,10 @@ class VAETrainer:
                 C = C.to(self.device, dtype=torch.long)
 
                 # ramp centre-loss coefficient BEFORE forward pass
-                self._update_center_coeff()
-
+                self._update_center_coeff_ramp()
+                tau_curr = self._current_tau(step) if self.tau_anneal_steps else self.tau_init
+                pyro.get_param_store()['tau_temp'] = torch.tensor(tau_curr, device=self.device)
+                step += 1
                 # one SVI step (forward+backward+optim)
                 batch_loss = self.svi.step(X, P, C)
                 epoch_loss += batch_loss
@@ -114,15 +139,18 @@ class VAETrainer:
                 actuals.append(self._to_numpy(X))
                 preds.append(self._to_numpy(x_mu))
 
+            self.vae.canonicalise_columns()
             actuals = np.concatenate(actuals, axis=0)
             preds   = np.concatenate(preds,   axis=0)
             r2      = r2_score(actuals.flatten(), preds.flatten())
             avg_loss = epoch_loss / dataset_size
 
             coeff_now = self.vae.center_coeff.item()
-            print(
-                f"[{time.strftime('%H:%M:%S')}] "
-                f"Epoch {epoch:02d} | "
-                f"ELBO per cell: {avg_loss:.4f} | "
-                f"R²: {r2:.4f} | λ_center: {coeff_now:.6f}"
-            )
+            if self.verbose:
+                print(
+                    f"Epoch {epoch:02d} | "
+                    f"ELBO per cell: {avg_loss:.4f} | "
+                    f"R²: {r2:.4f} | λ_center: {coeff_now:.6f}"
+                    f" | τ: {tau_curr:.4f}"
+                )
+        
