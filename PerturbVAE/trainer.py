@@ -10,6 +10,9 @@ import pyro, pyro.poutine as poutine
 from sklearn.metrics import r2_score
 from tqdm import tqdm
 from PerturbVAE.model import VAE
+from tqdm.auto import tqdm
+import torch.nn.functional as F
+
 
 
 class VAETrainer:
@@ -101,56 +104,86 @@ class VAETrainer:
         print(f"Training VAE on {self.device} …")
         dataset_size = len(self.dataloader.dataset)
         step = 0
-        for epoch in range(1, self.num_epochs + 1):
-            epoch_loss = 0.0
-            actuals, preds = [], []
 
-            # ---------------- mini-batches --------------------------------
-            for X, P, C in tqdm(
+        # ───────── outer progress bar over epochs ─────────
+        epoch_bar = tqdm(
+            range(1, self.num_epochs + 1),
+            desc="Epochs",
+            dynamic_ncols=True,
+        )
+
+        for epoch in epoch_bar:
+            epoch_loss = 0.0
+            preds, actuals = [], []
+
+            # ───── transient batch bar (cleared each epoch) ─────
+            batch_bar = tqdm(
                 self.dataloader,
-                desc=f"Epoch {epoch}/{self.num_epochs}",
+                desc=f"Epoch {epoch}",
                 leave=False,
-            ):
-                # send data to the right device
+                position=1,
+                dynamic_ncols=True,
+            )
+
+            for X, P, C in batch_bar:
                 X = X.to(self.device, dtype=torch.float32)
                 P = P.to(self.device, dtype=torch.long)
                 C = C.to(self.device, dtype=torch.long)
 
-                # ramp centre-loss coefficient BEFORE forward pass
+                # anneal coeffs & temp
                 self._update_center_coeff_ramp()
                 tau_curr = self._current_tau(step) if self.tau_anneal_steps else self.tau_init
-                pyro.get_param_store()['tau_temp'] = torch.tensor(tau_curr, device=self.device)
+                pyro.get_param_store()["tau_temp"] = torch.tensor(tau_curr, device=self.device)
                 step += 1
-                # one SVI step (forward+backward+optim)
+
+                # optimisation step
                 batch_loss = self.svi.step(X, P, C)
                 epoch_loss += batch_loss
                 self.global_step += 1
+                batch_bar.set_postfix(elbo_per_cell=batch_loss / X.size(0))
 
-                # quick reconstruction for R²
-                with torch.no_grad():
-                    z_loc, _ = self.vae.z_encoder(
-                        torch.cat([X, self.vae.p_emb(P)], dim=-1)
-                    )
-                    logits = self.vae.z_decoder(z_loc)
-                    mu = torch.softmax(logits, dim=-1)
-                    tot = X.sum(-1, keepdim=True)
-                    x_mu = tot * mu
+            # ──────────── validation ────────────
+            val_loader = getattr(self, "val_dataloader", self.dataloader)
+            val_ce_sum, val_correct, val_n = 0.0, 0, 0
 
-                actuals.append(self._to_numpy(X))
-                preds.append(self._to_numpy(x_mu))
+            with torch.no_grad():
+                for X, P, C in val_loader:
+                    X = X.to(self.device, dtype=torch.float32)
+                    P = P.to(self.device, dtype=torch.long)
+                    C = C.to(self.device, dtype=torch.long)
 
-            self.vae.canonicalise_columns()
-            actuals = np.concatenate(actuals, axis=0)
-            preds   = np.concatenate(preds,   axis=0)
+                    # guide → model replay
+                    guide_tr = poutine.trace(self.vae.guide).get_trace(X, P, C)
+                    model_tr = poutine.trace(
+                        poutine.replay(self.vae.model, guide_tr)
+                    ).get_trace(X, P, C)
+
+                    # regression predictions
+                    x_mu = model_tr.nodes["x_mu"]["value"]
+                    actuals.append(X.cpu())
+                    preds.append(x_mu.cpu())
+
+                    # ───── classification metrics
+                    cls_logits = model_tr.nodes["cls_logits"]["value"]
+                    ce_batch   = F.cross_entropy(cls_logits, P, reduction="sum")
+                    val_ce_sum += ce_batch.item()
+                    val_correct += (cls_logits.argmax(dim=-1) == P).sum().item()
+                    val_n += P.size(0)
+
+            # ──────────── epoch-level metrics ────────────
+            actuals = np.concatenate([a.numpy() for a in actuals], axis=0)
+            preds   = np.concatenate([p.numpy() for p in preds],   axis=0)
             r2      = r2_score(actuals.flatten(), preds.flatten())
-            avg_loss = epoch_loss / dataset_size
-
+            avg_elbo = epoch_loss / dataset_size
+            ce_loss  = val_ce_sum / val_n
+            acc      = val_correct / val_n
             coeff_now = self.vae.center_coeff.item()
-            if self.verbose:
-                print(
-                    f"Epoch {epoch:02d} | "
-                    f"ELBO per cell: {avg_loss:.4f} | "
-                    f"R²: {r2:.4f} | λ_center: {coeff_now:.6f}"
-                    f" | τ: {tau_curr:.4f}"
-                )
-        
+
+            epoch_bar.set_postfix(
+                ELBO=f"{avg_elbo:.4f}",
+                CE=f"{ce_loss:.4f}",
+                acc=f"{acc:.3f}",
+                R2=f"{r2:.4f}",
+                lambda_center=f"{coeff_now:.6f}",
+                tau=f"{tau_curr:.4f}",
+            )
