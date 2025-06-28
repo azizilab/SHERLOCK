@@ -105,29 +105,30 @@ class VAE(nn.Module):
             z0 = pyro.sample("z0", dist.Normal(z0_loc, z0_scale).to_event(1))
 
             if self.gate_on:
-                z0 = z0 * W[p]                               # (B,d) gate applied
+                z0_loc = z0_loc * W[p]                               # (B,d) gate applied
                 lin_shift = A[p] * (1. - W[p])                        # (B,d) gate applied
             else:
-                lin_shift = A[p]                                           # (B,d)
+                lin_shift = A[p]  
+                                                         # (B,d)
             # W_scale   = pyro.param("W_scale",
             #                        torch.ones(self.latent_dim, device=self.device),
             #                        constraint=constraints.positive)
             
-            # z0_var   = z0_scale.pow(2)
+            z0_var   = z0_scale.pow(2)
 
             # lin_shift = W[p]                                 # μ₂
-            # W_scale   = pyro.param("W_scale",
-            #                     torch.ones(self.latent_dim, device=self.device),
-            #                     constraint=constraints.positive)
-            # W_var = W_scale.pow(2)                           # σ₂²
+            W_scale   = pyro.param("W_scale",
+                                torch.ones(self.latent_dim, device=self.device)*0.1,
+                                constraint=constraints.positive)
+            W_var = W_scale.pow(2)                           # σ₂²
 
-            # # ----- product of experts ------------------------------------
-            # precision = 1.0 / z0_var + 1.0 / W_var
-            # z_var     = 1.0 / precision
-            # z_loc     = z_var * (z0_loc / z0_var + lin_shift / W_var)
+            # ----- product of experts ------------------------------------
+            precision = 1.0 / z0_var + 1.0 / W_var
+            z_var     = 1.0 / precision
+            z_loc     = z_var * (z0_loc / z0_var + lin_shift / W_var)
 
-            z_loc = z0 + lin_shift                     # μ₁ + μ₂
-            z_var = torch.ones_like(z_loc)       # σ₁² + σ₂²
+            # z_loc = z0 + lin_shift                     # μ₁ + μ₂
+            # z_var = torch.ones_like(z_loc)       # σ₁² + σ₂²
 
             z = pyro.sample("z",
                     dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1))
