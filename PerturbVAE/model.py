@@ -28,13 +28,13 @@ class VAE(nn.Module):
         # self.z0_encoder = GeneModuleEncoder(input_dim, module_dict, hidden_dims)
 
         self.z_encoder = nn.Sequential(
-            nn.Linear(input_dim, 128), nn.LeakyReLU(),
-            nn.Linear(128, 128), nn.LeakyReLU(),
+            nn.Linear(input_dim, 128), nn.LeakyReLU(), nn.LayerNorm(128),
+            nn.Linear(128, 128), nn.LeakyReLU(), nn.LayerNorm(128),
             nn.Linear(128, latent_dim * 2)
         )
         self.z0_encoder = nn.Sequential(
-            nn.Linear(input_dim + latent_dim, 128), nn.LeakyReLU(),
-            nn.Linear(128, 128), nn.LeakyReLU(),
+            nn.Linear(input_dim + latent_dim, 128), nn.LeakyReLU(), nn.LayerNorm(128),
+            nn.Linear(128, 128), nn.LeakyReLU(), nn.LayerNorm(128),
             nn.Linear(128, latent_dim * 2)
         )
 
@@ -61,6 +61,11 @@ class VAE(nn.Module):
 
         self.register_buffer("center_coeff",
                              torch.tensor(center_coeff_init, dtype=torch.float32))
+        
+        self.gate_on   = False    
+        self.tau_hi    = 5.0
+        self.tau_lo    = 0.1
+
 
     def model(self, x, p, c):
         pyro.module("VAE", self)
@@ -78,17 +83,20 @@ class VAE(nn.Module):
             )
         A = self.rho_dec(rho_single) / math.sqrt(self.latent_dim)  # (P,d)
 
-        # Beta–Bernoulli gate  (shape P×d) ----------------------------
-        # alpha = torch.tensor(2.0, device=self.device)   # broader prior
-        # beta  = torch.tensor(8.0, device=self.device)
-        # tau = pyro.param("tau_temp", torch.tensor(1.0), constraint=constraints.positive)
-    
-        # pi = pyro.sample("pi", dist.Beta(alpha, beta).expand([self.perturbs, self.latent_dim]).to_event(2))          # (P,d)
-        # s_gate = pyro.sample("s_gate", dist.RelaxedBernoulliStraightThrough(temperature=tau, probs=pi).to_event(2))
+        if self.gate_on:
+            # Beta–Bernoulli gate  (shape P×d) ----------------------------
+            alpha = torch.tensor(1.0, device=self.device)   # broader prior
+            beta  = torch.tensor(20.0, device=self.device)
+            tau   = pyro.param("tau_temp",
+                                torch.tensor(self.tau_hi, device=self.device),
+                                constraint=constraints.positive)
+        
+            pi = pyro.sample("pi", dist.Beta(alpha, beta).expand([self.perturbs, self.latent_dim]).to_event(2))          # (P,d)
+            s_gate = pyro.sample("s_gate", dist.RelaxedBernoulliStraightThrough(temperature=tau, probs=pi).to_event(2))
 
-        # W = s_gate * A    
-        W = A                                             
-        pyro.deterministic("W", W)
+            W = s_gate   
+                                        
+            pyro.deterministic("W", W)
 
         # --- cell likelihood -----------------------------------------
         with pyro.plate("cells", x.size(0)):
@@ -96,23 +104,30 @@ class VAE(nn.Module):
             z0_scale = (0.5 * self.c_emb_logvar(c)).exp()
             z0 = pyro.sample("z0", dist.Normal(z0_loc, z0_scale).to_event(1))
 
-            lin_shift = W[p]                                           # (B,d)
-            W_scale   = pyro.param("W_scale",
-                                   torch.ones(self.latent_dim, device=self.device),
-                                   constraint=constraints.positive)
+            if self.gate_on:
+                z0 = z0 * W[p]                               # (B,d) gate applied
+                lin_shift = A[p] * (1. - W[p])                        # (B,d) gate applied
+            else:
+                lin_shift = A[p]                                           # (B,d)
+            # W_scale   = pyro.param("W_scale",
+            #                        torch.ones(self.latent_dim, device=self.device),
+            #                        constraint=constraints.positive)
             
-            z0_var   = z0_scale.pow(2)
+            # z0_var   = z0_scale.pow(2)
 
-            lin_shift = W[p]                                 # μ₂
-            W_scale   = pyro.param("W_scale",
-                                torch.ones(self.latent_dim, device=self.device),
-                                constraint=constraints.positive)
-            W_var = W_scale.pow(2)                           # σ₂²
+            # lin_shift = W[p]                                 # μ₂
+            # W_scale   = pyro.param("W_scale",
+            #                     torch.ones(self.latent_dim, device=self.device),
+            #                     constraint=constraints.positive)
+            # W_var = W_scale.pow(2)                           # σ₂²
 
-            # ----- product of experts ------------------------------------
-            precision = 1.0 / z0_var + 1.0 / W_var
-            z_var     = 1.0 / precision
-            z_loc     = z_var * (z0_loc / z0_var + lin_shift / W_var)
+            # # ----- product of experts ------------------------------------
+            # precision = 1.0 / z0_var + 1.0 / W_var
+            # z_var     = 1.0 / precision
+            # z_loc     = z_var * (z0_loc / z0_var + lin_shift / W_var)
+
+            z_loc = z0 + lin_shift                     # μ₁ + μ₂
+            z_var = torch.ones_like(z_loc)       # σ₁² + σ₂²
 
             z = pyro.sample("z",
                     dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1))
@@ -120,7 +135,7 @@ class VAE(nn.Module):
             cls_logits = self.cls_head(z)
             pyro.deterministic("cls_logits", cls_logits)
             CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
-            pyro.factor("CE_loss", -100*CE_loss)
+            pyro.factor("CE_loss", -1*CE_loss)
 
             logits_gene = self.z_decoder(z).clamp(-8., 8.)
             total_counts = x.sum(-1, keepdim=True).clamp(min=1.)
@@ -131,11 +146,11 @@ class VAE(nn.Module):
             pyro.sample("X",
                         dist.NegativeBinomial(total_count=theta,
                                               logits=logits_nb).to_event(1),
-                        obs=x.float())
+                        obs=x.float(), infer={"scale": 1e-3})
 
             # centre loss
-            ctr = ((z - rho_single[p].detach())**2).sum(1)
-            pyro.factor("center_loss", -self.center_coeff * ctr.sum())
+            # ctr = ((z - rho_single[p].detach())**2).sum()
+            # pyro.factor("center_loss", -1e0*self.center_coeff * ctr.sum())
 
     def guide(self, x, p, c):
         pyro.module("VAE", self)
@@ -149,13 +164,32 @@ class VAE(nn.Module):
                                             torch.ones_like(q_loc)).to_event(1))
 
         # q_pi  (shape P×d) -------------------------------------------
-        # q_pi = pyro.param(
-        #     "q_pi",
-        #     torch.full((self.perturbs, self.latent_dim), 0.05, device=self.device),
-        #     constraint=constraints.unit_interval,
-        # )
-        # tau = pyro.param("tau_temp", torch.tensor(1.0), constraint=constraints.positive)
-        # pi = pyro.sample("pi", dist.Delta(q_pi).to_event(2))
+        if self.gate_on:
+            p0 = 0.5 #starting prob
+            q_pi_logits = pyro.param(
+                "q_pi_logits",
+                torch.full((self.perturbs, self.latent_dim),
+                        math.log(p0 / (1.0 - p0)),        # prior mean ≈ 0.05
+                        device=self.device)
+            )                       
+
+            q_pi = torch.sigmoid(q_pi_logits)            # (P, d) probability view
+
+            tau = pyro.param("tau_temp",
+                            torch.tensor(self.tau_hi, device=self.device),
+                            constraint=constraints.positive)
+
+            # MAP point-estimate for π
+            pyro.sample("pi", dist.Delta(q_pi).to_event(2))
+
+            # gate, using the SAME logits so gradients flow straight back
+            pyro.sample(
+                "s_gate",
+                dist.RelaxedBernoulliStraightThrough(
+                    temperature=tau,
+                    logits=q_pi_logits          # important!
+                ).to_event(2)
+            )
         
         # kappa = 2.0
         # a0 = 0.05 * kappa
@@ -174,7 +208,6 @@ class VAE(nn.Module):
         # tau = pyro.param("tau_temp", torch.tensor(1.0, device=self.device),
         #                 constraint=constraints.positive)
         # pi = pyro.sample("pi",   dist.Beta(q_alpha, q_beta).to_event(2))
-        # pyro.sample("s_gate", dist.RelaxedBernoulliStraightThrough(temperature=tau, probs=pi).to_event(2))
 
     
 

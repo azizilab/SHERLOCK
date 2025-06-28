@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from pyro.infer import SVI, Trace_ELBO
-from pyro.optim import Adam
+from pyro.optim import Adam, ClippedAdam
 import pyro, pyro.poutine as poutine
 from sklearn.metrics import r2_score
 from tqdm import tqdm
@@ -27,6 +27,7 @@ class VAETrainer:
         final_coeff: float = 0.0,
         tau_init: float = 1.0,
         tau_end: float = 0.1,
+        gate_start: int = 0,
         tau_anneal_steps: Optional[int] = None,
         ramp_steps: Optional[int] = None,
         verbose: bool = True,
@@ -42,6 +43,10 @@ class VAETrainer:
         self.tau_end   = tau_end
         self.tau_anneal_steps = tau_anneal_steps
         self.verbose = verbose
+
+        self.gate_start = gate_start         # # warm-up epochs
+        self.tau_hi = vae.tau_hi
+        self.tau_lo = vae.tau_lo
 
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -60,6 +65,7 @@ class VAETrainer:
         self.svi = SVI(
             self.vae.model,
             self.vae.guide,
+            # ClippedAdam({"lr": lr, 'clip_norm': 5.0}),
             Adam({"lr": lr}),
             loss=Trace_ELBO(),
         )
@@ -116,6 +122,23 @@ class VAETrainer:
             epoch_loss = 0.0
             preds, actuals = [], []
 
+            # ----- switch gate ON exactly at gate_start ------------
+            if (not self.vae.gate_on) and epoch >= self.gate_start:
+                self.vae.gate_on = True
+                if self.verbose:
+                    print(f"▶  Gate training ENABLED at epoch {epoch}")
+
+            # ----- anneal tau when gate is active ------------------
+            if self.vae.gate_on:
+                # linear tau: τ_hi → τ_lo over remaining epochs
+                t = (epoch - self.gate_start) / max(1, self.num_epochs - self.gate_start)
+                tau_now = self.tau_hi * (self.tau_lo / self.tau_hi) ** t
+                pyro.get_param_store()["tau_temp"] = torch.tensor(tau_now,
+                                                                  device=self.device)
+            else:
+                tau_now = self.tau_hi
+
+
             # ───── transient batch bar (cleared each epoch) ─────
             batch_bar = tqdm(
                 self.dataloader,
@@ -131,7 +154,7 @@ class VAETrainer:
                 C = C.to(self.device, dtype=torch.long)
 
                 # anneal coeffs & temp
-                self._update_center_coeff_ramp()
+                # self._update_center_coeff_ramp()
                 tau_curr = self._current_tau(step) if self.tau_anneal_steps else self.tau_init
                 pyro.get_param_store()["tau_temp"] = torch.tensor(tau_curr, device=self.device)
                 step += 1
@@ -179,11 +202,24 @@ class VAETrainer:
             acc      = val_correct / val_n
             coeff_now = self.vae.center_coeff.item()
 
+
+            # ───── Pi percentiles (print NaN during warm-up) ─────
+            if "q_pi_logits" in pyro.get_param_store():
+                q_pi = F.sigmoid(pyro.param("q_pi_logits").detach())
+                pi25 = torch.quantile(q_pi, 0.25).item()
+                pi99 = torch.quantile(q_pi, 0.99).item()
+            else:                     # gate not yet enabled
+                pi25 = float("nan")
+                pi99 = float("nan")
+
+
             epoch_bar.set_postfix(
                 ELBO=f"{avg_elbo:.4f}",
                 CE=f"{ce_loss:.4f}",
                 acc=f"{acc:.3f}",
                 R2=f"{r2:.4f}",
+                pi25=f"{pi25:.2f}",
+                pi99=f"{pi99:.2f}",
                 lambda_center=f"{coeff_now:.6f}",
-                tau=f"{tau_curr:.4f}",
+                tau=f"{tau_now:.4f}",
             )
