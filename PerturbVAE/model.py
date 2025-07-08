@@ -4,6 +4,21 @@ from pyro.distributions import constraints
 from module import GeneModuleEncoder
 import torch.nn as nn
 
+class QRCov(nn.Module):
+    def __init__(self, d, r, device):
+        super().__init__()
+        self.U_unproj = nn.Parameter(0.01*torch.randn(d, r, device=device))
+        self.log_s    = nn.Parameter(torch.linspace(0., -1., r, device=device))
+
+    def U(self):
+        Q, _ = torch.linalg.qr(self.U_unproj, mode="reduced")
+        return Q
+
+    def forward(self):
+        U = self.U()                              
+        S = torch.diag(torch.exp(self.log_s))     
+        return U @ S                          
+
 class VAE(nn.Module):
     # -----------------------------------------------------------------
     def __init__(self, input_dim, latent_dim, perturbs, conds,
@@ -65,6 +80,10 @@ class VAE(nn.Module):
         self.gate_on   = False    
         self.tau_hi    = 5.0
         self.tau_lo    = 0.1
+        
+        
+        # cov params
+        self.qr = QRCov(self.perturbs, 5, device=self.device)
 
 
     def model(self, x, p, c):
@@ -74,13 +93,31 @@ class VAE(nn.Module):
                                  torch.zeros(self.input_dim, device=self.device))
         theta = F.softplus(theta_uncon) + 1e-3
 
-        # ρ prior
+        
+        # row covariance across perturbations
+        L = self.qr()
+        sigma = pyro.param(
+            "sigma_fac",
+            torch.full((), 0.05, device=self.device),  # () is a scalar tensor
+            constraint=constraints.positive,
+        )
+        row_cov = L @ L.T + sigma.pow(2) * torch.eye(self.perturbs, device=self.device)
+        
+        # shrinkage on sigma with tight half normal prior(normalisation dosn't matter)
+        pyro.factor("half_normal_energy", -0.5*(sigma/0.05)**2)
+
+        # rho noise
         with pyro.plate("perturbations", self.perturbs):
             rho_single = pyro.sample(
                 "rho",
                 dist.Normal(torch.zeros_like(self.p_emb.weight),
                             torch.ones_like(self.p_emb.weight)).to_event(1)
             )
+        # cholesky factorization of row covariance
+        chol_P = torch.linalg.cholesky(row_cov)
+        
+        # left-multiply(covariance reparameterization)
+        rho_single = chol_P @ rho_single
         A = self.rho_dec(rho_single) / math.sqrt(self.latent_dim)  # (P,d)
 
         if self.gate_on:
@@ -136,7 +173,7 @@ class VAE(nn.Module):
             cls_logits = self.cls_head(z)
             pyro.deterministic("cls_logits", cls_logits)
             CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
-            pyro.factor("CE_loss", -1*CE_loss)
+            pyro.factor("CE_loss", -1.0*CE_loss)
 
             logits_gene = self.z_decoder(z).clamp(-8., 8.)
             total_counts = x.sum(-1, keepdim=True).clamp(min=1.)
@@ -150,8 +187,8 @@ class VAE(nn.Module):
                         obs=x.float(), infer={"scale": 1e-3})
 
             # centre loss
-            # ctr = ((z - rho_single[p].detach())**2).sum()
-            # pyro.factor("center_loss", -1e0*self.center_coeff * ctr.sum())
+            ctr = ((z - rho_single[p].detach())**2).sum()
+            pyro.factor("center_loss", -1e-2 * ctr.sum())
 
     def guide(self, x, p, c):
         pyro.module("VAE", self)
@@ -222,33 +259,4 @@ class VAE(nn.Module):
             z0_mu, z0_logvar = self.z0_encoder(torch.cat([x, self.c_emb_mu(c)], dim=-1)).chunk(2, dim=-1)
             z0_std = (0.5 * z0_logvar).exp()
             pyro.sample("z0", dist.Normal(z0_mu, z0_std).to_event(1))
-
-    @torch.no_grad()
-    def canonicalise_columns(self):
-        """
-        Re-order every tensor that carries a latent dimension so that
-        latent‐dim `k` corresponds to the k-th smallest module‐ID in
-        `self.z_encoder._module_order`.
-        """
-        module_ids = torch.tensor(self.z_encoder._module_order,
-                                device=self.device)
-        _, perm = torch.sort(module_ids)                # ascending
-
-        def _permute_last(t: torch.Tensor):
-            return t.index_select(-1, perm)
-
-        # permute every parameter whose *last* axis is latent_dim
-        self.p_emb.weight.data        = _permute_last(self.p_emb.weight.data)
-        self.c_emb_mu.weight.data     = _permute_last(self.c_emb_mu.weight.data)
-        self.c_emb_logvar.weight.data = _permute_last(self.c_emb_logvar.weight.data)
-
-        # first Linear(d→d) inside rho_dec: permute rows AND columns
-        w0 = self.rho_dec[0].weight.data
-        self.rho_dec[0].weight.data = (
-            w0.index_select(0, perm).index_select(1, perm)
-        )
-
-        #permute variational probabilities of pi
-        q_pi = pyro.param("q_pi")                       # (P,d)
-        pyro.get_param_store()["q_pi"] = q_pi.index_select(-1, perm)
         
