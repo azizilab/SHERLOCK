@@ -17,13 +17,13 @@ class QRCov(nn.Module):
     def forward(self):
         U = self.U()                              
         S = torch.diag(torch.exp(self.log_s))     
-        return U @ S                          
+        return U @ S                  
 
 class VAE(nn.Module):
     # -----------------------------------------------------------------
     def __init__(self, input_dim, latent_dim, perturbs, conds,
                  beta, module_dict, hidden_dims=(16,),
-                 center_coeff_init=1e-2):
+                 center_coeff_init=1e-2, use_gene_modules=False):
         super().__init__()
         self.input_dim   = input_dim
         self.latent_dim  = latent_dim
@@ -32,6 +32,7 @@ class VAE(nn.Module):
         self.beta        = beta
         self.center_coeff_init = center_coeff_init
         self.device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.use_gene_modules  = use_gene_modules
 
         # ---- embeddings ---------------------------------------------
         self.p_emb        = nn.Embedding(perturbs, latent_dim)
@@ -39,19 +40,21 @@ class VAE(nn.Module):
         self.c_emb_logvar = nn.Embedding(conds,    latent_dim)
 
         # ---- encoders / decoders ------------------------------------
-        # self.z_encoder  = GeneModuleEncoder(input_dim, module_dict, hidden_dims)
-        # self.z0_encoder = GeneModuleEncoder(input_dim, module_dict, hidden_dims)
-
-        self.z_encoder = nn.Sequential(
-            nn.Linear(input_dim, 128), nn.LeakyReLU(), nn.LayerNorm(128),
-            nn.Linear(128, 128), nn.LeakyReLU(), nn.LayerNorm(128),
-            nn.Linear(128, latent_dim * 2)
-        )
-        self.z0_encoder = nn.Sequential(
-            nn.Linear(input_dim + latent_dim, 128), nn.LeakyReLU(), nn.LayerNorm(128),
-            nn.Linear(128, 128), nn.LeakyReLU(), nn.LayerNorm(128),
-            nn.Linear(128, latent_dim * 2)
-        )
+        if self.use_gene_modules:
+            self.z_encoder  = GeneModuleEncoder(input_dim, module_dict, hidden_dims, if_conditional=False) # do not condition on perturbations
+            self.z0_encoder = GeneModuleEncoder(input_dim, module_dict, hidden_dims, if_conditional=True)
+            
+        else:
+            self.z_encoder = nn.Sequential(
+                nn.Linear(input_dim, 128), nn.LeakyReLU(), nn.LayerNorm(128),
+                nn.Linear(128, 128), nn.LeakyReLU(), nn.LayerNorm(128),
+                nn.Linear(128, latent_dim * 2)
+            )
+            self.z0_encoder = nn.Sequential(
+                nn.Linear(input_dim + latent_dim, 128), nn.LeakyReLU(), nn.LayerNorm(128),
+                nn.Linear(128, 128), nn.LeakyReLU(), nn.LayerNorm(128),
+                nn.Linear(128, latent_dim * 2)
+            )
 
         self.z_decoder  = nn.Sequential(
             nn.Linear(latent_dim, 128), nn.LeakyReLU(),
@@ -84,6 +87,31 @@ class VAE(nn.Module):
         
         # cov params
         self.qr = QRCov(self.perturbs, 5, device=self.device)
+    
+    # expectation of perturbation simlarity based on pi
+    def E_pert_sim(self, min_conf=0.2):
+        q_pi_logits = pyro.param("q_pi_logits")
+        pi_probs = torch.sigmoid(q_pi_logits).detach()
+        conf = (pi_probs - 0.5).abs() * 2.0   
+        mask = (conf >= min_conf).float()
+        pi_eff = pi_probs * mask            
+        S = pi_eff @ pi_eff.T
+        m = S.max()
+        if m > 0:
+            S = S / m
+        S.fill_diagonal_(1.0)
+        return S
+    
+    def _corr(self, M, eps=1e-8):
+        d = torch.sqrt(torch.clamp(torch.diag(M), min=eps))
+        return M / (d[:, None] * d[None, :] + eps)
+    
+    def _laplacian_loss(self, rho, cov):
+        corr = self._corr(cov)
+        C_cov = ((corr + 1.0) / 2.0).clamp(0., 1.)
+        C_cov.fill_diagonal_(1.0)
+        L = torch.diag(C_cov.sum(1)) - C_cov
+        return torch.trace(rho.T @ L @ rho) / (self.perturbs)
 
 
     def model(self, x, p, c):
@@ -134,6 +162,14 @@ class VAE(nn.Module):
             W = s_gate   
                                         
             pyro.deterministic("W", W)
+            
+            loss_lap = self._laplacian_loss(rho_single, row_cov)
+            pyro.factor("smoothness_reg", -1.0 * loss_lap)
+            
+            # E_S = self.E_pert_sim()
+            # corr = self._corr(row_cov)
+            # norm = (corr - E_S).pow(2).mean()
+            # pyro.factor("cov_algin", -1.0 * norm)
 
         # --- cell likelihood -----------------------------------------
         with pyro.plate("cells", x.size(0)):
@@ -172,8 +208,11 @@ class VAE(nn.Module):
             
             cls_logits = self.cls_head(z)
             pyro.deterministic("cls_logits", cls_logits)
-            CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
-            pyro.factor("CE_loss", -1.0*CE_loss)
+            # CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
+            # pyro.factor("CE_loss", -1.0*CE_loss)
+            
+            CE_loss = F.cross_entropy(cls_logits, p, reduction="sum", label_smoothing=0.3)
+            pyro.factor("CE_loss", -1.0 * CE_loss)
 
             logits_gene = self.z_decoder(z).clamp(-8., 8.)
             total_counts = x.sum(-1, keepdim=True).clamp(min=1.)
@@ -188,7 +227,9 @@ class VAE(nn.Module):
 
             # centre loss
             ctr = ((z - rho_single[p].detach())**2).sum()
-            pyro.factor("center_loss", -1e-2 * ctr.sum())
+            pyro.factor("center_loss", -1e-2 * ctr)
+            # ctr = (z - rho_single[p]).pow(2).sum()   
+            # pyro.factor("center_loss", -1e-2 * ctr)
 
     def guide(self, x, p, c):
         pyro.module("VAE", self)
