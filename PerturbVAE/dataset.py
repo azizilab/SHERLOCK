@@ -1,7 +1,10 @@
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler, DataLoader
 import numpy as np
 import pandas as pd
+import random
+import itertools
+from collections import defaultdict
 
 class PerturbDataset(Dataset):
     def __init__(self, anndata):
@@ -55,3 +58,63 @@ class PerturbDataset(Dataset):
         P = self.P_indices[idx]
         C = self.C_indices[idx]
         return X, P, C
+    
+
+
+
+
+class MultiClassBatchSampler(Sampler[list[int]]):
+    """
+    Yields batches that comprise *all* examples from `n_classes_per_batch`
+    randomly-chosen class labels.
+
+    Parameters
+    ----------
+    labels               : 1-D array-like of ints, length == dataset
+    n_classes_per_batch  : how many distinct classes to pack into one batch
+    shuffle_within_class : shuffle order of indices inside each class
+    drop_last            : drop the final (smaller) batch of classes if the
+                           total #classes isn't divisible by n_classes_per_batch
+    """
+    def __init__(self, labels,
+                 n_classes_per_batch: int,
+                 shuffle_within_class: bool = False,
+                 drop_last: bool = False):
+        self.labels   = np.asarray(labels)
+        self.k        = int(n_classes_per_batch)
+        self.shuffle_within = shuffle_within_class
+        self.drop_last = drop_last
+
+        # build {class_id: [idx0, idx1, …]}
+        self.class_to_idxs = defaultdict(list)
+        for idx, lab in enumerate(self.labels):
+            self.class_to_idxs[int(lab)].append(idx)
+
+        # keep only non-empty classes
+        self.classes = list(self.class_to_idxs.keys())
+
+    def __len__(self):
+        n_groups = len(self.classes) // self.k
+        if not self.drop_last and len(self.classes) % self.k:
+            n_groups += 1
+        return n_groups
+
+    def __iter__(self):
+        # shuffle class order every epoch
+        random.shuffle(self.classes)
+
+        # slice classes into groups of k
+        for i in range(0, len(self.classes), self.k):
+            group = self.classes[i : i + self.k]
+            if len(group) < self.k and self.drop_last:
+                break
+
+            # gather indices from each class
+            batch_idxs = []
+            for c in group:
+                idxs = self.class_to_idxs[c]
+                if self.shuffle_within:
+                    random.shuffle(idxs)
+                batch_idxs.extend(idxs)
+
+            yield batch_idxs
