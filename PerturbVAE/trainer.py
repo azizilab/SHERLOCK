@@ -148,8 +148,9 @@ class VAETrainer:
                 dynamic_ncols=True,
             )
 
-            for X, P, C in batch_bar:
-                X = X.to(self.device, dtype=torch.float32)
+            for X_p, X_ntc, P, C in batch_bar:
+                X_p = X_p.to(self.device, dtype=torch.float32)
+                X_ntc = X_ntc.to(self.device, dtype=torch.float32)
                 P = P.to(self.device, dtype=torch.long)
                 C = C.to(self.device, dtype=torch.long)
 
@@ -160,30 +161,31 @@ class VAETrainer:
                 step += 1
 
                 # optimisation step
-                batch_loss = self.svi.step(X, P, C)
+                batch_loss = self.svi.step(X_p, X_ntc, P, C)
                 epoch_loss += batch_loss
                 self.global_step += 1
-                batch_bar.set_postfix(elbo_per_cell=batch_loss / X.size(0))
+                batch_bar.set_postfix(elbo_per_cell=batch_loss / X_p.size(0))
 
             # ──────────── validation ────────────
             val_loader = getattr(self, "val_dataloader", self.dataloader)
             val_ce_sum, val_correct, val_n = 0.0, 0, 0
 
             with torch.no_grad():
-                for X, P, C in val_loader:
-                    X = X.to(self.device, dtype=torch.float32)
+                for X_p, X_ntc, P, C in val_loader:
+                    X_p = X_p.to(self.device, dtype=torch.float32)
+                    X_ntc = X_ntc.to(self.device, dtype=torch.float32)
                     P = P.to(self.device, dtype=torch.long)
                     C = C.to(self.device, dtype=torch.long)
 
                     # guide → model replay
-                    guide_tr = poutine.trace(self.vae.guide).get_trace(X, P, C)
+                    guide_tr = poutine.trace(self.vae.guide).get_trace(X_p, X_ntc, P, C)
                     model_tr = poutine.trace(
                         poutine.replay(self.vae.model, guide_tr)
-                    ).get_trace(X, P, C)
+                    ).get_trace(X_p, X_ntc, P, C)
 
                     # regression predictions
                     x_mu = model_tr.nodes["x_mu"]["value"]
-                    actuals.append(X.cpu())
+                    actuals.append(X_p.cpu())
                     preds.append(x_mu.cpu())
 
                     # ───── classification metrics
