@@ -118,3 +118,79 @@ class MultiClassBatchSampler(Sampler[list[int]]):
                 batch_idxs.extend(idxs)
 
             yield batch_idxs
+
+class PerturbMatchingDataset(Dataset):
+    """
+    Dataset of (perturbed-cell, NTC-cell) pairs.
+
+    • X_p      – all *non-NTC* cells           (n_p × d)
+    • X_ntc    – one representative NTC cell *per condition*
+                 (n_cond x d)  — kept mainly for inspection.
+                 A fresh, random NTC cell of the matching
+                 condition is drawn on-the-fly in __getitem__.
+
+    """
+
+    def __init__(self, anndata, NTC: str = "NTC", seed: int | None = None):
+        rng = np.random.default_rng(seed)
+
+        pert_anndata = anndata[anndata.obs["top_sg"] != NTC]
+        ntc_anndata = anndata[anndata.obs["top_sg"] == NTC]
+
+        # ── metadata columns ────────────────────────────────────────────
+        pertlbl      = pert_anndata.obs["top_sg"].values
+        condlbl = pert_anndata.obs["treatment"].values
+
+        # unique conditions
+        cond_unique = np.unique(condlbl)
+        pert_unique = np.unique(pertlbl)
+
+        self.perturbation_dict = {p: i for i, p in enumerate(pert_unique)}
+        self.condition_dict = {c: i for i, c in enumerate(cond_unique)}
+
+        # ── expression matrix ───────────────────────────────────────────
+        self.X_ntc = [ntc_anndata[ntc_anndata.obs.treatment == cond].X.toarray() for cond in cond_unique]
+        self.X_pert = pert_anndata.X.toarray() if hasattr(pert_anndata.X, "toarray") else pert_anndata.X
+
+        self.P = pert_anndata.obs['top_sg'].values
+        self.C = pert_anndata.obs['treatment'].values
+        self.C_ntc = ntc_anndata.obs['treatment'].values
+
+        # Convert P and C to indices
+        self.P_indices = np.array([self.perturbation_dict[p] for p in self.P])
+        self.C_indices = np.array([self.condition_dict[c] for c in self.C])
+        self.C_ntc_indices = np.array([self.condition_dict[c] for c in self.C_ntc])
+
+
+        # quick NA / NaN guard
+        if pd.isna(pertlbl).any() or pd.isna(condlbl).any():
+            raise ValueError("obs contains NA / NaN in 'top_sg' or 'treatment'.")
+
+        self.rng = rng
+
+    # ── Dataset API ─────────────────────────────────────────────────────
+    def __len__(self) -> int:
+        # one entry per perturbed cell
+        return self.X_pert.shape[0]
+
+    def __getitem__(self, idx: int):
+        '''
+        returns
+        (x_p, x_ntc, p_idx, c_idx)
+
+        x_p        : expression vector of the i-th perturbed cell
+        x_ntc : expression vector of a random NTC cell
+                     with the same condition as x_p
+        p_idx      : integer perturbation label (0 … n_perturb-1)
+        c_idx      : integer condition label    (0 … n_cond-1)
+        '''
+        # perturbed cell
+        x_p   = self.X_pert[idx]
+        c_idx = self.C_indices[idx]
+        p_idx = self.P_indices[idx]
+
+        # random NTC cell with same condition
+        ntc_idx = self.rng.integers(0, len(self.X_ntc[c_idx]), size=1)[0]
+        x_ntc   = self.X_ntc[c_idx][ntc_idx]
+
+        return x_p, x_ntc, p_idx, c_idx
