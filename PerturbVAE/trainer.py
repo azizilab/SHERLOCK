@@ -12,6 +12,7 @@ from tqdm import tqdm
 from PerturbVAE.model import VAE
 from tqdm.auto import tqdm
 import torch.nn.functional as F
+from customized_loss import gene_distribution_loss
 
 
 
@@ -169,6 +170,7 @@ class VAETrainer:
             # ──────────── validation ────────────
             val_loader = getattr(self, "val_dataloader", self.dataloader)
             val_ce_sum, val_correct, val_n = 0.0, 0, 0
+            val_slice_sum, val_slice_batches = 0.0, 0
 
             with torch.no_grad():
                 for X_p, X_ntc, P, C in val_loader:
@@ -194,6 +196,15 @@ class VAETrainer:
                     val_ce_sum += ce_batch.item()
                     val_correct += (cls_logits.argmax(dim=-1) == P).sum().item()
                     val_n += P.size(0)
+                    
+                    #sliced gene loss
+                    # if "q_pi_logits" in pyro.get_param_store():
+                    #     q_pi_logits = pyro.param("q_pi_logits")
+                    #     sl_batch = gene_distribution_loss(
+                    #         x_mu, X_p, X_ntc, P, q_pi_logits, self.vae.z_decoder
+                    #     )
+                    #     val_slice_sum += float(sl_batch)
+                    #     val_slice_batches += 1
 
             # ──────────── epoch-level metrics ────────────
             actuals = np.concatenate([a.numpy() for a in actuals], axis=0)
@@ -203,7 +214,7 @@ class VAETrainer:
             ce_loss  = val_ce_sum / val_n
             acc      = val_correct / val_n
             coeff_now = self.vae.center_coeff.item()
-
+            # slice_loss_avg = (val_slice_sum / max(1, val_slice_batches)) if val_slice_batches > 0 else float("nan")
 
             # ───── Pi percentiles (print NaN during warm-up) ─────
             if "q_pi_logits" in pyro.get_param_store():
@@ -214,7 +225,6 @@ class VAETrainer:
                 pi25 = float("nan")
                 pi99 = float("nan")
 
-
             epoch_bar.set_postfix(
                 ELBO=f"{avg_elbo:.4f}",
                 CE=f"{ce_loss:.4f}",
@@ -222,6 +232,7 @@ class VAETrainer:
                 R2=f"{r2:.4f}",
                 pi25=f"{pi25:.2f}",
                 pi99=f"{pi99:.2f}",
+                # slice_loss=f"{slice_loss_avg:.4f}",
                 lambda_center=f"{coeff_now:.6f}",
                 tau=f"{tau_now:.4f}",
             )

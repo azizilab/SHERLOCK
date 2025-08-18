@@ -1,8 +1,9 @@
 import pyro, torch, math, torch.nn.functional as F
 import pyro.distributions as dist
 from pyro.distributions import constraints
-from module import GeneModuleEncoder
+from module import GeneModuleEncoderRegularized, GeneModuleOutputLayer, GeneModuleEncoder
 import torch.nn as nn
+from customized_loss import gene_distribution_loss
 
 class QRCov(nn.Module):
     def __init__(self, d, r, device):
@@ -20,7 +21,6 @@ class QRCov(nn.Module):
         return U @ S                  
 
 class VAE(nn.Module):
-    # -----------------------------------------------------------------
     def __init__(self, input_dim, latent_dim, perturbs, conds,
                  beta, module_dict, hidden_dims=(16,),
                  center_coeff_init=1e-2, use_gene_modules=False):
@@ -43,6 +43,16 @@ class VAE(nn.Module):
         if self.use_gene_modules:
             self.z_encoder  = GeneModuleEncoder(input_dim, module_dict, hidden_dims, if_conditional=False) # do not condition on perturbations
             self.z0_encoder = GeneModuleEncoder(input_dim, module_dict, hidden_dims, if_conditional=True)
+            # self.z_encoder  = GeneModuleEncoderRegularized(input_dim, module_dict, if_conditional=False) # do not condition on perturbations
+            # self.z0_encoder = GeneModuleEncoderRegularized(input_dim, module_dict, if_conditional=True)
+        #     self.z_decoder = nn.Sequential(
+        #     nn.Linear(latent_dim, 128), nn.LeakyReLU(), nn.Linear(128, latent_dim), 
+        #     GeneModuleOutputLayer(input_dim, latent_dim, module_dict)
+        # )
+            self.z_decoder  = nn.Sequential(
+                nn.Linear(latent_dim, 128), nn.LeakyReLU(),
+                nn.Linear(128, input_dim)
+            )
             
         else:
             self.z_encoder = nn.Sequential(
@@ -55,11 +65,10 @@ class VAE(nn.Module):
                 nn.Linear(128, 128), nn.LeakyReLU(), nn.LayerNorm(128),
                 nn.Linear(128, latent_dim * 2)
             )
-
-        self.z_decoder  = nn.Sequential(
-            nn.Linear(latent_dim, 128), nn.LeakyReLU(),
-            nn.Linear(128, input_dim)
-        )
+            self.z_decoder  = nn.Sequential(
+                nn.Linear(latent_dim, 128), nn.LeakyReLU(),
+                nn.Linear(128, input_dim)
+            )
 
         self.rho_dec = nn.Sequential(
             nn.Linear(latent_dim, latent_dim), nn.LeakyReLU(),
@@ -87,31 +96,11 @@ class VAE(nn.Module):
         
         # cov params
         self.qr = QRCov(self.perturbs, 5, device=self.device)
-    
-    # expectation of perturbation simlarity based on pi
-    def E_pert_sim(self, min_conf=0.2):
-        q_pi_logits = pyro.param("q_pi_logits")
-        pi_probs = torch.sigmoid(q_pi_logits).detach()
-        conf = (pi_probs - 0.5).abs() * 2.0   
-        mask = (conf >= min_conf).float()
-        pi_eff = pi_probs * mask            
-        S = pi_eff @ pi_eff.T
-        m = S.max()
-        if m > 0:
-            S = S / m
-        S.fill_diagonal_(1.0)
-        return S
-    
+
+
     def _corr(self, M, eps=1e-8):
         d = torch.sqrt(torch.clamp(torch.diag(M), min=eps))
         return M / (d[:, None] * d[None, :] + eps)
-    
-    def _laplacian_loss(self, rho, cov):
-        corr = self._corr(cov)
-        C_cov = ((corr + 1.0) / 2.0).clamp(0., 1.)
-        C_cov.fill_diagonal_(1.0)
-        L = torch.diag(C_cov.sum(1)) - C_cov
-        return torch.trace(rho.T @ L @ rho) / (self.perturbs)
 
 
     def model(self, x_p, x_ntc, p, c):
@@ -163,14 +152,6 @@ class VAE(nn.Module):
                                         
             pyro.deterministic("W", W)
             
-            # loss_lap = self._laplacian_loss(rho_single, row_cov)
-            # pyro.factor("smoothness_reg", -1.0 * loss_lap)
-            
-            # E_S = self.E_pert_sim()
-            # corr = self._corr(row_cov)
-            # norm = (corr - E_S).pow(2).mean()
-            # pyro.factor("cov_algin", -1.0 * norm)
-
         # --- cell likelihood -----------------------------------------
         with pyro.plate("cells", x_p.size(0)):
             z0_loc   = self.c_emb_mu(c)
@@ -191,8 +172,9 @@ class VAE(nn.Module):
 
             # lin_shift = W[p]                                 # μ₂
             W_scale   = pyro.param("W_scale",
-                                torch.ones(self.latent_dim, device=self.device)*0.1,
+                                torch.ones(self.latent_dim, device=self.device)*0.05,
                                 constraint=constraints.positive)
+            
             W_var = W_scale.pow(2)                           # σ₂²
 
             # ----- product of experts ------------------------------------
@@ -208,12 +190,10 @@ class VAE(nn.Module):
             
             cls_logits = self.cls_head(z)
             pyro.deterministic("cls_logits", cls_logits)
-            # CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
-            # pyro.factor("CE_loss", -1.0*CE_loss)
-            
-            CE_loss = F.cross_entropy(cls_logits, p, reduction="sum", label_smoothing=0.3)
-            pyro.factor("CE_loss", -1.0 * CE_loss)
+            CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
+            pyro.factor("CE_loss", -1.0*CE_loss)
 
+            
             logits_gene = self.z_decoder(z).clamp(-8., 8.)
             total_counts = x_p.sum(-1, keepdim=True).clamp(min=1.)
             mu_prob = torch.softmax(logits_gene, dim=-1)
@@ -230,20 +210,34 @@ class VAE(nn.Module):
             pyro.factor("center_loss", -1e-2 * ctr)
             # ctr = (z - rho_single[p]).pow(2).sum()   
             # pyro.factor("center_loss", -1e-2 * ctr)
+            
+            # distribution loss on gene slices
+            # if "q_pi_logits" in pyro.get_param_store():
+            #     q_pi_logits = pyro.param("q_pi_logits")
+            #     sliced_gene_loss = gene_distribution_loss(
+            #         mu,
+            #         x_p,
+            #         x_ntc,
+            #         p,
+            #         q_pi_logits,
+            #         self.z_decoder,
+            #     )
+            # else:
+            #     sliced_gene_loss = torch.tensor(0.0, device=self.device)
+            # pyro.factor("sliced_gene_loss", -sliced_gene_loss)
+            
 
     def guide(self, x_p, x_ntc, p, c):
         pyro.module("VAE", self)
 
         x_p = torch.log(x_p + 1.0)  # log-transform input counts
         x_ntc = torch.log(x_ntc + 1.0)
-
-        # ρ posterior --------------------------------------------------
         q_loc = self.rho_enc(self.p_emb.weight)
         with pyro.plate("perturbations", self.perturbs):
             pyro.sample("rho", dist.Normal(q_loc,
                                             torch.ones_like(q_loc)).to_event(1))
 
-        # q_pi  (shape P×d) -------------------------------------------
+        # q_pi
         if self.gate_on:
             p0 = 0.5 #starting prob
             q_pi_logits = pyro.param(
@@ -270,35 +264,19 @@ class VAE(nn.Module):
                     logits=q_pi_logits          # important!
                 ).to_event(2)
             )
-        
-        # kappa = 2.0
-        # a0 = 0.05 * kappa
-        # b0 = 0.95 * kappa
-
-        # q_alpha = pyro.param(
-        #     "q_alpha",
-        #     torch.full((self.perturbs, self.latent_dim), a0, device=self.device),
-        #     constraint=constraints.positive
-        # )
-        # q_beta  = pyro.param(
-        #     "q_beta",
-        #     torch.full((self.perturbs, self.latent_dim), b0, device=self.device),
-        #     constraint=constraints.positive
-        # )
-        # tau = pyro.param("tau_temp", torch.tensor(1.0, device=self.device),
-        #                 constraint=constraints.positive)
-        # pi = pyro.sample("pi",   dist.Beta(q_alpha, q_beta).to_event(2))
-
-    
 
         # cell-wise factors -------------------------------------------
         with pyro.plate("cells", x_p.size(0)):
             # z_mu, z_logvar = self.z_encoder(torch.cat([x, self.p_emb(p)], dim=-1)).chunk(2, dim=-1)
-            z_mu, z_logvar = self.z_encoder(torch.cat([x_p], dim=-1)).chunk(2, dim=-1)
+            #z_mu, z_logvar = self.z_encoder(torch.cat([x_p], dim=-1)).chunk(2, dim=-1)
+            z_mu, z_logvar = self.z_encoder(x_p)
             z_std = (0.5 * z_logvar).exp()
-            pyro.sample("z", dist.Normal(z_mu, z_std).to_event(1))
+            z_q = pyro.sample("z", dist.Normal(z_mu, z_std).to_event(1))
+            
 
-            z0_mu, z0_logvar = self.z0_encoder(torch.cat([x_ntc], dim=-1)).chunk(2, dim=-1)
+
+            #z0_mu, z0_logvar = self.z0_encoder(torch.cat([x_ntc], dim=-1)).chunk(2, dim=-1)
+            z0_mu, z0_logvar = self.z0_encoder(torch.cat([x_ntc, self.c_emb_mu(c)], dim=-1))
             z0_std = (0.5 * z0_logvar).exp()
             pyro.sample("z0", dist.Normal(z0_mu, z0_std).to_event(1))
         
