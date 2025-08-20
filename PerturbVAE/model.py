@@ -1,7 +1,7 @@
 import pyro, torch, math, torch.nn.functional as F
 import pyro.distributions as dist
 from pyro.distributions import constraints
-from module import GeneModuleEncoder
+from module import GeneModuleEncoder, SparseModuleTransform
 import torch.nn as nn
 
 class QRCov(nn.Module):
@@ -22,7 +22,7 @@ class QRCov(nn.Module):
 class VAE(nn.Module):
     # -----------------------------------------------------------------
     def __init__(self, input_dim, latent_dim, perturbs, conds,
-                 beta, module_dict, hidden_dims=(16,),
+                 beta, module_var, hidden_dims=(16,),
                  center_coeff_init=1e-2, use_gene_modules=False):
         super().__init__()
         self.input_dim   = input_dim
@@ -41,8 +41,9 @@ class VAE(nn.Module):
 
         # ---- encoders / decoders ------------------------------------
         if self.use_gene_modules:
-            self.z_encoder  = GeneModuleEncoder(input_dim, module_dict, hidden_dims, if_conditional=False) # do not condition on perturbations
-            self.z0_encoder = GeneModuleEncoder(input_dim, module_dict, hidden_dims, if_conditional=True)
+            self.z_encoder  = SparseModuleTransform(input_dim, latent_dim, module_map=module_var, hidden=4)
+            self.z0_encoder = SparseModuleTransform(input_dim, latent_dim, module_map=module_var, hidden=4)
+            self.z_decoder  = SparseModuleTransform(latent_dim, input_dim, module_map=module_var, hidden=4, reverse=True, inference=False)
             
         else:
             self.z_encoder = nn.Sequential(
@@ -55,15 +56,17 @@ class VAE(nn.Module):
                 nn.Linear(128, 128), nn.LeakyReLU(), nn.LayerNorm(128),
                 nn.Linear(128, latent_dim * 2)
             )
+            self.z_decoder  = nn.Sequential(
+                nn.Linear(latent_dim, 128), nn.LeakyReLU(),
+                nn.Linear(128, input_dim)
+            )
+            
 
-        self.z_decoder  = nn.Sequential(
-            nn.Linear(latent_dim, 128), nn.LeakyReLU(),
-            nn.Linear(128, input_dim)
-        )
+        
 
         self.rho_dec = nn.Sequential(
             nn.Linear(latent_dim, latent_dim), nn.LeakyReLU(),
-            nn.Linear(latent_dim, latent_dim), nn.Tanh()
+            nn.Linear(latent_dim, latent_dim)
         )
         self.rho_enc = nn.Sequential(
             nn.Linear(latent_dim, latent_dim), nn.LeakyReLU(),
@@ -71,7 +74,9 @@ class VAE(nn.Module):
         )
 
         self.cls_head = nn.Sequential(
-            nn.Linear(latent_dim, perturbs)
+            nn.Linear(latent_dim, 128),
+            nn.LeakyReLU(),
+            nn.Linear(128, perturbs)
         )
         for m in self.rho_dec.modules():
             if isinstance(m, nn.Linear):
@@ -175,7 +180,11 @@ class VAE(nn.Module):
         with pyro.plate("cells", x_p.size(0)):
             z0_loc   = self.c_emb_mu(c)
             z0_scale = (0.5 * self.c_emb_logvar(c)).exp()
-            z0 = pyro.sample("z0", dist.Normal(z0_loc, z0_scale).to_event(1))
+
+            z0_loc = torch.zeros_like(z0_loc)
+            z0_scale = torch.ones_like(z0_scale)
+            pyro.sample("z0", dist.Normal(z0_loc, z0_scale).to_event(1))
+
 
             if self.gate_on:
                 z0_loc = z0_loc * (1. - W[p])                               # (B,d) gate applied
@@ -191,7 +200,7 @@ class VAE(nn.Module):
 
             # lin_shift = W[p]                                 # μ₂
             W_scale   = pyro.param("W_scale",
-                                torch.ones(self.latent_dim, device=self.device)*0.1,
+                                torch.ones(self.latent_dim, device=self.device)*5.0,
                                 constraint=constraints.positive)
             W_var = W_scale.pow(2)                           # σ₂²
 
@@ -202,7 +211,6 @@ class VAE(nn.Module):
 
             # z_loc = z0 + lin_shift                     # μ₁ + μ₂
             # z_var = torch.ones_like(z_loc)       # σ₁² + σ₂²
-
             z = pyro.sample("z",
                     dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1))
             
@@ -211,11 +219,11 @@ class VAE(nn.Module):
             # CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
             # pyro.factor("CE_loss", -1.0*CE_loss)
             
-            CE_loss = F.cross_entropy(cls_logits, p, reduction="sum", label_smoothing=0.3)
-            pyro.factor("CE_loss", -1.0 * CE_loss)
+            CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
+            pyro.factor("CE_loss", -10.0 * CE_loss)
 
-            logits_gene = self.z_decoder(z).clamp(-8., 8.)
-            total_counts = x_p.sum(-1, keepdim=True).clamp(min=1.)
+            logits_gene = self.z_decoder(z)#.clamp(-8., 8.)
+            total_counts = x_p.sum(-1, keepdim=True)#.clamp(min=1.)
             mu_prob = torch.softmax(logits_gene, dim=-1)
             mu = total_counts * mu_prob
             pyro.deterministic("x_mu", mu)
@@ -226,8 +234,8 @@ class VAE(nn.Module):
                         obs=x_p.float(), infer={"scale": 1e-3})
 
             # centre loss
-            ctr = ((z - rho_single[p].detach())**2).sum()
-            pyro.factor("center_loss", -1e-2 * ctr)
+            # ctr = ((z - rho_single[p].detach())**2).sum()
+            # pyro.factor("center_loss", -1e-2 * ctr)
             # ctr = (z - rho_single[p]).pow(2).sum()   
             # pyro.factor("center_loss", -1e-2 * ctr)
 
@@ -294,11 +302,11 @@ class VAE(nn.Module):
         # cell-wise factors -------------------------------------------
         with pyro.plate("cells", x_p.size(0)):
             # z_mu, z_logvar = self.z_encoder(torch.cat([x, self.p_emb(p)], dim=-1)).chunk(2, dim=-1)
-            z_mu, z_logvar = self.z_encoder(torch.cat([x_p], dim=-1)).chunk(2, dim=-1)
+            z_mu, z_logvar = self.z_encoder(torch.cat([x_p], dim=-1)).unbind(dim=-1)
             z_std = (0.5 * z_logvar).exp()
             pyro.sample("z", dist.Normal(z_mu, z_std).to_event(1))
 
-            z0_mu, z0_logvar = self.z0_encoder(torch.cat([x_ntc], dim=-1)).chunk(2, dim=-1)
+            z0_mu, z0_logvar = self.z0_encoder(torch.cat([x_ntc], dim=-1)).unbind(dim=-1)
             z0_std = (0.5 * z0_logvar).exp()
             pyro.sample("z0", dist.Normal(z0_mu, z0_std).to_event(1))
         

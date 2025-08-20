@@ -111,5 +111,65 @@ class GeneModuleEncoder(nn.Module):
         return z_mean, z_log_var
 
         
+
+class SparseModuleTransform(nn.Module):
+    def __init__(self,
+                 input_dim: int,
+                 out_dim: int,
+                 module_map: list[str],
+                 hidden: int = 4,
+                 activation=nn.LeakyReLU(),
+                 reverse: bool = False,
+                 inference: bool = True):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.out_dim = out_dim
+        self.hidden = hidden
+        self.activation = activation
+
+        # Compute the intermediate hidden dimension: d × hidden
+        d = out_dim
+        hidden_dim = d * hidden
+
+        # Create (input_dim x out_dim) binary mask from module_map
+        if reverse:
+            base_mask = torch.zeros((out_dim, input_dim), dtype=torch.bool)
+        else:
+            base_mask = torch.zeros((input_dim, out_dim), dtype=torch.bool)
+        for i, entry in enumerate(module_map):
+            dims = map(int, entry.split(','))
+            for dim in dims:
+                base_mask[i, dim] = True
+
+        if reverse:
+            # Transpose the mask for reverse mapping
+            base_mask = base_mask.t()
+
+        # Expand mask to hidden dimension (input_dim x hidden_dim)
+        # Each column of base_mask gets repeated `hidden` times
+        self.register_buffer("mask", base_mask.repeat_interleave(hidden, dim=1))
+
+        # Learnable weights and biases
+        self.input_to_hidden = nn.Parameter(torch.empty(input_dim, hidden_dim))
+        self.bias = nn.Parameter(torch.zeros(hidden_dim))
+        nn.init.xavier_uniform_(self.input_to_hidden)
+        nn.init.zeros_(self.bias)
+
+        self.hidden_to_out = nn.Linear(hidden, 2 if inference else 1)  # Output is mean and log variance
+
+    def forward(self, x):
+        # Apply mask to input projection weights
+        masked_weight = self.input_to_hidden * self.mask
+
+        # Linear projection: input_dim × hidden_dim
+        h = x @ masked_weight + self.bias 
+        h = self.activation(h)
+        h = h.view(x.shape[0], self.out_dim, self.hidden) # N x latent x hidden
+
+        # Final projection to output
+        return self.hidden_to_out(h).squeeze(-1) # N x latent x 2 (mean, logvar if inference)
+
+
         
 
