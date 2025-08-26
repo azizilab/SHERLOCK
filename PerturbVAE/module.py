@@ -148,6 +148,7 @@ class SparseModuleTransform(nn.Module):
 
         # Expand mask to hidden dimension (input_dim x hidden_dim)
         # Each column of base_mask gets repeated `hidden` times
+        self.register_buffer("base_mask", base_mask)
         self.register_buffer("mask", base_mask.repeat_interleave(hidden, dim=1))
 
         # Learnable weights and biases
@@ -157,6 +158,12 @@ class SparseModuleTransform(nn.Module):
         nn.init.zeros_(self.bias)
 
         self.hidden_to_out = nn.Linear(hidden, 2 if inference else 1)  # Output is mean and log variance
+
+        group_sizes = base_mask.sum(dim=0).to(torch.float32) * hidden
+        self.register_buffer(
+            "group_sqrt_sizes",
+            torch.sqrt(group_sizes.clamp_min(1.0))  # (O,)
+        )
 
     def forward(self, x):
         # Apply mask to input projection weights
@@ -169,7 +176,42 @@ class SparseModuleTransform(nn.Module):
 
         # Final projection to output
         return self.hidden_to_out(h).squeeze(-1) # N x latent x 2 (mean, logvar if inference)
+    
+    def regularization_loss(self, l1: float = 0.0, l2: float = 0.0,
+                            group_lambda: float = 0.0) -> torch.Tensor:
+        """
+        Vectorized Elastic Net + Group Lasso on masked weights (no Python loops).
 
+        L1:  l1 * ||W∘mask||_1
+        L2:  l2 * ||W∘mask||_2^2
+        GL:  group_lambda * sum_j sqrt(|G_j|) * ||W_j||_F,
+             where W_j collects all masked weights feeding latent j across 'hidden'.
+        """
+        W = self.input_to_hidden
+        Wm = W * self.mask  # (I, O*H)
+        loss = Wm.new_zeros(())
 
-        
+        if l1:
+            loss = loss + l1 * Wm.abs().sum()
 
+        if l2:
+            loss = loss + l2 * (Wm.pow(2).sum())
+
+        if group_lambda:
+            # reshape to (I, O, H)
+            I, O, H = self.input_dim, self.out_dim, self.hidden
+            Wm_IOH = Wm.view(I, O, H)
+
+            # broadcast base mask over hidden: (I, O, 1)
+            bm = self.base_mask.to(dtype=Wm.dtype).unsqueeze(-1)
+
+            # zero out rows not in group (vectorized selection)
+            Wg = Wm_IOH * bm  # (I, O, H)
+
+            # Frobenius per latent j: ||W_j||_F = sqrt(sum_{i,h} Wg^2)
+            fro_per_latent = torch.sqrt((Wg.pow(2).sum(dim=(0, 2))).clamp_min(0.0))  # (O,)
+
+            # weighted sum with sqrt(|G_j|)
+            loss = loss + group_lambda * (self.group_sqrt_sizes * fro_per_latent).sum()
+
+        return loss

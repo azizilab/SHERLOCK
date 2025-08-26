@@ -2,6 +2,7 @@ import math, os, time
 from typing import Optional, Sequence
 
 import numpy as np
+import copy
 import torch
 from torch.utils.data import DataLoader
 from pyro.infer import SVI, Trace_ELBO
@@ -111,6 +112,12 @@ class VAETrainer:
         dataset_size = len(self.dataloader.dataset)
         step = 0
 
+        best_score = -float("inf")       # best harmonic mean so far
+        best_state = None                # best model state_dict
+        patience = self.num_epochs                 
+        patience_counter = 0
+
+
         # ───────── outer progress bar over epochs ─────────
         epoch_bar = tqdm(
             range(1, self.num_epochs + 1),
@@ -195,6 +202,7 @@ class VAETrainer:
                     val_correct += (cls_logits.argmax(dim=-1) == P).sum().item()
                     val_n += P.size(0)
 
+
             # ──────────── epoch-level metrics ────────────
             actuals = np.concatenate([a.numpy() for a in actuals], axis=0)
             preds   = np.concatenate([p.numpy() for p in preds],   axis=0)
@@ -205,14 +213,15 @@ class VAETrainer:
             coeff_now = self.vae.center_coeff.item()
 
 
+
             # ───── Pi percentiles (print NaN during warm-up) ─────
             if "q_pi_logits" in pyro.get_param_store():
                 q_pi = F.sigmoid(pyro.param("q_pi_logits").detach())
                 pi25 = torch.quantile(q_pi, 0.25).item()
-                pi99 = torch.quantile(q_pi, 0.99).item()
+                pi75 = torch.quantile(q_pi, 0.99).item()
             else:                     # gate not yet enabled
                 pi25 = float("nan")
-                pi99 = float("nan")
+                pi75 = float("nan")
 
 
             epoch_bar.set_postfix(
@@ -221,7 +230,25 @@ class VAETrainer:
                 acc=f"{acc:.3f}",
                 R2=f"{r2:.4f}",
                 pi25=f"{pi25:.2f}",
-                pi99=f"{pi99:.2f}",
+                pi75=f"{pi75:.2f}",
                 lambda_center=f"{coeff_now:.6f}",
                 tau=f"{tau_now:.4f}",
             )
+
+            # ───── harmonic mean of accuracy and R² ─────
+            if (acc + r2) > 0:
+                score = 2 * acc * r2 / (acc + r2)
+            else:
+                score = 0.0
+
+            if score > best_score or epoch < self.num_epochs // 2:
+                best_score = score
+                best_state = copy.deepcopy(self.vae)
+                patience_counter = 0
+
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"⏹ Early stopping at epoch {epoch} (best score={best_score:.4f})")
+                    return best_state
+        return best_state
