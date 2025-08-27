@@ -10,6 +10,8 @@ from typing import Sequence, Union, Literal, Tuple, List
 from numpy.linalg import svd
 from statsmodels.stats.multitest import multipletests
 import pyro
+import torch
+import torch.nn.functional as F
 
 Array = Union[np.ndarray, torch.Tensor]
 
@@ -318,3 +320,4 @@ def get_bipartite_graph(mode : Literal["weighted", "threshold", "fdr"] = "weight
         )
         mask = torch.as_tensor(rejected, dtype=torch.uint8).reshape_as(q_pi)
         return mask
+    

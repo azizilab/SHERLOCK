@@ -14,12 +14,6 @@ class QRCov(nn.Module):
     def _canonicalize(self):
         # Reduced QR
         Q, R = torch.linalg.qr(self.U_unproj, mode="reduced")
-        
-        # Fix column signs via R's diagonal so Q is canonical up to permutation
-        # diag = torch.diag(R)
-        # signs = torch.sign(diag)
-        # signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-        # Q = Q * signs  # (d, r)
 
         # Order columns by descending scale (exp(log_s))
         s = torch.exp(self.log_s)                    
@@ -33,8 +27,42 @@ class QRCov(nn.Module):
         Q, s = self._canonicalize()
         S = torch.diag(s)
         return Q @ S
+    
+    
+@torch.no_grad()
+def init_QRCov(vae, dataloader, top_r=None, sigma0=0.05, eps=1e-6):
+    device = vae.device
+    P, D = vae.perturbs, vae.input_dim
+    r = top_r or vae.qr.U_unproj.shape[1]
 
+    sums = torch.zeros(P, D, device=device)
+    counts = torch.zeros(P, device=device)
 
+    for x_p, x_ntc, p, c in dataloader:
+        x_p = x_p.to(device).float()
+        p   = p.to(device).long()
+        sums.index_add_(0, p, x_p)
+        counts.index_add_(0, p, torch.ones_like(p, dtype=torch.float))
+
+    means = sums / counts.clamp_min(1.0).unsqueeze(-1)           
+    means = (means - means.mean(0)) / (means.std(0) + 1e-6)     
+
+    covP = (means @ means.t()) / D
+    covP = 0.5 * (covP + covP.t()) + eps * torch.eye(P, device=device)
+
+    evals, evecs = torch.linalg.eigh(covP)
+    idx = torch.argsort(evals, descending=True)[:r]
+    lam = evals[idx].clamp_min(eps)                              
+    Q0  = evecs[:, idx].contiguous()                              
+
+    s0_sq = (lam - sigma0**2).clamp_min(eps)
+    s0 = torch.sqrt(s0_sq)
+
+    vae.qr.U_unproj.data.copy_(Q0)                               
+    vae.qr.log_s.data.copy_(s0.log())                             
+
+    if "sigma_fac" in pyro.get_param_store():
+        pyro.param("sigma_fac").data.fill_(sigma0)
 
 
 class VAE(nn.Module):
@@ -139,7 +167,8 @@ class VAE(nn.Module):
     
     def _corr(self, M, eps=1e-8):
         d = torch.sqrt(torch.clamp(torch.diag(M), min=eps))
-        return M / (d[:, None] * d[None, :] + eps)
+        denom = torch.outer(d, d)
+        return M / torch.clamp(denom, min=eps)
     
     def _laplacian_loss(self, rho, cov):
         corr = self._corr(cov)
@@ -147,6 +176,11 @@ class VAE(nn.Module):
         C_cov.fill_diagonal_(1.0)
         L = torch.diag(C_cov.sum(1)) - C_cov
         return torch.trace(rho.T @ L @ rho) / (self.perturbs)
+    
+    def _eigen_gap(s, margin=1e-3, weight=1e-2):
+        gaps = s[:-1] - s[1:]
+        penalty = F.relu(margin - gaps).sum()
+        return weight * penalty
 
 
     def model(self, x_p, x_ntc, p, c):
@@ -158,6 +192,7 @@ class VAE(nn.Module):
 
         
         # row covariance across perturbations
+        #L, s = self.qr()
         L = self.qr()
         sigma = pyro.param(
             "sigma_fac",
@@ -168,7 +203,11 @@ class VAE(nn.Module):
         
         # shrinkage on sigma with tight half normal prior(normalisation dosn't matter)
         pyro.factor("half_normal_energy", -0.5*(sigma/0.05)**2)
-
+        
+        # eigen gap
+        # gap_pen = self._eigen_gap(s, margin=1e-3, weight=1e-2)
+        # pyro.factor("eig_gap", -gap_pen)
+        
         # rho noise
         with pyro.plate("perturbations", self.perturbs):
             rho_single = pyro.sample(
