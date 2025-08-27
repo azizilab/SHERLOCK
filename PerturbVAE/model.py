@@ -4,20 +4,38 @@ from pyro.distributions import constraints
 from module import GeneModuleEncoder, SparseModuleTransform
 import torch.nn as nn
 
+
 class QRCov(nn.Module):
     def __init__(self, d, r, device):
         super().__init__()
-        self.U_unproj = nn.Parameter(0.01*torch.randn(d, r, device=device))
-        self.log_s    = nn.Parameter(torch.linspace(0., -1., r, device=device))
+        self.U_unproj = nn.Parameter(0.01 * torch.randn(d, r, device=device))
+        self.log_s    = nn.Parameter(torch.linspace(0., -2., r, device=device))  # unconstrained
 
-    def U(self):
-        Q, _ = torch.linalg.qr(self.U_unproj, mode="reduced")
-        return Q
+    def _canonicalize(self):
+        # Reduced QR
+        Q, R = torch.linalg.qr(self.U_unproj, mode="reduced")
+        
+        # Fix column signs via R's diagonal so Q is canonical up to permutation
+        # diag = torch.diag(R)
+        # signs = torch.sign(diag)
+        # signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+        # Q = Q * signs  # (d, r)
+
+        # Order columns by descending scale (exp(log_s))
+        s = torch.exp(self.log_s)                    
+        perm = torch.argsort(s, descending=True)      
+        Q_sorted = Q[:, perm]
+        s_sorted = s[perm]
+        return Q_sorted, s_sorted
 
     def forward(self):
-        U = self.U()                              
-        S = torch.diag(torch.exp(self.log_s))     
-        return U @ S                  
+        # Return the low-rank factor L = Q @ diag(s)
+        Q, s = self._canonicalize()
+        S = torch.diag(s)
+        return Q @ S
+
+
+
 
 class VAE(nn.Module):
     # -----------------------------------------------------------------
@@ -162,13 +180,14 @@ class VAE(nn.Module):
         chol_P = torch.linalg.cholesky(row_cov)
         
         # left-multiply(covariance reparameterization)
-        rho_single = chol_P @ rho_single
+        if self.gate_on:
+            rho_single = chol_P @ rho_single
         A = self.rho_dec(rho_single) / math.sqrt(self.latent_dim)  # (P,d)
 
         if self.gate_on:
             # Beta–Bernoulli gate  (shape P×d) ----------------------------
             alpha = torch.tensor(1.0, device=self.device)   # broader prior
-            beta  = torch.tensor(20.0, device=self.device)
+            beta  = torch.tensor(40.0, device=self.device)
             tau   = pyro.param("tau_temp",
                                 torch.tensor(self.tau_hi, device=self.device),
                                 constraint=constraints.positive)
@@ -298,24 +317,6 @@ class VAE(nn.Module):
                     logits=q_pi_logits          # important!
                 ).to_event(2)
             )
-        
-        # kappa = 2.0
-        # a0 = 0.05 * kappa
-        # b0 = 0.95 * kappa
-
-        # q_alpha = pyro.param(
-        #     "q_alpha",
-        #     torch.full((self.perturbs, self.latent_dim), a0, device=self.device),
-        #     constraint=constraints.positive
-        # )
-        # q_beta  = pyro.param(
-        #     "q_beta",
-        #     torch.full((self.perturbs, self.latent_dim), b0, device=self.device),
-        #     constraint=constraints.positive
-        # )
-        # tau = pyro.param("tau_temp", torch.tensor(1.0, device=self.device),
-        #                 constraint=constraints.positive)
-        # pi = pyro.sample("pi",   dist.Beta(q_alpha, q_beta).to_event(2))
 
     
 
@@ -329,5 +330,7 @@ class VAE(nn.Module):
 
             z0_mu, z0_logvar = self.z0_encoder(torch.cat([x_ntc], dim=-1)).chunk(2, dim=-1)
             z0_std = (0.5 * z0_logvar).exp()
-            pyro.sample("z0", dist.Normal(z0_mu, z0_std).to_event(1))
+            pyro.sample("z0", dist.Normal(z0_mu, z0_std).to_event(1))    
+
+
         

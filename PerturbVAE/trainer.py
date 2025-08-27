@@ -218,7 +218,7 @@ class VAETrainer:
             if "q_pi_logits" in pyro.get_param_store():
                 q_pi = F.sigmoid(pyro.param("q_pi_logits").detach())
                 pi25 = torch.quantile(q_pi, 0.25).item()
-                pi75 = torch.quantile(q_pi, 0.99).item()
+                pi75 = torch.quantile(q_pi, 0.75).item()
             else:                     # gate not yet enabled
                 pi25 = float("nan")
                 pi75 = float("nan")
