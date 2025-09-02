@@ -144,26 +144,29 @@ class VAE(nn.Module):
                              torch.tensor(center_coeff_init, dtype=torch.float32))
         
         self.gate_on   = False    
-        self.tau_hi    = 5.0
+        self.tau_hi    = 1.0
         self.tau_lo    = 0.1
         
         
         # cov params
         self.qr = QRCov(self.perturbs, 6, device=self.device)
     
-    # expectation of perturbation simlarity based on pi
-    def E_pert_sim(self, min_conf=0.2):
-        q_pi_logits = pyro.param("q_pi_logits")
-        pi_probs = torch.sigmoid(q_pi_logits).detach()
-        conf = (pi_probs - 0.5).abs() * 2.0   
-        mask = (conf >= min_conf).float()
-        pi_eff = pi_probs * mask            
-        S = pi_eff @ pi_eff.T
-        m = S.max()
-        if m > 0:
-            S = S / m
-        S.fill_diagonal_(1.0)
-        return S
+    # similar pert have similar W
+    def _w_laplacian_reg(self, pi, cov, thres=0.4):
+        rho_cov = cov.detach()
+        corr = self._corr(rho_cov)
+        adj = F.relu(corr - thres).fill_diagonal_(0.)
+        D = torch.diag(adj.sum(1))
+        Lap = D - adj
+        return torch.trace(pi.T @ Lap @ pi) / self.perturbs    
+
+    def _get_cov(self):
+        L = self.qr().detach()
+        sigma_P = pyro.param("sigma_fac").detach()
+        P_ = L.size(0)
+        eyeP = torch.eye(P_, dtype=L.dtype, device=L.device)
+        Sigma_P = L @ L.T + (sigma_P**2) * eyeP
+        return Sigma_P
     
     def _corr(self, M, eps=1e-8):
         d = torch.sqrt(torch.clamp(torch.diag(M), min=eps))
@@ -225,8 +228,8 @@ class VAE(nn.Module):
 
         if self.gate_on:
             # Beta–Bernoulli gate  (shape P×d) ----------------------------
-            alpha = torch.tensor(1.0, device=self.device)   # broader prior
-            beta  = torch.tensor(40.0, device=self.device)
+            alpha = torch.tensor(0.5, device=self.device)   
+            beta  = torch.tensor(0.5, device=self.device)
             tau   = pyro.param("tau_temp",
                                 torch.tensor(self.tau_hi, device=self.device),
                                 constraint=constraints.positive)
@@ -240,7 +243,7 @@ class VAE(nn.Module):
             
             # loss_lap = self._laplacian_loss(rho_single, row_cov)
             # pyro.factor("smoothness_reg", -1.0 * loss_lap)
-            
+
             # E_S = self.E_pert_sim()
             # corr = self._corr(row_cov)
             # norm = (corr - E_S).pow(2).mean()
@@ -305,10 +308,9 @@ class VAE(nn.Module):
                         # obs=x_p.float(), infer={"scale": 1e-3})
 
             # centre loss
-            ctr = ((z - rho_single[p].detach())**2).sum()
-            pyro.factor("center_loss", -1e-2 * ctr)
-            # ctr = (z - rho_single[p]).pow(2).sum()   
-            # pyro.factor("center_loss", -1e-2 * ctr)
+            ctr = ((z - rho_single[p])**2).sum()
+            pyro.factor("center_loss", -0.01 * ctr)
+            
 
             # reg = self.z_decoder.regularization_loss(
             #     l1=1.0,         
@@ -340,6 +342,19 @@ class VAE(nn.Module):
             )                       
 
             q_pi = torch.sigmoid(q_pi_logits)            # (P, d) probability view
+            
+            # bi-modal energy
+            # penalty = (q_pi * (1 - q_pi)).sum()
+            # pyro.factor("bimodal_energy", -1.0 * penalty, has_rsample=False)
+            
+            # graph reg
+            rho_cov = self._get_cov()
+            graph_reg = self._w_laplacian_reg(q_pi, rho_cov, thres=0.7)
+            pyro.factor("graph_reg", -1e-1 * graph_reg, has_rsample=True)
+
+            # l1 on W
+            l1_reg = torch.abs(q_pi).sum()
+            pyro.factor("l1_reg", -1e-1 * l1_reg, has_rsample=True)
 
             tau = pyro.param("tau_temp",
                             torch.tensor(self.tau_hi, device=self.device),
