@@ -40,7 +40,7 @@ class QRCov(nn.Module):
 class VAE(nn.Module):
     # -----------------------------------------------------------------
     def __init__(self, input_dim, latent_dim, perturbs, conds,
-                 beta, module_var, hidden_dims=(16,),
+                 beta, module_var, tau, hidden_dims=(16,),
                  center_coeff_init=1e-2, use_gene_modules=False):
         super().__init__()
         self.input_dim   = input_dim
@@ -116,8 +116,7 @@ class VAE(nn.Module):
                              torch.tensor(center_coeff_init, dtype=torch.float32))
         
         self.gate_on   = False    
-        self.tau_hi    = 5.0
-        self.tau_lo    = 0.1
+        self.tau_init = tau
         
         
         # cov params
@@ -139,7 +138,16 @@ class VAE(nn.Module):
     
     def _corr(self, M, eps=1e-8):
         d = torch.sqrt(torch.clamp(torch.diag(M), min=eps))
-        return M / (d[:, None] * d[None, :] + eps)
+        denom = torch.outer(d, d)
+        return M / torch.clamp(denom, min=eps)
+    
+    def _get_cov(self):
+        L = self.qr().detach()
+        sigma_P = pyro.param("sigma_fac").detach()
+        P_ = L.size(0)
+        eyeP = torch.eye(P_, dtype=L.dtype, device=L.device)
+        Sigma_P = L @ L.T + (sigma_P**2) * eyeP
+        return Sigma_P
     
     def _laplacian_loss(self, rho, cov):
         corr = self._corr(cov)
@@ -182,15 +190,16 @@ class VAE(nn.Module):
         # left-multiply(covariance reparameterization)
         if self.gate_on:
             rho_single = chol_P @ rho_single
-        A = self.rho_dec(rho_single) / math.sqrt(self.latent_dim)  # (P,d)
+        A = rho_single  # (P,d)
+        # A = self.rho_dec(rho_single) / math.sqrt(self.latent_dim)  # (P,d)
 
         if self.gate_on:
             # Beta–Bernoulli gate  (shape P×d) ----------------------------
-            alpha = torch.tensor(1.0, device=self.device)   # broader prior
-            beta  = torch.tensor(40.0, device=self.device)
             tau   = pyro.param("tau_temp",
-                                torch.tensor(self.tau_hi, device=self.device),
+                                torch.tensor(self.tau_init, device=self.device),
                                 constraint=constraints.positive)
+            alpha = torch.tensor(1.0, device=self.device)   # broader prior
+            beta  = torch.tensor(10.0, device=self.device)
         
             pi = pyro.sample("pi", dist.Beta(alpha, beta).expand([self.perturbs, self.latent_dim]).to_event(2))          # (P,d)
             s_gate = pyro.sample("s_gate", dist.RelaxedBernoulliStraightThrough(temperature=tau, probs=pi).to_event(2))
@@ -198,6 +207,31 @@ class VAE(nn.Module):
             W = s_gate   
                                         
             pyro.deterministic("W", W)
+
+            # C = row_cov.detach()
+            # deg = C.sum(dim=1)
+            # L  = torch.diag(deg) - C
+            # D  = torch.diag(deg).clamp_min(1e-6)
+            # #smoothness
+            # num = (W.T @ L @ W).diagonal()
+            # den = (W.T @ D @ W).diagonal().clamp_min(1e-6)
+            # smooth = (num / den).sum()
+            # #penalize off-diagonals
+            # CW   = C @ W
+            # cnrm = (W * CW).sum(dim=0, keepdim=True).clamp_min(1e-6)  # each col: w^T C w
+            # Wc   = W / cnrm.sqrt()                                  
+
+            # G = (Wc.T @ C @ Wc)                                     
+            # off = G - torch.diag(torch.diag(G))
+            # orth = (off**2).sum()
+
+            # #elbo can be too weak early
+            # sparsity = W.abs().sum()
+
+
+
+            # pyro.factor("graph_smoothness", -1/(max(tau, 1)*1e13) * smooth)    
+            # pyro.factor("cov_orthogonality", -1/(max(tau, 1)*1e13) * orth)
             
             # loss_lap = self._laplacian_loss(rho_single, row_cov)
             # pyro.factor("smoothness_reg", -1.0 * loss_lap)
@@ -250,8 +284,8 @@ class VAE(nn.Module):
             # CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
             # pyro.factor("CE_loss", -1.0*CE_loss)
             
-            CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
-            pyro.factor("CE_loss", -1.0 * CE_loss)
+            CE_loss = F.cross_entropy(cls_logits, p, reduction="mean")
+            pyro.factor("CE_loss", -1e2 * CE_loss)
 
             logits_gene = self.z_decoder(z)#.clamp(-8., 8.)
             total_counts = x_p.sum(-1, keepdim=True)#.clamp(min=1.)
@@ -262,12 +296,15 @@ class VAE(nn.Module):
             pyro.sample("X",
                         dist.NegativeBinomial(total_count=theta,
                                               logits=logits_nb).to_event(1),
-                        obs=x_p.float())
-                        # obs=x_p.float(), infer={"scale": 1e-3})
+                        # obs=x_p.float())
+                        obs=x_p.float(), infer={"scale": 1e-3})
 
             # centre loss
-            ctr = ((z - rho_single[p].detach())**2).sum()
-            pyro.factor("center_loss", -1e-2 * ctr)
+            if self.gate_on:
+                ctr = ((z - rho_single[p].detach())**2).mean()
+            else:
+                ctr = 0
+            pyro.factor("center_loss", -1e-1 * ctr)
             # ctr = (z - rho_single[p]).pow(2).sum()   
             # pyro.factor("center_loss", -1e-2 * ctr)
 
@@ -303,11 +340,11 @@ class VAE(nn.Module):
             q_pi = torch.sigmoid(q_pi_logits)            # (P, d) probability view
 
             tau = pyro.param("tau_temp",
-                            torch.tensor(self.tau_hi, device=self.device),
+                            torch.tensor(self.tau_init, device=self.device),
                             constraint=constraints.positive)
 
             # MAP point-estimate for π
-            pyro.sample("pi", dist.Delta(q_pi).to_event(2))
+            pi = pyro.sample("pi", dist.Delta(q_pi).to_event(2))
 
             # gate, using the SAME logits so gradients flow straight back
             pyro.sample(
@@ -317,6 +354,58 @@ class VAE(nn.Module):
                     logits=q_pi_logits          # important!
                 ).to_event(2)
             )
+
+            rho_cov = self._get_cov()
+            rho_corr = self._corr(rho_cov).clone().detach()
+
+            # adj  = F.relu(rho_corr)
+            # adj.fill_diagonal_(0.)
+            adj = F.relu(rho_corr - 0.45).fill_diagonal_(0.)
+            deg  = adj.sum(1)
+            # L    = torch.diag(deg) - adj
+            D    = torch.diag(deg).clamp_min(1e-6)
+            # num  = (pi.T @ L @ pi).diagonal()
+            # den  = (pi.T @ D @ pi).diagonal().clamp_min(1e-6)
+            # smooth = (num / den).sum()
+
+            # # G = pi.T @ rho_corr.clone().detach() @ pi
+            # # smooth = torch.trace(G)
+
+            # CW  = rho_corr @ pi
+            # cn  = (pi * CW).sum(0, keepdim=True).clamp_min(1e-6)
+            # PiC = pi / cn.sqrt()
+            # G   = PiC.T @ rho_corr @ PiC
+            # off = G - torch.diag(torch.diag(G))
+            # orth = (off**2).sum()
+
+
+
+             # --- graph smoothness ---
+            pi_norm = pi / (pi.norm(dim=0, keepdim=True) + 1e-6)
+            # num = (pi_norm.T @ L @ pi_norm).diagonal()
+            # den = (pi_norm.T @ D @ pi_norm).diagonal().clamp_min(1e-6)
+            # smooth = (num / den).sum()
+            # deg_inv_sqrt = D.pow_(-0.5)
+            # deg_inv_sqrt.masked_fill_(deg_inv_sqrt == float('inf'), 0)
+            # A_norm = deg_inv_sqrt @ adj @ deg_inv_sqrt
+
+            # L = I - A_norm.
+            L = D - adj
+            smooth = torch.trace(pi_norm.T @ L @ pi) / (self.perturbs)
+
+            # --- orthogonality ---
+            G = pi_norm.T @ D @ pi_norm
+            off = G - torch.diag(torch.diag(G))
+            orth = (off**2).sum()
+
+            # off_diag = G - torch.diag(torch.diag(G))
+            # orth = (off_diag**2).sum()
+
+            # sparsity = pi.sum()
+
+            pyro.factor("graph_smoothness", -1e-2 * smooth, has_rsample=True)    
+            pyro.factor("cov_orthogonality", -1e-2 * orth, has_rsample=True)
+            # pyro.factor("mask_sparsity", -1e1 * sparsity, has_rsample=True)
 
     
 

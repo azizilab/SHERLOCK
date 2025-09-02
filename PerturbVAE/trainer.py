@@ -46,8 +46,8 @@ class VAETrainer:
         self.verbose = verbose
 
         self.gate_start = gate_start         # # warm-up epochs
-        self.tau_hi = vae.tau_hi
-        self.tau_lo = vae.tau_lo
+        self.tau_hi = tau_init
+        self.tau_lo = tau_end
 
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -112,8 +112,9 @@ class VAETrainer:
         dataset_size = len(self.dataloader.dataset)
         step = 0
 
-        best_score = -float("inf")       # best harmonic mean so far
+        best_score = float("inf")       # best harmonic mean so far
         best_state = None                # best model state_dict
+        param_store = None
         patience = self.num_epochs                 
         patience_counter = 0
 
@@ -241,14 +242,21 @@ class VAETrainer:
             else:
                 score = 0.0
 
-            if score > best_score or epoch < self.num_epochs // 2:
+            score = avg_elbo
+
+            if score < best_score or epoch < self.num_epochs // 2:
                 best_score = score
                 best_state = copy.deepcopy(self.vae)
+                param_store = copy.deepcopy(pyro.get_param_store().get_state())
                 patience_counter = 0
 
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
                     print(f"⏹ Early stopping at epoch {epoch} (best score={best_score:.4f})")
+                    pyro.clear_param_store()                                     
+                    pyro.get_param_store().set_state(param_store)
                     return best_state
-        return best_state
+        pyro.clear_param_store()                                     
+        pyro.get_param_store().set_state(param_store)
+        return best_state, param_store
