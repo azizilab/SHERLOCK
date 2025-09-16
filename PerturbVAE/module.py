@@ -156,7 +156,8 @@ class SparseModuleTransform(nn.Module):
         self.bias = nn.Parameter(torch.zeros(hidden_dim))
         nn.init.xavier_uniform_(self.input_to_hidden)
         nn.init.zeros_(self.bias)
-
+        
+        self.hidden_to_hidden = nn.Linear(hidden, hidden)
         self.hidden_to_out = nn.Linear(hidden, 2 if inference else 1)  # Output is mean and log variance
 
         group_sizes = base_mask.sum(dim=0).to(torch.float32) * hidden
@@ -173,6 +174,8 @@ class SparseModuleTransform(nn.Module):
         h = x @ masked_weight + self.bias 
         h = self.activation(h)
         h = h.view(x.shape[0], self.out_dim, self.hidden) # N x latent x hidden
+        h = self.hidden_to_hidden(h)
+        h = self.activation(h)
 
         # Final projection to output
         return self.hidden_to_out(h).squeeze(-1) # N x latent x 2 (mean, logvar if inference)

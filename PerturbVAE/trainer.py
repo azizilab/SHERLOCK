@@ -5,7 +5,7 @@ import numpy as np
 import copy
 import torch
 from torch.utils.data import DataLoader
-from pyro.infer import SVI, Trace_ELBO
+from pyro.infer import SVI, Trace_ELBO, RenyiELBO
 from pyro.optim import Adam, ClippedAdam
 import pyro, pyro.poutine as poutine
 from sklearn.metrics import r2_score
@@ -13,6 +13,10 @@ from tqdm import tqdm
 from PerturbVAE.model import VAE
 from tqdm.auto import tqdm
 import torch.nn.functional as F
+import anndata
+import pandas as pd
+from scipy.stats import pearsonr
+
 
 
 
@@ -22,6 +26,7 @@ class VAETrainer:
         self,
         vae: VAE,
         dataloader: DataLoader,
+        treat_effect: anndata.AnnData,
         lr: float = 5e-4,
         num_epochs: int = 10,
         init_coeff: float = 1e-2,
@@ -44,6 +49,7 @@ class VAETrainer:
         self.tau_end   = tau_end
         self.tau_anneal_steps = tau_anneal_steps
         self.verbose = verbose
+        self.treat_effect = treat_effect
 
         self.gate_start = gate_start         # # warm-up epochs
         self.tau_hi = tau_init
@@ -69,6 +75,7 @@ class VAETrainer:
             # ClippedAdam({"lr": lr, 'clip_norm': 5.0}),
             Adam({"lr": lr}),
             loss=Trace_ELBO(),
+            # loss=RenyiELBO(alpha=0, num_particles=10)
         )
 
         # reproducibility
@@ -128,7 +135,9 @@ class VAETrainer:
 
         for epoch in epoch_bar:
             epoch_loss = 0.0
-            preds, actuals = [], []
+            preds_p, actuals_p = [], []
+            preds_ntc, actuals_ntc = [], []
+            pis = torch.zeros([self.vae.perturbs, self.vae.latent_dim])
 
             # ----- switch gate ON exactly at gate_start ------------
             if (not self.vae.gate_on) and epoch >= self.gate_start:
@@ -178,25 +187,37 @@ class VAETrainer:
             val_loader = getattr(self, "val_dataloader", self.dataloader)
             val_ce_sum, val_correct, val_n = 0.0, 0, 0
 
-            with torch.no_grad():
-                for X_p, X_ntc, P, C in val_loader:
-                    X_p = X_p.to(self.device, dtype=torch.float32)
-                    X_ntc = X_ntc.to(self.device, dtype=torch.float32)
-                    P = P.to(self.device, dtype=torch.long)
-                    C = C.to(self.device, dtype=torch.long)
+            all_P = []
 
-                    # guide → model replay
+            with torch.no_grad():
+                all_P = []
+                val_ce_sum, val_correct, val_n = 0.0, 0, 0
+
+                for batch_idx, (X_p, X_ntc, P, C) in enumerate(val_loader):
+                    # --- move to device ---
+                    X_p  = X_p.to(self.device, dtype=torch.float32)
+                    X_ntc = X_ntc.to(self.device, dtype=torch.float32)
+                    P    = P.to(self.device, dtype=torch.long)
+                    C    = C.to(self.device, dtype=torch.long)
+
+                    all_P.append(P.cpu().numpy())
+
+                    # --- guide → model replay ---
                     guide_tr = poutine.trace(self.vae.guide).get_trace(X_p, X_ntc, P, C)
                     model_tr = poutine.trace(
                         poutine.replay(self.vae.model, guide_tr)
                     ).get_trace(X_p, X_ntc, P, C)
 
-                    # regression predictions
-                    x_mu = model_tr.nodes["x_mu"]["value"]
-                    actuals.append(X_p.cpu())
-                    preds.append(x_mu.cpu())
+                    # --- decoded counts directly from model trace ---
+                    x_p   = model_tr.nodes["x_p"]["value"]
+                    x_ntc = model_tr.nodes["x_ntc"]["value"]
 
-                    # ───── classification metrics
+                    actuals_p.append(X_p.cpu())
+                    preds_p.append(x_p.detach().cpu())
+                    actuals_ntc.append(X_ntc.cpu())
+                    preds_ntc.append(x_ntc.detach().cpu())
+
+                    # --- classification metric ---
                     cls_logits = model_tr.nodes["cls_logits"]["value"]
                     ce_batch   = F.cross_entropy(cls_logits, P, reduction="sum")
                     val_ce_sum += ce_batch.item()
@@ -204,43 +225,97 @@ class VAETrainer:
                     val_n += P.size(0)
 
 
+
+
+
             # ──────────── epoch-level metrics ────────────
-            actuals = np.concatenate([a.numpy() for a in actuals], axis=0)
-            preds   = np.concatenate([p.numpy() for p in preds],   axis=0)
-            r2      = r2_score(actuals.flatten(), preds.flatten())
+            actuals_p = np.concatenate([a.numpy() for a in actuals_p], axis=0)
+            preds_p   = np.concatenate([p.numpy() for p in preds_p],   axis=0)
+            r2_p      = r2_score(actuals_p.flatten(), preds_p.flatten())
+            actuals_ntc = np.concatenate([a.numpy() for a in actuals_ntc], axis=0)
+            preds_ntc   = np.concatenate([p.numpy() for p in preds_ntc],   axis=0)
+            r2_ntc      = r2_score(actuals_ntc.flatten(), preds_ntc.flatten())
+
+            # convert to perturb-seq space for ATE metric
+            # ---- normalize preds into Perturb-seq space ----
+            lib_p = preds_p.sum(axis=1, keepdims=True)
+            preds_p = 1e4 * preds_p / lib_p
+            preds_p = np.log2(preds_p + 1.0)
+
+            lib_ntc = preds_ntc.sum(axis=1, keepdims=True)
+            preds_ntc = 1e4 * preds_ntc / lib_ntc
+            preds_ntc = np.log2(preds_ntc + 1.0)
+            ###############
+
+
             avg_elbo = epoch_loss / dataset_size
             ce_loss  = val_ce_sum / val_n
             acc      = val_correct / val_n
             coeff_now = self.vae.center_coeff.item()
 
 
+            #Treatment effect
+            dataset = self.dataloader.dataset
+            n_perts   = len(dataset.perturbation_dict)
+            n_genes   = preds_p.shape[1]
+
+            effect = np.zeros((n_perts, n_genes))
+
+            # Loop over perturbations by index
+            P = np.concatenate(all_P)
+            for pert_name, j in dataset.perturbation_dict.items():
+                mask = (P == j)                         # cells for this perturbation
+                if not mask.any():
+                    continue                            # skip if no cells for this perturbation
+                mean_p   = preds_p[mask].mean(axis=0)   # mean of perturbed cells
+                mean_ntc = preds_ntc[mask].mean(axis=0) # mean of matched controls
+                effect[j] = mean_p - mean_ntc
+
+            effect_df = pd.DataFrame(
+                effect, 
+                index=list(dataset.perturbation_dict.keys()), 
+                columns=self.treat_effect.var_names
+            )
+
+            effect_aligned = effect_df.loc[self.treat_effect.obs_names, self.treat_effect.var_names]
+
+            x = effect_aligned.values.flatten()
+            y = self.treat_effect.X.flatten()
+
+            # Pearson correlation
+            ate, pval = pearsonr(x, y)
 
             # ───── Pi percentiles (print NaN during warm-up) ─────
+            # pis = pis.flatten() / (batch_idx+1)
+            # pi25 = torch.quantile(pis, 0.25).item()
+            # pi99 = torch.quantile(pis, 0.99).item()
             if "q_pi_logits" in pyro.get_param_store():
                 q_pi = F.sigmoid(pyro.param("q_pi_logits").detach())
                 pi25 = torch.quantile(q_pi, 0.25).item()
-                pi75 = torch.quantile(q_pi, 0.75).item()
+                pi99 = torch.quantile(q_pi, 0.99).item()
             else:                     # gate not yet enabled
                 pi25 = float("nan")
-                pi75 = float("nan")
+                pi99 = float("nan")
 
 
             epoch_bar.set_postfix(
                 ELBO=f"{avg_elbo:.4f}",
                 CE=f"{ce_loss:.4f}",
                 acc=f"{acc:.3f}",
-                R2=f"{r2:.4f}",
+                R2_p=f"{r2_p:.4f}",
+                R2_ntc=f"{r2_ntc:.4f}",
+                ATE=f"{ate:.4f}",
                 pi25=f"{pi25:.2f}",
-                pi75=f"{pi75:.2f}",
+                pi99=f"{pi99:.2f}",
                 lambda_center=f"{coeff_now:.6f}",
                 tau=f"{tau_now:.4f}",
             )
 
             # ───── harmonic mean of accuracy and R² ─────
-            if (acc + r2) > 0:
-                score = 2 * acc * r2 / (acc + r2)
-            else:
-                score = 0.0
+            # if (acc + r2) > 0:
+            #     score = 2 * acc * r2 / (acc + r2)
+            # else:
+            #     score = 0.0
 
             score = avg_elbo
 

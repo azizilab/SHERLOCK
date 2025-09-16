@@ -131,14 +131,14 @@ class PerturbMatchingDataset(Dataset):
 
     """
 
-    def __init__(self, anndata, NTC: str = "NTC", seed: int | None = None):
+    def __init__(self, anndata, NTC: str = "NTC", p_key: str = "top_sg", seed: int | None = None):
         rng = np.random.default_rng(seed)
 
-        pert_anndata = anndata[anndata.obs["top_sg"] != NTC]
-        ntc_anndata = anndata[anndata.obs["top_sg"] == NTC]
+        pert_anndata = anndata[anndata.obs[p_key] != NTC]
+        ntc_anndata = anndata[anndata.obs[p_key] == NTC]
 
         # ── metadata columns ────────────────────────────────────────────
-        pertlbl      = pert_anndata.obs["top_sg"].values
+        pertlbl      = pert_anndata.obs[p_key].values
         condlbl = pert_anndata.obs["treatment"].values
 
         # unique conditions
@@ -148,11 +148,16 @@ class PerturbMatchingDataset(Dataset):
         self.perturbation_dict = {p: i for i, p in enumerate(pert_unique)}
         self.condition_dict = {c: i for i, c in enumerate(cond_unique)}
 
+        # if perturbation is on var, find indices
+        self.perturbed_idx = np.where(anndata.var.index.isin(pert_unique))[0]
+        self.perturbed_names = anndata.var.index[self.perturbed_idx].tolist()
+
+
         # ── expression matrix ───────────────────────────────────────────
         self.X_ntc = [ntc_anndata[ntc_anndata.obs.treatment == cond].X.toarray() for cond in cond_unique]
         self.X_pert = pert_anndata.X.toarray() if hasattr(pert_anndata.X, "toarray") else pert_anndata.X
 
-        self.P = pert_anndata.obs['top_sg'].values
+        self.P = pert_anndata.obs[p_key].values
         self.C = pert_anndata.obs['treatment'].values
         self.C_ntc = ntc_anndata.obs['treatment'].values
 
