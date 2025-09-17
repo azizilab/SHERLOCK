@@ -64,7 +64,7 @@ class VAE(nn.Module):
             # self.z0_encoder = SparseModuleTransform(input_dim, latent_dim, module_map=module_var, hidden=4)
 
             self.z_encoder = nn.Sequential(
-                nn.Linear(input_dim+2*latent_dim, 128), nn.LeakyReLU(),
+                nn.Linear(input_dim+latent_dim, 128), nn.LeakyReLU(),
                 nn.Linear(128, 128), nn.LeakyReLU(), 
                 nn.Linear(128, latent_dim * 2)
             )
@@ -79,7 +79,7 @@ class VAE(nn.Module):
             
         else:
             self.z_encoder = nn.Sequential(
-                nn.Linear(input_dim+2*latent_dim, 128), nn.LeakyReLU(), nn.LayerNorm(128),
+                nn.Linear(input_dim+latent_dim, 128), nn.LeakyReLU(), nn.LayerNorm(128),
                 nn.Linear(128, 128), nn.LeakyReLU(), nn.LayerNorm(128),
                 nn.Linear(128, latent_dim * 2)
             )
@@ -259,8 +259,8 @@ class VAE(nn.Module):
             pyro.sample("X_ntc",
                         dist.NegativeBinomial(total_count=theta,
                                               logits=logits_ntc).to_event(1),
-                        obs=x_ntc.float())
-                        # obs=x_ntc.float(), infer={"scale": 1e-5}) #1e-5
+                        # obs=x_ntc.float())
+                        obs=x_ntc.float(), infer={"scale": 1e-5}) #1e-5
 
             if self.gate_on:
                 z0_loc = z0_loc * (1. - W[p])                               # (B,d) gate applied
@@ -278,7 +278,7 @@ class VAE(nn.Module):
             # pyro.factor("CE_loss", -1.0*CE_loss)
             
             CE_loss = F.cross_entropy(cls_logits, p, reduction="mean")
-            # pyro.factor("CE_loss", -1e4 * CE_loss)
+            # pyro.factor("CE_loss", -1e2 * CE_loss)
 
             logits_p = self.__decode(x_p, z, self.z_decoder, theta, 'x_p')
             pyro.sample("X",
@@ -339,7 +339,7 @@ class VAE(nn.Module):
                             constraint=constraints.positive)
 
             # MAP point-estimate for π
-            pyro.sample("pi", dist.Delta(q_pi).to_event(2))
+            pi = pyro.sample("pi", dist.Delta(q_pi).to_event(2))
 
             # gate, using the SAME logits so gradients flow straight back
             W = pyro.sample(
@@ -349,6 +349,59 @@ class VAE(nn.Module):
                     logits=q_pi_logits          # important!
                 ).to_event(2)
             )
+
+
+            rho_cov = self._get_cov()
+            rho_corr = self._corr(rho_cov).clone().detach()
+
+            # adj  = F.relu(rho_corr)
+            # adj.fill_diagonal_(0.)
+            adj = F.relu(rho_corr - 0.45).fill_diagonal_(0.)
+            deg  = adj.sum(1)
+            # L    = torch.diag(deg) - adj
+            D    = torch.diag(deg).clamp_min(1e-6)
+            # num  = (pi.T @ L @ pi).diagonal()
+            # den  = (pi.T @ D @ pi).diagonal().clamp_min(1e-6)
+            # smooth = (num / den).sum()
+
+            # # G = pi.T @ rho_corr.clone().detach() @ pi
+            # # smooth = torch.trace(G)
+
+            # CW  = rho_corr @ pi
+            # cn  = (pi * CW).sum(0, keepdim=True).clamp_min(1e-6)
+            # PiC = pi / cn.sqrt()
+            # G   = PiC.T @ rho_corr @ PiC
+            # off = G - torch.diag(torch.diag(G))
+            # orth = (off**2).sum()
+
+
+
+                # --- graph smoothness ---
+            pi_norm = pi / (pi.norm(dim=0, keepdim=True) + 1e-6)
+            # num = (pi_norm.T @ L @ pi_norm).diagonal()
+            # den = (pi_norm.T @ D @ pi_norm).diagonal().clamp_min(1e-6)
+            # smooth = (num / den).sum()
+            # deg_inv_sqrt = D.pow_(-0.5)
+            # deg_inv_sqrt.masked_fill_(deg_inv_sqrt == float('inf'), 0)
+            # A_norm = deg_inv_sqrt @ adj @ deg_inv_sqrt
+
+            # L = I - A_norm.
+            L = D - adj
+            smooth = torch.trace(pi_norm.T @ L @ pi) / (self.perturbs)
+
+            # --- orthogonality ---
+            G = pi_norm.T @ D @ pi_norm
+            off = G - torch.diag(torch.diag(G))
+            orth = (off**2).sum()
+
+            # off_diag = G - torch.diag(torch.diag(G))
+            # orth = (off_diag**2).sum()
+
+            # sparsity = pi.sum()
+
+            pyro.factor("graph_smoothness", -1e1 * smooth, has_rsample=True)    
+            pyro.factor("cov_orthogonality", -1e-1 * orth, has_rsample=True)
+            # pyro.factor("mask_sparsity", -1e1 * sparsity, has_rsample=True)
 
     
 
@@ -361,14 +414,14 @@ class VAE(nn.Module):
             z0_std = (0.5 * z0_logvar).exp()
             z0 = pyro.sample("z0", dist.Normal(z0_mu, z0_std).to_event(1))    
 
-            # z_mu, z_logvar = self.z_encoder(torch.cat([x_p], dim=-1)).chunk(2, dim=-1)
-            # z_std = (0.5 * z_logvar).exp()
-            # pyro.sample("z", dist.Normal(z_mu, z_std).to_event(1))
-            if self.gate_on:
-                lin_shift = A[p] * W[p]                        # (B,d) gate applied
-            else:
-                lin_shift = A[p]  
-            z_loc, z_var = self.__poe(z0_mu, z0_std, lin_shift)  # uses inferred z0 + (A[p] * W[p])
-            pyro.sample("z", dist.Normal(z_loc, z_var.sqrt()).to_event(1))
+            z_mu, z_logvar = self.z_encoder(torch.cat([x_p, self.p_emb_z(p)], dim=-1)).chunk(2, dim=-1)
+            z_std = (0.5 * z_logvar).exp()
+            pyro.sample("z", dist.Normal(z_mu, z_std).to_event(1))
+            # if self.gate_on:
+            #     lin_shift = A[p] * W[p]                        # (B,d) gate applied
+            # else:
+            #     lin_shift = A[p]  
+            # z_loc, z_var = self.__poe(z0_mu, z0_std, lin_shift)  # uses inferred z0 + (A[p] * W[p])
+            # pyro.sample("z", dist.Normal(z_loc, z_var.sqrt()).to_event(1))
 
         
