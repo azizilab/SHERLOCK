@@ -49,6 +49,9 @@ class HardConcreteGate(nn.Module):
         dev = self.log_alpha.device
         temp = self.temperature.to(dev)
         return torch.sigmoid(self.log_alpha - temp * c)
+    
+    def l1_logit(self):
+        return torch.norm(torch.sigmoid(self.log_alpha), p=1)
 
 
 
@@ -91,12 +94,15 @@ class VAE(nn.Module):
     def __init__(self, input_dim, latent_dim, perturbs, conds,
                  beta, module_var, tau, hidden_dims=(16,),
                  center_coeff_init=1e-2, use_gene_modules=False,
-                 l0_lambda=1e-3, cov_lambda=1e-4, gate_init_p=0.5):
+                 l0_lambda=1e-3, l1_lambda=1e-2, cov_lambda=1e-4, gate_init_p=0.5):
         super().__init__()
         self.input_dim   = input_dim
         self.latent_dim  = latent_dim
         self.perturbs    = perturbs
         self.conds       = conds
+        self.l0_lambda   = l0_lambda
+        self.l1_lambda   = l1_lambda
+        self.cov_lambda  = cov_lambda
         self.beta        = beta
         self.center_coeff_init = center_coeff_init
         self.device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -268,6 +274,7 @@ class VAE(nn.Module):
             # L0 penalty encourages stable sparse patterns
             expected_l0 = self.gate.expected_L0().sum()
             pyro.factor("l0_penalty", - self.l0_lambda * expected_l0)
+            pyro.factor("l1_penalty", - self.l1_lambda * self.gate.l1_logit())
 
         # --- cell likelihood -----------------------------------------
         with pyro.plate("cells", x_p.size(0)):
@@ -297,7 +304,7 @@ class VAE(nn.Module):
             cls_logits = self.cls_head(z)
             pyro.deterministic("cls_logits", cls_logits)
             CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
-            pyro.factor("CE_loss", -0.1 * CE_loss)
+            pyro.factor("CE_loss", -CE_loss)
 
             logits_p = self.__decode(x_p, z, self.z_decoder, theta, 'x_p')
             pyro.sample("X",
