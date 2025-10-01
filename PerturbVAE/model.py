@@ -5,6 +5,55 @@ from module import GeneModuleEncoder, SparseModuleTransform
 import torch.nn as nn
 
 
+class HardConcreteGate(nn.Module):
+    def __init__(self, shape, init_p=0.5, temperature=2./3., gamma=-0.1, zeta=1.1):
+        super().__init__()
+        self.shape = shape
+        self.gamma = float(gamma)
+        self.zeta  = float(zeta)
+
+        init_logit = math.log(init_p) - math.log(1. - init_p)
+        self.log_alpha = nn.Parameter(torch.full(shape, init_logit))  
+        self.register_buffer("temperature", torch.tensor(float(temperature)))  
+
+    @torch.no_grad()
+    def set_temperature(self, t: float):
+        self.temperature.fill_(float(t))  
+
+    @torch.no_grad()
+    def anneal_temperature(self, factor=0.98, min_t=0.1):
+        new_t = max(min_t, float(self.temperature) * float(factor))
+        self.temperature.fill_(new_t)
+
+    def _sample_relaxed(self):
+        dev = self.log_alpha.device
+        u = torch.rand(self.shape, device=dev)
+        temp = self.temperature.to(dev)
+        s = torch.sigmoid((self.log_alpha + torch.log(u) - torch.log1p(-u)) / temp)
+        s_bar = s * (self.zeta - self.gamma) + self.gamma
+        return s_bar
+
+    def forward(self, deterministic: bool = False):
+        dev = self.log_alpha.device
+        temp = self.temperature.to(dev)
+        if deterministic:
+            s = torch.sigmoid(self.log_alpha / temp)
+            s_bar = s * (self.zeta - self.gamma) + self.gamma
+        else:
+            s_bar = self._sample_relaxed()
+        z_hard = torch.clamp(s_bar, 0.0, 1.0)
+        return z_hard + (s_bar - z_hard).detach()
+
+    def expected_L0(self):
+        c = math.log(-self.gamma / self.zeta)
+        dev = self.log_alpha.device
+        temp = self.temperature.to(dev)
+        return torch.sigmoid(self.log_alpha - temp * c)
+
+
+
+
+
 class QRCov(nn.Module):
     def __init__(self, d, r, device):
         super().__init__()
@@ -16,10 +65,10 @@ class QRCov(nn.Module):
         Q, R = torch.linalg.qr(self.U_unproj, mode="reduced")
         
         # Fix column signs via R's diagonal so Q is canonical up to permutation
-        # diag = torch.diag(R)
-        # signs = torch.sign(diag)
-        # signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-        # Q = Q * signs  # (d, r)
+        diag = torch.diag(R)
+        signs = torch.sign(diag)
+        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+        Q = Q * signs
 
         # Order columns by descending scale (exp(log_s))
         s = torch.exp(self.log_s)                    
@@ -41,7 +90,8 @@ class VAE(nn.Module):
     # -----------------------------------------------------------------
     def __init__(self, input_dim, latent_dim, perturbs, conds,
                  beta, module_var, tau, hidden_dims=(16,),
-                 center_coeff_init=1e-2, use_gene_modules=False):
+                 center_coeff_init=1e-2, use_gene_modules=False,
+                 l0_lambda=1e-3, cov_lambda=1e-4, gate_init_p=0.5):
         super().__init__()
         self.input_dim   = input_dim
         self.latent_dim  = latent_dim
@@ -60,12 +110,9 @@ class VAE(nn.Module):
 
         # ---- encoders / decoders ------------------------------------
         if self.use_gene_modules:
-            # self.z_encoder  = SparseModuleTransform(input_dim, latent_dim, module_map=module_var, hidden=4)
-            # self.z0_encoder = SparseModuleTransform(input_dim, latent_dim, module_map=module_var, hidden=4)
-
             self.z_encoder = nn.Sequential(
                 nn.Linear(input_dim+latent_dim, 128), nn.LeakyReLU(),
-                nn.Linear(128, 128), nn.LeakyReLU(), 
+                nn.Linear(128, 128), nn.LeakyReLU(),
                 nn.Linear(128, latent_dim * 2)
             )
             self.z0_encoder = nn.Sequential(
@@ -73,13 +120,10 @@ class VAE(nn.Module):
                 nn.Linear(128, 128), nn.LeakyReLU(),
                 nn.Linear(128, latent_dim * 2)
             )
-
             self.z_decoder  = SparseModuleTransform(latent_dim, input_dim, module_map=module_var, hidden=6, reverse=True, inference=False)
-            # self.z0_decoder = SparseModuleTransform(latent_dim, input_dim, module_map=module_var, hidden=6, reverse=True, inference=False)
-            
         else:
             self.z_encoder = nn.Sequential(
-                nn.Linear(input_dim+latent_dim, 128), nn.LeakyReLU(), nn.LayerNorm(128),
+                nn.Linear(input_dim, 128), nn.LeakyReLU(), nn.LayerNorm(128),
                 nn.Linear(128, 128), nn.LeakyReLU(), nn.LayerNorm(128),
                 nn.Linear(128, latent_dim * 2)
             )
@@ -92,17 +136,11 @@ class VAE(nn.Module):
                 nn.Linear(latent_dim, 128), nn.LeakyReLU(),
                 nn.Linear(128, input_dim)
             )
-            # self.z0_decoder  = nn.Sequential(
-            #     nn.Linear(latent_dim, 128), nn.LeakyReLU(),
-            #     nn.Linear(128, input_dim)
-            # )
-            
 
         self.pi_dec = nn.Sequential(
             nn.Linear(latent_dim, latent_dim), nn.LeakyReLU(),
             nn.Linear(latent_dim, latent_dim)
         )
-        
 
         self.rho_dec = nn.Sequential(
             nn.Linear(latent_dim, latent_dim), nn.LeakyReLU(),
@@ -126,33 +164,28 @@ class VAE(nn.Module):
 
         self.register_buffer("center_coeff",
                              torch.tensor(center_coeff_init, dtype=torch.float32))
-        
-        self.gate_on   = False    
-        self.tau_init = tau
-        
-        
-        # cov params
+
+        # ---- gating --------------------------------------------------
+        self.gate_on   = True        # turn on to use hard-concrete gates
+        self.tau_init  = tau         # used as initial temperature if you like
+        self.gate = HardConcreteGate(
+            shape=(self.perturbs, self.latent_dim),
+            init_p=gate_init_p,
+            temperature=float(tau) if tau is not None else (2./3.)
+        )
+        self.l0_lambda = float(l0_lambda)
+
+        # ---- covariance params --------------------------------------
         self.qr = QRCov(self.perturbs, 6, device=self.device)
-    
-    # expectation of perturbation simlarity based on pi
-    def E_pert_sim(self, min_conf=0.2):
-        q_pi_logits = pyro.param("q_pi_logits")
-        pi_probs = torch.sigmoid(q_pi_logits).detach()
-        conf = (pi_probs - 0.5).abs() * 2.0   
-        mask = (conf >= min_conf).float()
-        pi_eff = pi_probs * mask            
-        S = pi_eff @ pi_eff.T
-        m = S.max()
-        if m > 0:
-            S = S / m
-        S.fill_diagonal_(1.0)
-        return S
-    
+        self.cov_lambda = float(cov_lambda)
+
+    # ---------------------------- helpers ---------------------------- #
+
     def _corr(self, M, eps=1e-8):
         d = torch.sqrt(torch.clamp(torch.diag(M), min=eps))
         denom = torch.outer(d, d)
         return M / torch.clamp(denom, min=eps)
-    
+
     def _get_cov(self):
         L = self.qr().detach()
         sigma_P = pyro.param("sigma_fac").detach()
@@ -160,133 +193,116 @@ class VAE(nn.Module):
         eyeP = torch.eye(P_, dtype=L.dtype, device=L.device)
         Sigma_P = L @ L.T + (sigma_P**2) * eyeP
         return Sigma_P
-    
+
     def _laplacian_loss(self, rho, cov):
         corr = self._corr(cov)
         C_cov = ((corr + 1.0) / 2.0).clamp(0., 1.)
         C_cov.fill_diagonal_(1.0)
         L = torch.diag(C_cov.sum(1)) - C_cov
         return torch.trace(rho.T @ L @ rho) / (self.perturbs)
-    
+
     def __poe(self, z0_loc, z0_scale, lin_shift):
-        
         z0_var   = z0_scale.pow(2)
 
-        W_scale   = pyro.param("W_scale",
-                            0.1*torch.ones(self.latent_dim, device=self.device),
-                            constraint=constraints.positive)
-        W_var = W_scale.pow(2)                           # σ₂²
+        W_scale   = pyro.param(
+            "W_scale",
+            0.1*torch.ones(self.latent_dim, device=self.device),
+            constraint=constraints.positive
+        )
+        W_var = W_scale.pow(2)
 
-        # ----- product of experts ------------------------------------
         precision = 1.0 / z0_var + 1.0 / W_var
         z_var     = 1.0 / precision
-        z_loc     = z_var * (z0_loc / z0_var + (z0_loc + lin_shift) / W_var) #parameterize N(z0 + shift, σ₂)
-
+        z_loc     = z_var * (z0_loc / z0_var + (z0_loc + lin_shift) / W_var)
         return z_loc, z_var
-    
+
     def __decode(self, x, z, weight, theta, d_key):
-        logits_gene = weight(z)#.clamp(-8., 8.)
-        total_counts = x.sum(-1, keepdim=True)#.clamp(min=1.)
+        logits_gene = weight(z)
+        total_counts = x.sum(-1, keepdim=True)
         mu_prob = torch.softmax(logits_gene, dim=-1)
         mu = total_counts * mu_prob
         pyro.deterministic(d_key, mu)
         logits_nb = (mu + 1e-6).log() - theta.log()
         return logits_nb
 
+    # ------------------------------ model ---------------------------- #
 
     def model(self, x_p, x_ntc, p, c):
         pyro.module("VAE", self)
 
-        theta_uncon = pyro.param("theta_uncon",
-                                 torch.ones(self.input_dim, device=self.device))
+        theta_uncon = pyro.param(
+            "theta_uncon",
+            torch.ones(self.input_dim, device=self.device)
+        )
         theta = F.softplus(theta_uncon) + 1e-3
 
-        
-        # row covariance across perturbations
+        # row covariance across perturbations (stabilized)
         L = self.qr()
         sigma = pyro.param(
             "sigma_fac",
-            torch.full((), 0.05, device=self.device),  # () is a scalar tensor
+            torch.full((), 0.05, device=self.device),
             constraint=constraints.positive,
         )
         row_cov = L @ L.T + sigma.pow(2) * torch.eye(self.perturbs, device=self.device)
-        
-        # shrinkage on sigma with tight half normal prior(normalisation dosn't matter)
-        pyro.factor("half_normal_energy", -0.5*(sigma/0.05)**2)
 
-        # rho noise
+        # Half-normal shrinkage on sigma (stability)
+        pyro.factor("half_normal_energy", -0.5 * (sigma / 0.05) ** 2)
+
+        # small L2 on the low-rank factor to reduce drift across runs
+        pyro.factor("cov_ridge", - self.cov_lambda * (L**2).sum())
+
+        # rho prior (factorized) then correlate with row_cov by left-multiplying chol
         with pyro.plate("perturbations", self.perturbs):
             rho_single = pyro.sample(
                 "rho",
                 dist.Normal(torch.zeros_like(self.p_emb.weight),
                             torch.ones_like(self.p_emb.weight)).to_event(1)
             )
-        # cholesky factorization of row covariance
         chol_P = torch.linalg.cholesky(row_cov)
-        
-        # left-multiply(covariance reparameterization)
-        if self.gate_on:
-            rho_single = chol_P @ rho_single
-        A = rho_single  # (P,d)
-        # A = self.rho_dec(rho_single) / math.sqrt(self.latent_dim)  # (P,d)
+        A = chol_P @ rho_single   # (P, d)
 
+        # --------------------- Hard-Concrete gating ------------------- #
         if self.gate_on:
-            # Beta–Bernoulli gate  (shape P×d) ----------------------------
-            tau   = pyro.param("tau_temp",
-                                torch.tensor(self.tau_init, device=self.device),
-                                constraint=constraints.positive)
-            alpha = torch.tensor(1.0, device=self.device)   # broader prior
-            beta  = torch.tensor(10.0, device=self.device)
-        
-            pi = pyro.sample("pi", dist.Beta(alpha, beta).expand([self.perturbs, self.latent_dim]).to_event(2))          # (P,d)
-            s_gate = pyro.sample("s_gate", dist.RelaxedBernoulliStraightThrough(temperature=tau, probs=pi).to_event(2))
-
-            W = s_gate   
-                                        
+            W = self.gate(deterministic=False)           # (P, d) in [0,1], ST
             pyro.deterministic("W", W)
-
+            # L0 penalty encourages stable sparse patterns
+            expected_l0 = self.gate.expected_L0().sum()
+            pyro.factor("l0_penalty", - self.l0_lambda * expected_l0)
 
         # --- cell likelihood -----------------------------------------
         with pyro.plate("cells", x_p.size(0)):
             z0_loc   = self.c_emb_mu(c)
             z0_scale = (0.5 * self.c_emb_logvar(c)).exp()
 
+            # if you truly want standard N(0,I) for z0, keep these overrides
             z0_loc = torch.zeros_like(z0_loc)
             z0_scale = torch.ones_like(z0_scale)
             z0 = pyro.sample("z0", dist.Normal(z0_loc, z0_scale).to_event(1))
 
             logits_ntc = self.__decode(x_ntc, z0, self.z_decoder, theta, 'x_ntc')
             pyro.sample("X_ntc",
-                        dist.NegativeBinomial(total_count=theta,
-                                              logits=logits_ntc).to_event(1),
-                        # obs=x_ntc.float())
-                        obs=x_ntc.float(), infer={"scale": 1e-5}) #1e-5
+                        dist.NegativeBinomial(total_count=theta, logits=logits_ntc).to_event(1),
+                        obs=x_ntc.float(), infer={"scale": 1e-5})
 
             if self.gate_on:
-                z0_loc = z0_loc * (1. - W[p])                               # (B,d) gate applied
-                lin_shift = A[p] * W[p]                        # (B,d) gate applied
+                z0_loc_mod = z0_loc * (1. - W[p])      # optionally damp dims that are "on"
+                lin_shift  = A[p] * W[p]               # gated perturbation shift
             else:
-                lin_shift = A[p]  
+                z0_loc_mod = z0_loc
+                lin_shift  = A[p]
 
-            z_loc, z_var = self.__poe(z0_loc, z0_scale, lin_shift)
-            z = pyro.sample("z",
-                    dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1))
-            
+            z_loc, z_var = self.__poe(z0_loc_mod, z0_scale, lin_shift)
+            z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1))
+
             cls_logits = self.cls_head(z)
             pyro.deterministic("cls_logits", cls_logits)
-            # CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
-            # pyro.factor("CE_loss", -1.0*CE_loss)
-            
-            CE_loss = F.cross_entropy(cls_logits, p, reduction="mean")
-            # pyro.factor("CE_loss", -1e2 * CE_loss)
+            CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
+            pyro.factor("CE_loss", -0.1 * CE_loss)
 
             logits_p = self.__decode(x_p, z, self.z_decoder, theta, 'x_p')
             pyro.sample("X",
-                        dist.NegativeBinomial(total_count=theta,
-                                              logits=logits_p).to_event(1),
+                        dist.NegativeBinomial(total_count=theta, logits=logits_p).to_event(1),
                         obs=x_p.float())
-                        # obs=x_p.float(), infer={"scale": 1e-2}) #1e-5
-
 
 
     def guide(self, x_p, x_ntc, p, c):
@@ -304,124 +320,19 @@ class VAE(nn.Module):
         med_ntc = torch.median(lib_ntc).item()
         x_ntc = torch.log1p(x_ntc / lib_ntc * med_ntc)
 
-        # ρ posterior --------------------------------------------------
+        # ρ posterior
         q_loc = self.rho_enc(self.p_emb.weight)
         with pyro.plate("perturbations", self.perturbs):
-            rho = pyro.sample("rho", dist.Normal(q_loc,
-                                            torch.ones_like(q_loc)).to_event(1))
-            
-        if self.gate_on:
-            L = self.qr()
-            sigma = pyro.param("sigma_fac")
-            row_cov = L @ L.T + (sigma**2) * torch.eye(self.perturbs, device=self.device)
-            chol_P = torch.linalg.cholesky(row_cov)
-            A = chol_P @ rho
-        else:
-            A = rho
+            rho = pyro.sample("rho", dist.Normal(q_loc, torch.ones_like(q_loc)).to_event(1))
 
-        # q_pi  (shape P×d) -------------------------------------------
-        if self.gate_on:
-
-            # q_pi_logits = self.pi_dec(rho)
-
-            p0 = 0.5 #starting prob
-            q_pi_logits = pyro.param(
-                "q_pi_logits",
-                torch.full((self.perturbs, self.latent_dim),
-                        math.log(p0 / (1.0 - p0)),        # prior mean ≈ 0.05
-                        device=self.device)
-            )                       
-
-            q_pi = torch.sigmoid(q_pi_logits)            # (P, d) probability view
-
-            tau = pyro.param("tau_temp",
-                            torch.tensor(self.tau_init, device=self.device),
-                            constraint=constraints.positive)
-
-            # MAP point-estimate for π
-            pi = pyro.sample("pi", dist.Delta(q_pi).to_event(2))
-
-            # gate, using the SAME logits so gradients flow straight back
-            W = pyro.sample(
-                "s_gate",
-                dist.RelaxedBernoulliStraightThrough(
-                    temperature=tau,
-                    logits=q_pi_logits          # important!
-                ).to_event(2)
-            )
-
-
-            rho_cov = self._get_cov()
-            rho_corr = self._corr(rho_cov).clone().detach()
-
-            # adj  = F.relu(rho_corr)
-            # adj.fill_diagonal_(0.)
-            adj = F.relu(rho_corr - 0.45).fill_diagonal_(0.)
-            deg  = adj.sum(1)
-            # L    = torch.diag(deg) - adj
-            D    = torch.diag(deg).clamp_min(1e-6)
-            # num  = (pi.T @ L @ pi).diagonal()
-            # den  = (pi.T @ D @ pi).diagonal().clamp_min(1e-6)
-            # smooth = (num / den).sum()
-
-            # # G = pi.T @ rho_corr.clone().detach() @ pi
-            # # smooth = torch.trace(G)
-
-            # CW  = rho_corr @ pi
-            # cn  = (pi * CW).sum(0, keepdim=True).clamp_min(1e-6)
-            # PiC = pi / cn.sqrt()
-            # G   = PiC.T @ rho_corr @ PiC
-            # off = G - torch.diag(torch.diag(G))
-            # orth = (off**2).sum()
-
-
-
-                # --- graph smoothness ---
-            pi_norm = pi / (pi.norm(dim=0, keepdim=True) + 1e-6)
-            # num = (pi_norm.T @ L @ pi_norm).diagonal()
-            # den = (pi_norm.T @ D @ pi_norm).diagonal().clamp_min(1e-6)
-            # smooth = (num / den).sum()
-            # deg_inv_sqrt = D.pow_(-0.5)
-            # deg_inv_sqrt.masked_fill_(deg_inv_sqrt == float('inf'), 0)
-            # A_norm = deg_inv_sqrt @ adj @ deg_inv_sqrt
-
-            # L = I - A_norm.
-            L = D - adj
-            smooth = torch.trace(pi_norm.T @ L @ pi) / (self.perturbs)
-
-            # --- orthogonality ---
-            G = pi_norm.T @ D @ pi_norm
-            off = G - torch.diag(torch.diag(G))
-            orth = (off**2).sum()
-
-            # off_diag = G - torch.diag(torch.diag(G))
-            # orth = (off_diag**2).sum()
-
-            # sparsity = pi.sum()
-
-            pyro.factor("graph_smoothness", -1e1 * smooth, has_rsample=True)    
-            pyro.factor("cov_orthogonality", -1e-1 * orth, has_rsample=True)
-            # pyro.factor("mask_sparsity", -1e1 * sparsity, has_rsample=True)
-
-    
-
-        # cell-wise factors -------------------------------------------
+        # cell-wise factors
         with pyro.plate("cells", x_p.size(0)):
-            # z_mu, z_logvar = self.z_encoder(torch.cat([x, self.p_emb(p)], dim=-1)).chunk(2, dim=-1)
-            # z_mu, z_logvar = self.z_encoder(torch.cat([x_p], dim=-1)).unbind(dim=-1)
-
             z0_mu, z0_logvar = self.z0_encoder(torch.cat([x_ntc], dim=-1)).chunk(2, dim=-1)
             z0_std = (0.5 * z0_logvar).exp()
-            z0 = pyro.sample("z0", dist.Normal(z0_mu, z0_std).to_event(1))    
+            pyro.sample("z0", dist.Normal(z0_mu, z0_std).to_event(1))
 
-            z_mu, z_logvar = self.z_encoder(torch.cat([x_p, self.p_emb_z(p)], dim=-1)).chunk(2, dim=-1)
+            z_mu, z_logvar = self.z_encoder(torch.cat([x_p], dim=-1)).chunk(2, dim=-1)
             z_std = (0.5 * z_logvar).exp()
             pyro.sample("z", dist.Normal(z_mu, z_std).to_event(1))
-            # if self.gate_on:
-            #     lin_shift = A[p] * W[p]                        # (B,d) gate applied
-            # else:
-            #     lin_shift = A[p]  
-            # z_loc, z_var = self.__poe(z0_mu, z0_std, lin_shift)  # uses inferred z0 + (A[p] * W[p])
-            # pyro.sample("z", dist.Normal(z_loc, z_var.sqrt()).to_event(1))
 
         
