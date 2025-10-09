@@ -3,6 +3,7 @@ import pyro.distributions as dist
 from pyro.distributions import constraints
 from module import GeneModuleEncoder, SparseModuleTransform
 import torch.nn as nn
+from torch.func import jacrev, vmap
 
 
 class HardConcreteGate(nn.Module):
@@ -52,6 +53,11 @@ class HardConcreteGate(nn.Module):
     
     def l1_logit(self):
         return torch.norm(torch.sigmoid(self.log_alpha), p=1)
+    
+    def expected_L2(self, ungated):
+        pi = self.expected_L0()
+        val = pi * (ungated**2)
+        return val.sum()
 
 
 
@@ -67,7 +73,7 @@ class QRCov(nn.Module):
         # Reduced QR
         Q, R = torch.linalg.qr(self.U_unproj, mode="reduced")
         
-        # Fix column signs via R's diagonal so Q is canonical up to permutation
+        # Fix column signs via R's diagonal
         diag = torch.diag(R)
         signs = torch.sign(diag)
         signs = torch.where(signs == 0, torch.ones_like(signs), signs)
@@ -94,12 +100,17 @@ class VAE(nn.Module):
     def __init__(self, input_dim, latent_dim, perturbs, conds,
                  beta, module_var, tau, hidden_dims=(16,),
                  center_coeff_init=1e-2, use_gene_modules=False,
-                 l0_lambda=1e-3, l1_lambda=1e-2, cov_lambda=1e-4, gate_init_p=0.5):
+                 l0_lambda=1e-3, l1_lambda=1e-3, H_lambda=1e-3,
+                 l2_lambda=1e-3, cov_lambda=1e-4, 
+                 gate_init_p=0.5):
         super().__init__()
         self.input_dim   = input_dim
         self.latent_dim  = latent_dim
+        self.H_lambda    = H_lambda
+        # self.H_lambda    = H_lambda
         self.perturbs    = perturbs
         self.conds       = conds
+        self.l2_lambda   = l2_lambda
         self.l0_lambda   = l0_lambda
         self.l1_lambda   = l1_lambda
         self.cov_lambda  = cov_lambda
@@ -187,11 +198,13 @@ class VAE(nn.Module):
 
     # ---------------------------- helpers ---------------------------- #
 
+    @torch.no_grad()
     def _corr(self, M, eps=1e-8):
         d = torch.sqrt(torch.clamp(torch.diag(M), min=eps))
         denom = torch.outer(d, d)
         return M / torch.clamp(denom, min=eps)
 
+    @torch.no_grad()
     def _get_cov(self):
         L = self.qr().detach()
         sigma_P = pyro.param("sigma_fac").detach()
@@ -199,13 +212,6 @@ class VAE(nn.Module):
         eyeP = torch.eye(P_, dtype=L.dtype, device=L.device)
         Sigma_P = L @ L.T + (sigma_P**2) * eyeP
         return Sigma_P
-
-    def _laplacian_loss(self, rho, cov):
-        corr = self._corr(cov)
-        C_cov = ((corr + 1.0) / 2.0).clamp(0., 1.)
-        C_cov.fill_diagonal_(1.0)
-        L = torch.diag(C_cov.sum(1)) - C_cov
-        return torch.trace(rho.T @ L @ rho) / (self.perturbs)
 
     def __poe(self, z0_loc, z0_scale, lin_shift):
         z0_var   = z0_scale.pow(2)
@@ -230,6 +236,42 @@ class VAE(nn.Module):
         pyro.deterministic(d_key, mu)
         logits_nb = (mu + 1e-6).log() - theta.log()
         return logits_nb
+    
+    @torch.no_grad()
+    def __eval_points(self, x_p, p):
+        self.eval()
+        z_mu, _ = self.z_encoder(torch.cat([x_p], dim=-1)).chunk(2, dim=-1)
+        eval_points = []
+        for pp in torch.unique(p):
+            mask = (p == pp)
+            eval_points.append(z_mu[mask].mean(dim=0, keepdim=True))
+        return torch.cat(eval_points, dim=0)
+    
+    # (1, d) -> (1, G) -> (G,)
+    def __decode_one_sample(self, z_single):
+        return self.z_decoder(z_single.unsqueeze(0)).squeeze(0)
+    
+    def __jac(self, eval_points):
+        self.eval()
+        f = jacrev(self.__decode_one_sample)
+        J = vmap(f)(eval_points) # (P, G, d)
+        B = J.mean(dim=0).transpose(0,1).contiguous().abs() # (d, G)
+        return B
+    
+    @torch.no_grad()
+    def __pert_to_target_graph(self, x_p, p, fix_gate=True):
+        device = x_p.device
+        eval_points = self.__eval_points(x_p, p)
+        
+        # turn on local gradient for jacobian
+        with torch.enable_grad():
+            eval_points = eval_points.detach().requires_grad_(True)
+            B = self.__jac(eval_points)
+        
+        W = self.gate(deterministic=fix_gate)
+        G = W @ B
+        return G / (G.max(dim=1, keepdim=True).values + 1e-8)
+        
 
     # ------------------------------ model ---------------------------- #
 
@@ -272,9 +314,20 @@ class VAE(nn.Module):
             W = self.gate(deterministic=False)           # (P, d) in [0,1], ST
             pyro.deterministic("W", W)
             # L0 penalty encourages stable sparse patterns
-            expected_l0 = self.gate.expected_L0().sum()
+            
+            # gate regularizations
+            pi = self.gate.expected_L0()
+            expected_l0 = pi.sum()
+            expected_l2 = self.gate.expected_L2(A)
             pyro.factor("l0_penalty", - self.l0_lambda * expected_l0)
             pyro.factor("l1_penalty", - self.l1_lambda * self.gate.l1_logit())
+            pyro.factor("l2_penalty", - self.l2_lambda * expected_l2)
+            
+            # column entropy
+            col_usage = pi.sum(dim=0)                     
+            p_col = col_usage / (col_usage.sum() + 1e-8)
+            entropy_col = -(p_col * (p_col + 1e-8).log()).sum()
+            pyro.factor("col_entropy", + self.H_lambda * entropy_col)
 
         # --- cell likelihood -----------------------------------------
         with pyro.plate("cells", x_p.size(0)):
@@ -300,7 +353,6 @@ class VAE(nn.Module):
 
             z_loc, z_var = self.__poe(z0_loc_mod, z0_scale, lin_shift)
             z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1))
-
             cls_logits = self.cls_head(z)
             pyro.deterministic("cls_logits", cls_logits)
             CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
