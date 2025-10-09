@@ -102,12 +102,11 @@ class VAE(nn.Module):
                  center_coeff_init=1e-2, use_gene_modules=False,
                  l0_lambda=1e-3, l1_lambda=1e-3, H_lambda=1e-3,
                  l2_lambda=1e-3, cov_lambda=1e-4, 
-                 gate_init_p=0.5):
+                 gate_init_p=0.5, use_conditions=False):
         super().__init__()
         self.input_dim   = input_dim
         self.latent_dim  = latent_dim
         self.H_lambda    = H_lambda
-        # self.H_lambda    = H_lambda
         self.perturbs    = perturbs
         self.conds       = conds
         self.l2_lambda   = l2_lambda
@@ -118,10 +117,13 @@ class VAE(nn.Module):
         self.center_coeff_init = center_coeff_init
         self.device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.use_gene_modules  = use_gene_modules
+        self.use_conditions = use_conditions
 
         # ---- embeddings ---------------------------------------------
         self.p_emb        = nn.Embedding(perturbs, latent_dim)
-        self.p_emb_z      = nn.Embedding(perturbs, latent_dim)
+        #self.p_emb_z      = nn.Embedding(perturbs, latent_dim)
+        
+        # do priors for conditions
         self.c_emb_mu     = nn.Embedding(conds,    latent_dim)
         self.c_emb_logvar = nn.Embedding(conds,    latent_dim)
 
@@ -237,6 +239,9 @@ class VAE(nn.Module):
         logits_nb = (mu + 1e-6).log() - theta.log()
         return logits_nb
     
+    
+    # ------------------------------ jaccobian helpers ---------------------------- #
+    
     @torch.no_grad()
     def __eval_points(self, x_p, p):
         self.eval()
@@ -271,8 +276,57 @@ class VAE(nn.Module):
         W = self.gate(deterministic=fix_gate)
         G = W @ B
         return G / (G.max(dim=1, keepdim=True).values + 1e-8)
+    
+    
+    # ------------------------------ counterfactual helpers ---------------------------- #
+    
+    @torch.no_grad()
+    def _abduct_z0(self, x_ntc):
+        """
+        q(z0_hat | x_ntc)
+        """
+        self.eval()
+        lib_ntc = x_ntc.sum(dim=1, keepdim=True)
+        med_ntc = torch.median(lib_ntc).item()
+        x_ntc_n = torch.log1p(x_ntc / lib_ntc * med_ntc)
+        z0_mu, _ = self.z0_encoder(x_ntc_n).chunk(2, dim=-1)
+        return z0_mu
+    
+    @torch.no_grad()
+    def _do_shift_z0(self, z0, c_from=None, c_to=None):
+        """
+        p(z0_cf|z0_hat, do(c=c_to), c_from)
+        """
+        mu_from = self.c_emb_mu(c_from)
+        mu_to = self.c_emb_mu(c_to)
+        return z0 + (mu_to - mu_from)
+    
+    @torch.no_grad()
+    def latent_counterfactual(self, x_ntc, x_p, p, c_from=None, c_to=None):
+        """
+        q(z | z0_cf, p)
+        """
+        device = x_p.device
+        # abuduct and shift
+        z0_hat = self._abduct_z0(x_ntc)
+        z0_cf = self._do_shift_z0(z0_hat, c_from=c_from, c_to=c_to)
         
-
+        # predict with CF
+        self.eval()
+        L = self.qr()                                           
+        sigma = pyro.param("sigma_fac").detach()
+        row_cov = L @ L.T + sigma.pow(2) * torch.eye(self.perturbs, device=device)
+        chol_P = torch.linalg.cholesky(row_cov)                 
+        q_rho_mean = self.rho_enc(self.p_emb.weight).detach()     # (P, d)
+        A = chol_P @ q_rho_mean
+        
+        W = self.gate(deterministic=True)
+        pert_shift = A[p] * W[p]
+        z0_cf_masked = z0_cf * (1. - W[p])
+        
+        z_loc_cf, _ = self.__poe(z0_cf_masked, torch.ones_like(z0_cf_masked), pert_shift)
+        return z_loc_cf
+              
     # ------------------------------ model ---------------------------- #
 
     def model(self, x_p, x_ntc, p, c):
@@ -330,13 +384,19 @@ class VAE(nn.Module):
             pyro.factor("col_entropy", + self.H_lambda * entropy_col)
 
         # --- cell likelihood -----------------------------------------
+        
+        # do prior for z0 if there is conditions
         with pyro.plate("cells", x_p.size(0)):
-            z0_loc   = self.c_emb_mu(c)
-            z0_scale = (0.5 * self.c_emb_logvar(c)).exp()
+            if self.use_conditions:
+                z0_loc = self.c_emb_mu(c)
+                z0_scale = (0.5 * self.c_emb_logvar(c)).exp()
+                pyro.factor("do_prior_ridge_mu",  -1e-4 * (z0_loc**2).mean())
+                pyro.factor("do_prior_ridge_logvar", -1e-4 * (self.c_emb_logvar.weight**2).mean())
 
-            # if you truly want standard N(0,I) for z0, keep these overrides
-            z0_loc = torch.zeros_like(z0_loc)
-            z0_scale = torch.ones_like(z0_scale)
+            else:
+                z0_loc = torch.zeros_like(z0_loc)
+                z0_scale = torch.ones_like(z0_scale)
+                
             z0 = pyro.sample("z0", dist.Normal(z0_loc, z0_scale).to_event(1))
 
             logits_ntc = self.__decode(x_ntc, z0, self.z_decoder, theta, 'x_ntc')
