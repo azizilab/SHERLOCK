@@ -5,6 +5,7 @@ import pandas as pd
 import random
 import itertools
 from collections import defaultdict
+from .._configs import get_config
 
 class PerturbDataset(Dataset):
     def __init__(self, anndata):
@@ -131,15 +132,19 @@ class PerturbMatchingDataset(Dataset):
 
     """
 
-    def __init__(self, anndata, NTC: str = "NTC", p_key: str = "top_sg", seed: int | None = None):
+    def __init__(self, anndata, seed: int | None = None):
         rng = np.random.default_rng(seed)
+
+        p_key = get_config('pert_key')
+        NTC = get_config('ntc_label')
+        treatment_key = get_config('treatment_key')
 
         pert_anndata = anndata[anndata.obs[p_key] != NTC]
         ntc_anndata = anndata[anndata.obs[p_key] == NTC]
 
         # ── metadata columns ────────────────────────────────────────────
         pertlbl      = pert_anndata.obs[p_key].values
-        condlbl = pert_anndata.obs["treatment"].values
+        condlbl = pert_anndata.obs[treatment_key].values
 
         # unique conditions
         cond_unique = np.unique(condlbl)
@@ -158,8 +163,8 @@ class PerturbMatchingDataset(Dataset):
         self.X_pert = pert_anndata.X.toarray() if hasattr(pert_anndata.X, "toarray") else pert_anndata.X
 
         self.P = pert_anndata.obs[p_key].values
-        self.C = pert_anndata.obs['treatment'].values
-        self.C_ntc = ntc_anndata.obs['treatment'].values
+        self.C = pert_anndata.obs[treatment_key].values
+        self.C_ntc = ntc_anndata.obs[treatment_key].values
 
         # Convert P and C to indices
         self.P_indices = np.array([self.perturbation_dict[p] for p in self.P])
@@ -169,7 +174,7 @@ class PerturbMatchingDataset(Dataset):
 
         # quick NA / NaN guard
         if pd.isna(pertlbl).any() or pd.isna(condlbl).any():
-            raise ValueError("obs contains NA / NaN in 'top_sg' or 'treatment'.")
+            raise ValueError(f"obs contains NA / NaN in {p_key} or f{treatment_key}.")
 
         self.rng = rng
 
