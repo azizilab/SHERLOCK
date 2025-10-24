@@ -86,6 +86,7 @@ class VAE(nn.Module):
         l1_lambda=1e-3,
         l2_lambda=1e-3,
         H_lambda=1e-3,
+        ce_lambda=1.0,
         cov_lambda=1e-4,
         gate_init_p=0.5,
         use_conditions=False,
@@ -102,6 +103,7 @@ class VAE(nn.Module):
         self.l1_lambda = float(l1_lambda)
         self.l2_lambda = float(l2_lambda)
         self.H_lambda = float(H_lambda)
+        self.ce_lambda = float(ce_lambda)
         self.cov_lambda = float(cov_lambda)
 
         # embeddings / condition prior params
@@ -255,7 +257,7 @@ class VAE(nn.Module):
             cls_logits = self.cls_head(z)
             pyro.deterministic("cls_logits", cls_logits)
             CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
-            pyro.factor("CE_loss", -CE_loss)
+            pyro.factor("CE_loss", -self.ce_lambda*CE_loss)
 
             logits_p = self.__decode(x_p, z, self.z_decoder, theta, "x_p")
             pyro.sample(

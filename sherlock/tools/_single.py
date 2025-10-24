@@ -33,8 +33,7 @@ def run_single(
     validate_every=10,
     device=torch.device('cpu'),
     patience=20,
-    *,
-    vae_kwargs=None
+    **kwargs,
 ):
 
     if num_workers > 0:
@@ -55,27 +54,34 @@ def run_single(
 
     pyro.clear_param_store()
 
-    vae_kwargs = dict(vae_kwargs or {})
-
-    # --- build default VAE args ---
+    # ---- VAE defaults from run_single args
     default_vae_args = dict(
         input_dim=adata.shape[-1],
         latent_dim=latent_dim,
-        perturbs=len(np.unique(dataset.P_indices)),
-        conds=len(np.unique(dataset.C_indices)),
+        perturbs=int(len(np.unique(dataset.P_indices))),
+        conds=int(len(np.unique(dataset.C_indices))),
         tau=tau_init,
         use_conditions=use_conditions,
     )
+
+    # ---- Filter user kwargs to ONLY those accepted by VAE.__init__
+    try:
+        vae_params = set(inspect.signature(VAE.__init__).parameters)
+        vae_params.discard("self")
+    except Exception:
+        # if reflection fails, assume everything is a VAE kw
+        vae_params = set(default_vae_args.keys())
+
+    vae_kwargs = {k: kwargs[k] for k in list(kwargs) if k in vae_params}
+    # warn on unknown kwargs:
+    unknown = [k for k in kwargs.keys() if k not in vae_params]
+    if unknown:
+        raise TypeError(f"Unknown keyword(s) for VAE/run_single: {unknown}")
+
+    # user kwargs override defaults
     default_vae_args.update(vae_kwargs)
 
-    #filter to proper VAE args
-    try:
-        sig = inspect.signature(VAE.__init__)
-        allowed = set(k for k in sig.parameters if k != "self")
-        default_vae_args = {k: v for k, v in default_vae_args.items() if k in allowed}
-    except Exception:
-        pass
-
+    # construct model
     vae = VAE(**default_vae_args).to(device)
 
     trainer = VAETrainer(
