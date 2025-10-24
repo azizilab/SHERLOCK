@@ -26,7 +26,7 @@ Reference for **all arguments** used by `run_single(...)`:
 | **seed** | `0` | RNG seed for reproducibility (init, shuffles). Change to explore different random starts. |
 | **shuffle** | `True`  | Shuffle samples each epoch. Keep `True` for SGD; set `False` for deterministic passes/eval. |
 | **use_conditions** | `False` | Enable conditional priors/embeddings over `conds`. Set `True` if you provide condition indices (e.g., batch/cell line). |
-| **validate_every** | `10` Run validation every N epochs. Increase to validate less often (faster), decrease for closer monitoring. |
+| **validate_every** | `10` | Run validation every N epochs. Increase to validate less often (faster), decrease for closer monitoring. |
 | **verbose** | `True` | Print training/validation logs. Turn off for silent runs. |
 
 ---
