@@ -9,7 +9,7 @@ Reference for **all arguments** used by `run_single(...)`:
 ## Parameters
 
 | Name | Default(s) | What it controls / When to change |
-|---|---|---|---|
+|---|---|---|
 | **adata** | *(required)* | Input `AnnData` (cells × features). Must contain `.X` (and any fields your dataset expects). Pre-filter/normalize per your pipeline. |
 | **batch_size** | `4096`| Minibatch size. Increase for faster epochs if memory allows; decrease if you hit OOM or unstable gradients. |
 | **device** | `cpu` | Compute device (`torch.device("cpu")` / `"cuda:0"`). Use CUDA for GPU training. |
