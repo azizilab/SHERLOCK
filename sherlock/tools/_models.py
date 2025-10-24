@@ -82,7 +82,7 @@ class VAE(nn.Module):
         perturbs,
         conds,
         tau,
-        l0_lambda=1e-3,
+        l0_lambda=10.0,
         l1_lambda=1e-3,
         l2_lambda=1e-3,
         H_lambda=1e-3,

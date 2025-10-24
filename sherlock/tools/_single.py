@@ -9,6 +9,7 @@ import pyro.poutine as poutine
 from typing import Literal
 import pandas as pd
 from scipy.stats import spearmanr, pearsonr
+import inspect
 
 
 
@@ -32,7 +33,10 @@ def run_single(
     validate_every=10,
     device=torch.device('cpu'),
     patience=20,
+    *,
+    vae_kwargs=None
 ):
+
     if num_workers > 0:
         ctx = mp.get_context("spawn")
 
@@ -51,14 +55,28 @@ def run_single(
 
     pyro.clear_param_store()
 
-    vae = VAE(
+    vae_kwargs = dict(vae_kwargs or {})
+
+    # --- build default VAE args ---
+    default_vae_args = dict(
         input_dim=adata.shape[-1],
         latent_dim=latent_dim,
         perturbs=len(np.unique(dataset.P_indices)),
         conds=len(np.unique(dataset.C_indices)),
-        tau=tau_init,            
-        use_conditions=use_conditions,       
-    ).to(device)
+        tau=tau_init,
+        use_conditions=use_conditions,
+    )
+    default_vae_args.update(vae_kwargs)
+
+    #filter to proper VAE args
+    try:
+        sig = inspect.signature(VAE.__init__)
+        allowed = set(k for k in sig.parameters if k != "self")
+        default_vae_args = {k: v for k, v in default_vae_args.items() if k in allowed}
+    except Exception:
+        pass
+
+    vae = VAE(**default_vae_args).to(device)
 
     trainer = VAETrainer(
         vae=vae,

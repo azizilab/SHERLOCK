@@ -1,5 +1,6 @@
 import torch
 import pyro
+from pathlib import Path
 
 def save_results(results, path: str) -> None:
     """
@@ -23,12 +24,14 @@ def save_results(results, path: str) -> None:
         "class": "VAE",
         "ctor": ctor,
         "state_dict": model.state_dict(),
-        "meta": {
-            "torch": torch.__version__,
-        },
+        "meta": {"torch": torch.__version__},
+        "pyro_param_store": results['param_store'],
     }
 
     payload["pyro_param_store"] = results['param_store']
+
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
 
     torch.save(payload, path)
 

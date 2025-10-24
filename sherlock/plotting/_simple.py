@@ -52,7 +52,7 @@ def plot_r2(adata):
                
 
 def plot_corr(adata, uns_key='results'):
-    corr = adata.uns[uns_key]['corr']
+    corr = adata.uns[uns_key]['rho_corr']
     sns.clustermap(corr, cmap="coolwarm", annot=False)
 
 def plot_zcorr(adata, uns_key='results'):
