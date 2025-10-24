@@ -12,8 +12,6 @@ def cluster_rho(adata, t=1.5, uns_key='results', rho_corr=None, show=True):
     D = 1.0 - C  # distance
     Z_link = linkage(D[np.triu_indices_from(D, 1)], method='ward')
 
-    t = 1.5  # your cut in the same distance scale as Z_link
-
     if show:
         plt.figure(figsize=(10, 6))
         dendrogram(
