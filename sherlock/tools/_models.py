@@ -254,15 +254,11 @@ class VAE(nn.Module):
             )
 
             # gated perturbation shift (no condition branch)
-            # z0_loc_mod = z0_loc * (1.0 - W[p])
-            z0_loc_mod = z0_loc
+            z0_loc_mod = z0_loc * (1.0 - W[p])
             lin_shift = A[p] * W[p]
 
-            # z_loc, z_var = self.__poe(z0_loc_mod, z0_scale, lin_shift)
-            # z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1))
-            z_loc = z0_loc_mod + lin_shift
-            z_std = pyro.param("z_var_scale", torch.ones_like(z_loc[0]), constraint=constraints.positive)
-            z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_std)).to_event(1))
+            z_loc, z_var = self.__poe(z0_loc_mod, z0_scale, lin_shift)
+            z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1))
 
             cls_logits = self.cls_head(z)
             pyro.deterministic("cls_logits", cls_logits)
