@@ -87,8 +87,11 @@ class VAE(nn.Module):
         l2_lambda=1e-3,
         H_lambda=1e-3,
         ce_lambda=1.0,
+        ntc_lambda=1e-5,
+        pert_lambda=1.0,
         cov_lambda=1e-4,
         gate_init_p=0.5,
+        rank=6,
         use_conditions=False,
     ):
         super().__init__()
@@ -97,6 +100,7 @@ class VAE(nn.Module):
         self.perturbs = perturbs
         self.conds = conds
         self.use_conditions = use_conditions
+        self.rank = rank
 
         # reg weights
         self.l0_lambda = float(l0_lambda)
@@ -104,6 +108,8 @@ class VAE(nn.Module):
         self.l2_lambda = float(l2_lambda)
         self.H_lambda = float(H_lambda)
         self.ce_lambda = float(ce_lambda)
+        self.ntc_lambda = float(ntc_lambda)
+        self.pert_lambda = float(pert_lambda)
         self.cov_lambda = float(cov_lambda)
 
         # embeddings / condition prior params
@@ -146,7 +152,7 @@ class VAE(nn.Module):
         )
 
         # low-rank covariance (params live on module device)
-        self.qr = QRCov(self.perturbs, 6)
+        self.qr = QRCov(self.perturbs, self.rank)
 
     # --- helpers ---
     @torch.no_grad()
@@ -244,15 +250,19 @@ class VAE(nn.Module):
                 "X_ntc",
                 dist.NegativeBinomial(total_count=theta, logits=logits_ntc).to_event(1),
                 obs=x_ntc.float(),
-                infer={"scale": 1e-5},
+                infer={"scale": self.ntc_lambda},
             )
 
             # gated perturbation shift (no condition branch)
-            z0_loc_mod = z0_loc * (1.0 - W[p])
+            # z0_loc_mod = z0_loc * (1.0 - W[p])
+            z0_loc_mod = z0_loc
             lin_shift = A[p] * W[p]
 
-            z_loc, z_var = self.__poe(z0_loc_mod, z0_scale, lin_shift)
-            z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1))
+            # z_loc, z_var = self.__poe(z0_loc_mod, z0_scale, lin_shift)
+            # z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1))
+            z_loc = z0_loc_mod + lin_shift
+            z_std = pyro.param("z_var_scale", torch.ones_like(z_loc[0]), constraint=constraints.positive)
+            z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_std)).to_event(1))
 
             cls_logits = self.cls_head(z)
             pyro.deterministic("cls_logits", cls_logits)
@@ -264,6 +274,7 @@ class VAE(nn.Module):
                 "X",
                 dist.NegativeBinomial(total_count=theta, logits=logits_p).to_event(1),
                 obs=x_p.float(),
+                infer={"scale": self.pert_lambda},
             )
 
     def guide(self, x_p, x_ntc, p, c):
