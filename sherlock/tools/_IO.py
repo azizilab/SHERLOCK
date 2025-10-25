@@ -19,6 +19,7 @@ def save_results(results, path: str) -> None:
         "conds":      model.conds,
         "use_conditions": bool(model.use_conditions),
         "rank":       model.rank,
+        "shift":     model.shift,
     }
 
     payload = {

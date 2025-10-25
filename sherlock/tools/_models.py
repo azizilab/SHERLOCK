@@ -93,14 +93,18 @@ class VAE(nn.Module):
         gate_init_p=0.5,
         rank=6,
         use_conditions=False,
+        shift='poe',
     ):
         super().__init__()
+        assert shift in ['poe', 'linear'], "shift must be 'poe' or 'linear'"
+
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.perturbs = perturbs
         self.conds = conds
         self.use_conditions = use_conditions
         self.rank = rank
+        self.shift = shift
 
         # reg weights
         self.l0_lambda = float(l0_lambda)
@@ -257,8 +261,15 @@ class VAE(nn.Module):
             z0_loc_mod = z0_loc * (1.0 - W[p])
             lin_shift = A[p] * W[p]
 
-            z_loc, z_var = self.__poe(z0_loc_mod, z0_scale, lin_shift)
-            z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1))
+            if self.shift == 'poe':
+                z_loc, z_var = self.__poe(z0_loc_mod, z0_scale, lin_shift)
+                z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1))
+            elif self.shift == 'linear':
+                z_loc = z0_loc_mod + lin_shift
+                z_std = pyro.param("z_var_scale", torch.ones_like(z_loc[0]), constraint=constraints.positive)
+                z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_std)).to_event(1))
+            else:
+                raise ValueError("Invalid shift type")
 
             cls_logits = self.cls_head(z)
             pyro.deterministic("cls_logits", cls_logits)

@@ -25,7 +25,8 @@ def run_single(
     shuffle=True,
     num_workers=0,
     latent_dim=16,
-    tau_init=0.67,           
+    tau_init=0.67,      
+    tau_end=0.1,     
     lr=1e-3,
     num_epochs=200,
     treat_effect_key="treat_effect",
@@ -93,6 +94,8 @@ def run_single(
         validate_every=validate_every,
         device=device,
         patience=patience,
+        tau_init=tau_init,
+        tau_end=tau_end,
     )
 
     best_vae, param_store = trainer.fit()
