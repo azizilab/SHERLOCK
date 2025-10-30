@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import pyro
 import pyro.distributions as dist
 from pyro.distributions import constraints
+from torch.func import jacrev, vmap
 
 
 class HardConcreteGate(nn.Module):
@@ -181,7 +182,7 @@ class VAE(nn.Module):
             "W_scale",
             0.1 * torch.ones(self.latent_dim, device=device),
             constraint=constraints.positive,
-        )
+        ).to(z0_loc.device)
         W_var = W_scale.pow(2)
         precision = 1.0 / z0_var + 1.0 / W_var
         z_var = 1.0 / precision
@@ -307,3 +308,96 @@ class VAE(nn.Module):
             z_mu, z_logvar = self.z_encoder(x_p).chunk(2, dim=-1)
             z_std = (0.5 * z_logvar).exp()
             pyro.sample("z", dist.Normal(z_mu, z_std).to_event(1))
+
+# ------------------------------ jaccobian helpers ---------------------------- #
+    
+    @torch.no_grad()
+    def __eval_points(self, x_p, p):
+        self.eval()
+        z_mu, _ = self.z_encoder(torch.cat([x_p], dim=-1)).chunk(2, dim=-1)
+        eval_points = []
+        for pp in torch.unique(p):
+            mask = (p == pp)
+            eval_points.append(z_mu[mask].mean(dim=0, keepdim=True))
+        return torch.cat(eval_points, dim=0)
+    
+    # (1, d) -> (1, G) -> (G,)
+    def __decode_one_sample(self, z_single):
+        return self.z_decoder(z_single.unsqueeze(0)).squeeze(0)
+    
+    def __jac(self, eval_points):
+        self.eval()
+        f = jacrev(self.__decode_one_sample)
+        J = vmap(f)(eval_points) # (P, G, d)
+        B = J.mean(dim=0).transpose(0,1).contiguous().abs() # (d, G)
+        return B
+    
+    @torch.no_grad()
+    def pert_to_target_graph(self, x_p, p, fix_gate=True):
+        device = x_p.device
+        eval_points = self.__eval_points(x_p, p)
+        
+        # turn on local gradient for jacobian
+        with torch.enable_grad():
+            eval_points = eval_points.detach().requires_grad_(True)
+            B = self.__jac(eval_points)
+        
+        W = self.gate(deterministic=fix_gate)
+        G = W @ B
+        return G / (G.max(dim=1, keepdim=True).values + 1e-8)
+    
+    
+    # ------------------------------ counterfactual helpers ---------------------------- #
+    
+    @torch.no_grad()
+    def _abduct_z0(self, x_ntc):
+        """
+        q(z0_hat | x_ntc)
+        """
+        self.eval()
+        lib_ntc = x_ntc.sum(dim=1, keepdim=True)
+        med_ntc = torch.median(lib_ntc).item()
+        x_ntc_n = torch.log1p(x_ntc / lib_ntc * med_ntc)
+        z0_mu, _ = self.z0_encoder(x_ntc_n).chunk(2, dim=-1)
+        return z0_mu
+    
+    @torch.no_grad()
+    def _do_shift_z0(self, z0, c_from=None, c_to=None):
+        """
+        p(z0_cf|z0_hat, do(c=c_to), c_from)
+        """
+        mu_from = self.c_emb_mu(c_from)
+        mu_to = self.c_emb_mu(c_to)
+        return z0 + (mu_to - mu_from)
+    
+    @torch.no_grad()
+    def latent_counterfactual(self, x_ntc, x_p, p, c_from=None, c_to=None):
+        """
+        q(z | z0_cf, p)
+        """
+        device = x_p.device
+        # abuduct and shift
+        z0_hat = self._abduct_z0(x_ntc)
+        z0_cf = self._do_shift_z0(z0_hat, c_from=c_from, c_to=c_to)
+        
+        # predict with CF
+        self.eval()
+        L = self.qr()                                           
+        sigma = pyro.param("sigma_fac").detach().to(x_ntc.device)
+        row_cov = L @ L.T + sigma.pow(2) * torch.eye(self.perturbs, device=device)
+        chol_P = torch.linalg.cholesky(row_cov)                 
+        q_rho_mean = self.rho_enc(self.p_emb.weight).detach()     # (P, d)
+        A = chol_P @ q_rho_mean
+        
+        W = self.gate(deterministic=True)
+        pert_shift = A[p] * W[p]
+        z0_cf_masked = z0_cf * (1. - W[p])
+
+        if self.shift == 'poe':
+            z_loc_cf, _ = self.__poe(z0_cf_masked, torch.ones_like(z0_cf_masked), pert_shift)
+        elif self.shift == 'linear':
+            z_loc_cf = z0_cf_masked + pert_shift
+        else:
+            raise ValueError("Invalid shift type")
+        
+        return z_loc_cf

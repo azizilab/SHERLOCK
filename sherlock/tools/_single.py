@@ -10,6 +10,7 @@ from typing import Literal
 import pandas as pd
 from scipy.stats import spearmanr, pearsonr
 import inspect
+from tqdm import tqdm
 
 
 
@@ -108,6 +109,7 @@ def _gen_uns(model, adata, ds, obsm_key, uns_key):
     #accuracy
     p_key = get_config("pert_key")
     ntc_label = get_config("ntc_label")
+    treatment_key = get_config("treatment_key")
 
     P_sub = adata[adata.obs[p_key].values != ntc_label]
     z_np = P_sub.obsm.get(obsm_key)
@@ -169,7 +171,55 @@ def _gen_uns(model, adata, ds, obsm_key, uns_key):
     W = model.gate(deterministic=True).cpu().detach().numpy()
     uns_data['W'] = W
 
+    x_p = torch.tensor(ds.X_pert).float()
+    p2g = model.pert_to_target_graph(x_p, P, fix_gate=True)
+    uns_data['p2g'] = p2g.cpu().detach().numpy()
+
+    x_ntc_mat = ds.X_ntc # list over cond: cells x genes
+
+    cond_unique = adata.obs[treatment_key].unique()
+    conds = torch.tensor([ds.condition_dict[c] for c in cond_unique], dtype=torch.int32)
+
+
+    cfs_mat = compute_counterfactual(model, x_ntc_mat, x_p, P, conds)
+    uns_data['cfs_mat'] = cfs_mat
+
     adata.uns[uns_key] = uns_data
+
+@torch.no_grad()
+def compute_counterfactual(model, x_ntc_mat, x_p, P, cond_list):
+    u = np.unique(P)
+    cf_mat = np.zeros((len(u), len(cond_list), len(cond_list)), dtype=np.float32)
+
+    for i in range(len(cond_list)):
+        c_from = cond_list[i]
+        
+        x_ntc = x_ntc_mat[i]
+
+        m, n = x_ntc.shape[0], x_p.shape[0]
+        idx = np.random.permutation(m)[:n] if m >= n else np.random.randint(0, m, size=n)
+        x_ntc = torch.tensor(x_ntc[idx], dtype=torch.float32)
+
+        for j in range(i + 1, len(cond_list)):
+            if i == j:
+                continue
+            c_to = cond_list[j]
+
+            cfs_base = model.latent_counterfactual(x_ntc, x_p, P, c_from, c_from).detach().cpu().numpy()  # cell x d
+            cfs      = model.latent_counterfactual(x_ntc, x_p, P, c_from, c_to   ).detach().cpu().numpy()  # cell x d
+
+            # pseudo-bulk by mean over P (groups in u)
+            bulk_cfs_base = np.stack([cfs_base[P == g].mean(axis=0) for g in u], axis=0)  # p x d
+            bulk_cfs      = np.stack([cfs     [P == g].mean(axis=0) for g in u], axis=0)  # p x d
+
+            distances = np.linalg.norm(bulk_cfs - bulk_cfs_base, axis=1).astype(np.float32)  # p
+            cf_mat[:, i, j] = distances
+
+    return cf_mat
+
+
+
+
 
 
 @torch.no_grad()
