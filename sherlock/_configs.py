@@ -8,6 +8,7 @@ class _Defaults:
     pert_key: str = "pert"
     treatment_key: str = "treatment"
     ntc_label: str = "NTC"
+    untreated_label: str = "untreated"
 
 _DEFAULTS = asdict(_Defaults())          # single place where values live
 _CONFIG   = dict(_DEFAULTS)              # mutable runtime copy
