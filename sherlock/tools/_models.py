@@ -371,11 +371,11 @@ class VAE(nn.Module):
         return z0 + (mu_to - mu_from)
     
     @torch.no_grad()
-    def latent_counterfactual(self, x_ntc, x_p, p, c_from=None, c_to=None):
+    def latent_counterfactual(self, x_ntc, p, c_from=None, c_to=None):
         """
         q(z | z0_cf, p)
         """
-        device = x_p.device
+        device = x_ntc.device
         # abuduct and shift
         z0_hat = self._abduct_z0(x_ntc)
         z0_cf = self._do_shift_z0(z0_hat, c_from=c_from, c_to=c_to)
@@ -390,8 +390,12 @@ class VAE(nn.Module):
         A = chol_P @ q_rho_mean
         
         W = self.gate(deterministic=True)
-        pert_shift = A[p] * W[p]
-        z0_cf_masked = z0_cf * (1. - W[p])
+        if p is None:
+            pert_shift = 0
+            z0_cf_masked = z0_cf
+        else:
+            pert_shift = A[p] * W[p]
+            z0_cf_masked = z0_cf * (1. - W[p])
 
         if self.shift == 'poe':
             z_loc_cf, _ = self.__poe(z0_cf_masked, torch.ones_like(z0_cf_masked), pert_shift)

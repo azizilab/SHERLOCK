@@ -174,50 +174,103 @@ def _gen_uns(model, adata, ds, obsm_key, uns_key):
     x_p = torch.tensor(ds.X_pert).float()
     p2g = model.pert_to_target_graph(x_p, P, fix_gate=True)
     uns_data['p2g'] = p2g.cpu().detach().numpy()
+    
 
+    #counter factuals
     x_ntc_mat = ds.X_ntc # list over cond: cells x genes
 
     cond_unique = adata.obs[treatment_key].unique()
-    conds = torch.tensor([ds.condition_dict[c] for c in cond_unique], dtype=torch.int32)
+    cond_list = cond_unique.tolist() if hasattr(cond_unique, "tolist") else list(cond_unique)
 
+    # ensure untreated comes first (if present)
+    untreated = get_config("untreated_label")
+    assert untreated in cond_list
+    cond_list = [untreated] + [c for c in cond_list if c != untreated]
 
-    cfs_mat = compute_counterfactual(model, x_ntc_mat, x_p, P, conds)
-    uns_data['cfs_mat'] = cfs_mat
+    conds = torch.tensor([ds.condition_dict[c] for c in cond_list], dtype=torch.long)
+
+    cfs_null = compute_counterfactual_null(model, x_ntc_mat, conds)
+    uns_data['cfs_null'] = cfs_null
+
+    p_indices = np.unique(ds.P_indices)
+    inv_pert_dict = {v: k for k, v in ds.perturbation_dict.items()}
+    pert_names = [inv_pert_dict[int(p)] for p in p_indices]
+    uns_data['perts'] = pert_names       
+    cfs_perts = compute_counterfactual(model, x_ntc_mat, conds, p_indices)
+    uns_data['cfs_perts'] = cfs_perts
+
+    uns_data['conds'] = cond_list
+    uns_data['perts'] = pert_names
 
     adata.uns[uns_key] = uns_data
 
 @torch.no_grad()
-def compute_counterfactual(model, x_ntc_mat, x_p, P, cond_list):
-    u = np.unique(P)
-    cf_mat = np.zeros((len(u), len(cond_list), len(cond_list)), dtype=np.float32)
+def compute_counterfactual_null(model, x_ntc_mat, cond_list):
+    """
+    Returns Z_null with shape (C-1, d).
+      Z_null[i-1, :] = E_z[ do(p=NTC, c0 -> ci) ], for i = 1..C-1
+    Assumes cond_list[0] is untreated (c0).
+    """
 
-    for i in range(len(cond_list)):
-        c_from = cond_list[i]
-        
-        x_ntc = x_ntc_mat[i]
+    C = len(cond_list)
+    if C <= 1:
+        return np.zeros((0, getattr(model, "latent_dim", 0)), dtype=np.float32)
 
-        m, n = x_ntc.shape[0], x_p.shape[0]
-        idx = np.random.permutation(m)[:n] if m >= n else np.random.randint(0, m, size=n)
-        x_ntc = torch.tensor(x_ntc[idx], dtype=torch.float32)
+    # device to match model
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
 
-        for j in range(i + 1, len(cond_list)):
-            if i == j:
-                continue
-            c_to = cond_list[j]
+    c0 = cond_list[0]
+    rows = []
 
-            cfs_base = model.latent_counterfactual(x_ntc, x_p, P, c_from, c_from).detach().cpu().numpy()  # cell x d
-            cfs      = model.latent_counterfactual(x_ntc, x_p, P, c_from, c_to   ).detach().cpu().numpy()  # cell x d
+    for i in range(1, C):
+        ci = cond_list[i]
+        xi_np = x_ntc_mat[i]                      # cells_i x genes (numpy array)
+        xi = torch.as_tensor(xi_np, dtype=torch.float32, device=device)
 
-            # pseudo-bulk by mean over P (groups in u)
-            bulk_cfs_base = np.stack([cfs_base[P == g].mean(axis=0) for g in u], axis=0)  # p x d
-            bulk_cfs      = np.stack([cfs     [P == g].mean(axis=0) for g in u], axis=0)  # p x d
+        zi_mean = model.latent_counterfactual(xi, None, c0, ci).mean(0)
+        rows.append(zi_mean.detach().cpu().numpy().astype(np.float32))
 
-            distances = np.linalg.norm(bulk_cfs - bulk_cfs_base, axis=1).astype(np.float32)  # p
-            cf_mat[:, i, j] = distances
-
-    return cf_mat
+    return np.stack(rows, axis=0)  # (C-1, d)
 
 
+@torch.no_grad()
+def compute_counterfactual(model, x_ntc_mat, cond_list, pert_indices):
+    """
+    Returns cf_perts with shape (num_perts, C-1, d),
+    where cf_perts[p_i, i-1, :] = mean_z[ do(p = pert_indices[p_i], c0 -> ci) ].
+    Uses ALL NTC cells for each target condition ci.
+    Assumes cond_list[0] is untreated (c0).
+    """
+
+    # device
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
+
+    C = len(cond_list)
+    if C <= 1:
+        return np.zeros((len(pert_indices), 0, 0), dtype=np.float32)
+
+    c0 = torch.as_tensor(cond_list[0], dtype=torch.long, device=device)
+
+    cf_list = []  # each item: (C-1, d)
+    for p in pert_indices:
+        row_vecs = []
+        for i in range(1, C):
+            ci = torch.as_tensor(cond_list[i], dtype=torch.long, device=device)
+            xi = torch.as_tensor(x_ntc_mat[i], dtype=torch.float32, device=device)   # (m_i, genes)
+            p_vec = torch.full((xi.shape[0],), int(p), dtype=torch.long, device=device)
+
+            z = model.latent_counterfactual(xi, p_vec, c0, ci)  # (m_i, d)
+            row_vecs.append(z.mean(0).detach().cpu().numpy().astype(np.float32))
+
+        cf_list.append(np.stack(row_vecs, axis=0))  # (C-1, d)
+
+    return np.stack(cf_list, axis=0)  # (num_perts, C-1, d)
 
 
 
