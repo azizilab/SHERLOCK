@@ -6,21 +6,31 @@ import numpy as np
 from tqdm import tqdm
 import pandas as pd
 
-def slk_prepare_data(data: AnnData, pert_key: str, ntc_label: str, treatment_key: str = None, inplace: bool = True) -> AnnData:
+def slk_prepare_data(data: AnnData, pert_key: str, ntc_label: str, treatment_key: str = None, untreated_label: str = None, inplace: bool = True) -> AnnData:
 
     if not inplace:
         data = data.copy()
 
+    model_treatment_key = get_config('treatment_key')
+    model_untreated_label = get_config('untreated_label')
+
     if treatment_key is None:
-        data.obs[get_config('treatment_key')] = 'Untreated'
+        data.obs[model_treatment_key] = model_untreated_label
     else:
-        data.obs[get_config('treatment_key')] = data.obs[treatment_key].astype(str)
+        data.obs[model_treatment_key] = data.obs[treatment_key].astype(str)
 
-    data.obs[get_config('pert_key')] = data.obs[pert_key].astype(str)
+        untreated_idx = data.obs[treatment_key] == untreated_label
+        assert sum(untreated_idx) > 0, f"No cells with {treatment_key} == {untreated_label} found."
+        data.obs.loc[untreated_idx, model_treatment_key] = model_untreated_label
 
-    ntc_idx = data.obs.pert == ntc_label
+    model_pert_key = get_config('pert_key')
+    model_ntc_label = get_config('ntc_label')
+
+    data.obs[model_pert_key] = data.obs[pert_key].astype(str)
+
+    ntc_idx = data.obs[pert_key] == ntc_label
     assert sum(ntc_idx) > 0, f"No cells with {pert_key} == {ntc_label} found."
-    data.obs.loc[ntc_idx, 'pert'] = get_config('ntc_label')
+    data.obs.loc[ntc_idx, model_pert_key] = model_ntc_label
 
     return data
 
