@@ -33,6 +33,9 @@ def run_single(
     treat_effect_key="treat_effect",
     use_conditions=False,
     validate_every=10,
+    use_contrastive_jacobian=False,
+    use_de_align_loss=False,
+    de_align_lambda=1e-3,
     device=torch.device('cpu'),
     patience=20,
     **kwargs,
@@ -56,6 +59,27 @@ def run_single(
 
     pyro.clear_param_store()
 
+    # ---- optional DE alignment targets
+    treat_effect_map = None
+    if use_de_align_loss:
+        if treat_effect_key not in adata.uns:
+            raise ValueError(f"Requested DE alignment but uns['{treat_effect_key}'] is missing.")
+        te = adata.uns[treat_effect_key]
+        if hasattr(te, "to_df"):
+            te_df = te.to_df()
+        else:
+            te_df = pd.DataFrame(
+                getattr(te, "X", None),
+                index=getattr(te, "obs_names", None),
+                columns=getattr(te, "var_names", None),
+            )
+        te_df = te_df.reindex(columns=adata.var_names, fill_value=0.0)
+        effect_mat = np.zeros((len(dataset.perturbation_dict), adata.n_vars), dtype=np.float32)
+        for name, idx in dataset.perturbation_dict.items():
+            if name in te_df.index:
+                effect_mat[idx] = te_df.loc[name].to_numpy(dtype=np.float32)
+        treat_effect_map = torch.tensor(effect_mat, dtype=torch.float32, device=device)
+
     # ---- VAE defaults from run_single args
     default_vae_args = dict(
         input_dim=adata.shape[-1],
@@ -64,6 +88,10 @@ def run_single(
         conds=int(len(np.unique(dataset.C_indices))),
         tau=tau_init,
         use_conditions=use_conditions,
+        use_contrastive_jacobian=use_contrastive_jacobian,
+        use_de_align_loss=use_de_align_loss,
+        de_align_lambda=de_align_lambda,
+        treat_effect_map=treat_effect_map,
     )
 
     # ---- Filter user kwargs to ONLY those accepted by VAE.__init__
@@ -172,10 +200,11 @@ def _gen_uns(model, adata, ds, obsm_key, uns_key):
     uns_data['W'] = W
 
     x_p = torch.tensor(ds.X_pert).float()
-    p2g = model.pert_to_target_graph(x_p, P, fix_gate=True)
+    x_ntc_mat = ds.X_ntc  # list over cond: cells x genes
+    C = torch.from_numpy(ds.C_indices).long()
+    x_ntc_by_cond = [torch.tensor(x, dtype=torch.float32) for x in x_ntc_mat]
+    p2g = model.pert_to_target_graph(x_p, P, c=C, x_ntc_by_cond=x_ntc_by_cond, fix_gate=True)
     uns_data['p2g'] = p2g.cpu().detach().numpy()
-
-    x_ntc_mat = ds.X_ntc # list over cond: cells x genes
 
     cond_unique = adata.obs[treatment_key].unique()
     conds = torch.tensor([ds.condition_dict[c] for c in cond_unique], dtype=torch.int32)

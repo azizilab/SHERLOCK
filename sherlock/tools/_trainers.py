@@ -178,6 +178,8 @@ class VAETrainer:
                 self._last_tau = tau_curr
 
                 epoch_loss += self.svi.step(X_p, X_ntc, P, C)
+                # stabilize decoder basis after each update
+                self.vae.enforce_decoder_basis()
                 self.global_step += 1
 
             avg_elbo = epoch_loss / dataset_size

@@ -91,10 +91,15 @@ class VAE(nn.Module):
         ntc_lambda=1e-5,
         pert_lambda=1.0,
         cov_lambda=1e-4,
+        gate_row_repulsion_lambda=1e-3,
         gate_init_p=0.5,
         rank=6,
         use_conditions=False,
         shift='poe',
+        use_contrastive_jacobian=False,
+        use_de_align_loss=False,
+        de_align_lambda=1e-3,
+        treat_effect_map=None,
     ):
         super().__init__()
         assert shift in ['poe', 'linear'], "shift must be 'poe' or 'linear'"
@@ -116,6 +121,10 @@ class VAE(nn.Module):
         self.ntc_lambda = float(ntc_lambda)
         self.pert_lambda = float(pert_lambda)
         self.cov_lambda = float(cov_lambda)
+        self.gate_row_repulsion_lambda = float(gate_row_repulsion_lambda)
+        self.use_contrastive_jacobian = bool(use_contrastive_jacobian)
+        self.use_de_align_loss = bool(use_de_align_loss)
+        self.de_align_lambda = float(de_align_lambda)
 
         # embeddings / condition prior params
         self.p_emb = nn.Embedding(perturbs, latent_dim)
@@ -159,12 +168,23 @@ class VAE(nn.Module):
         # low-rank covariance (params live on module device)
         self.qr = QRCov(self.perturbs, self.rank)
 
+        # optional supervision: target DE per perturbation (perturbs x genes)
+        if treat_effect_map is not None:
+            self.register_buffer("treat_effect_map", treat_effect_map.float())
+        else:
+            self.treat_effect_map = None
+
     # --- helpers ---
     @torch.no_grad()
     def _corr(self, M, eps=1e-8):
         d = torch.sqrt(torch.clamp(torch.diag(M), min=eps))
         denom = torch.outer(d, d)
         return M / torch.clamp(denom, min=eps)
+
+    def _mednorm(self, x: torch.Tensor) -> torch.Tensor:
+        lib = x.sum(dim=1, keepdim=True)
+        med = torch.median(lib).item()
+        return torch.log1p(x / torch.clamp(lib, min=1e-8) * med)
 
     @torch.no_grad()
     def _get_cov(self):
@@ -174,6 +194,21 @@ class VAE(nn.Module):
         eyeP = torch.eye(P_, dtype=L.dtype, device=L.device)
         Sigma_P = L @ L.T + (sigma_P**2) * eyeP
         return Sigma_P
+
+    @torch.no_grad()
+    def enforce_decoder_basis(self):
+        """
+        Orthonormalize first decoder layer columns and fix signs for stability.
+        """
+        if not isinstance(self.z_decoder[0], nn.Linear):
+            return
+        W = self.z_decoder[0].weight  # (hidden, latent_dim)
+        Q, _ = torch.linalg.qr(W, mode="reduced")
+        idx = Q.abs().argmax(dim=0)
+        signs = torch.sign(Q[idx, torch.arange(Q.size(1), device=Q.device)])
+        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+        Q = Q * signs
+        W.copy_(Q)
     
     def __poe(self, z0_loc, z0_scale, lin_shift):
         device = z0_loc.device
@@ -237,6 +272,13 @@ class VAE(nn.Module):
         p_col = col_usage / (col_usage.sum() + 1e-8)
         entropy_col = -(p_col * (p_col + 1e-8).log()).sum()
         pyro.factor("col_entropy", + self.H_lambda * entropy_col)
+        # encourage perturbations to use different latent gates
+        if self.perturbs > 1:
+            W_norm = W / (W.norm(dim=1, keepdim=True) + 1e-8)
+            sim = W_norm @ W_norm.T
+            off_diag = sim[~torch.eye(self.perturbs, device=device, dtype=torch.bool)]
+            repulsion = (off_diag ** 2).mean()
+            pyro.factor("gate_row_repulsion", - self.gate_row_repulsion_lambda * repulsion)
 
         with pyro.plate("cells", x_p.size(0)):
             if self.use_conditions:
@@ -285,16 +327,37 @@ class VAE(nn.Module):
                 infer={"scale": self.pert_lambda},
             )
 
+            # optional DE alignment loss against provided targets
+            if self.use_de_align_loss and self.treat_effect_map is not None:
+                # reuse decoded logits to avoid extra passes
+                mu_p = theta * logits_p.exp()          # batch x genes
+                mu_ntc = theta * logits_ntc.exp()
+                P_max = self.perturbs
+
+                # per-pert sums via scatter for speed
+                sum_p = torch.zeros(P_max, self.input_dim, device=device)
+                sum_ntc = torch.zeros_like(sum_p)
+                cnt = torch.zeros(P_max, device=device)
+
+                expand_idx = p.unsqueeze(1).expand(-1, self.input_dim)
+                sum_p.scatter_add_(0, expand_idx, mu_p)
+                sum_ntc.scatter_add_(0, expand_idx, mu_ntc)
+                cnt.scatter_add_(0, p, torch.ones_like(p, dtype=sum_p.dtype))
+
+                mask = cnt > 0
+                if mask.any():
+                    mean_p = sum_p[mask] / (cnt[mask].unsqueeze(1) + 1e-8)
+                    mean_ntc = sum_ntc[mask] / (cnt[mask].unsqueeze(1) + 1e-8)
+                    pred_eff = mean_p - mean_ntc
+                    target = self.treat_effect_map.to(pred_eff.device)[:P_max][mask]
+                    loss = F.mse_loss(pred_eff, target)
+                    pyro.factor("de_align_loss", - self.de_align_lambda * loss)
+
     def guide(self, x_p, x_ntc, p, c):
         pyro.module("VAE", self)
 
-        def mednorm(x):
-            lib = x.sum(dim=1, keepdim=True)
-            med = torch.median(lib).item()
-            return torch.log1p(x / lib * med)
-
-        x_p = mednorm(x_p)
-        x_ntc = mednorm(x_ntc)
+        x_p = self._mednorm(x_p)
+        x_ntc = self._mednorm(x_ntc)
 
         q_loc = self.rho_enc(self.p_emb.weight)
         with pyro.plate("perturbations", self.perturbs):
@@ -314,12 +377,62 @@ class VAE(nn.Module):
     @torch.no_grad()
     def __eval_points(self, x_p, p):
         self.eval()
-        z_mu, _ = self.z_encoder(torch.cat([x_p], dim=-1)).chunk(2, dim=-1)
+        x_p_n = self._mednorm(x_p)
+        z_mu, _ = self.z_encoder(x_p_n).chunk(2, dim=-1)
         eval_points = []
-        for pp in torch.unique(p):
+        # gather one eval point per perturbation index; fallback to global mean if absent
+        global_mean = z_mu.mean(dim=0, keepdim=True)
+        for pp in range(self.perturbs):
             mask = (p == pp)
-            eval_points.append(z_mu[mask].mean(dim=0, keepdim=True))
+            if mask.any():
+                eval_points.append(z_mu[mask].mean(dim=0, keepdim=True))
+            else:
+                eval_points.append(global_mean)
         return torch.cat(eval_points, dim=0)
+
+    @torch.no_grad()
+    def __control_eval_points(self, p, c, x_ntc_by_cond, device):
+        """
+        Build per-perturbation control eval points from matching-condition NTC cells.
+        """
+        if x_ntc_by_cond is None or len(x_ntc_by_cond) == 0:
+            return None
+
+        # normalize control list to tensors on device
+        ctrl_list = []
+        for x in x_ntc_by_cond:
+            t = torch.as_tensor(x, device=device, dtype=torch.float32)
+            if t.ndim == 1:
+                t = t.unsqueeze(0)
+            ctrl_list.append(t)
+
+        # if no condition labels, fallback to global control mean for all perts
+        if c is None:
+            pooled = torch.cat(ctrl_list, dim=0)
+            z0_mu = self._abduct_z0(pooled)
+            ctrl_mean = z0_mu.mean(dim=0, keepdim=True)
+            return ctrl_mean.expand(self.perturbs, -1)
+
+        ctrl_points = []
+        global_mean = None
+        for pp in range(self.perturbs):
+            mask = (p == pp)
+            if not mask.any():
+                ctrl_points.append(None)
+                continue
+            cond_idx = c[mask][0].item()
+            if cond_idx >= len(ctrl_list):
+                ctrl_points.append(None)
+                continue
+            x_ntc = ctrl_list[cond_idx]
+            z0_mu = self._abduct_z0(x_ntc)
+            ctrl_points.append(z0_mu.mean(dim=0, keepdim=True))
+            if global_mean is None:
+                global_mean = ctrl_points[-1]
+        if global_mean is None:
+            return None
+        filled = [cp if cp is not None else global_mean for cp in ctrl_points]
+        return torch.cat(filled, dim=0)
     
     # (1, d) -> (1, G) -> (G,)
     def __decode_one_sample(self, z_single):
@@ -329,21 +442,33 @@ class VAE(nn.Module):
         self.eval()
         f = jacrev(self.__decode_one_sample)
         J = vmap(f)(eval_points) # (P, G, d)
-        B = J.mean(dim=0).transpose(0,1).contiguous().abs() # (d, G)
+        B = J.transpose(1, 2).contiguous().abs() # (P, d, G)
         return B
     
     @torch.no_grad()
-    def pert_to_target_graph(self, x_p, p, fix_gate=True):
+    def pert_to_target_graph(self, x_p, p, c=None, x_ntc_by_cond=None, fix_gate=True):
         device = x_p.device
+        x_p = self._mednorm(x_p)
         eval_points = self.__eval_points(x_p, p)
         
         # turn on local gradient for jacobian
         with torch.enable_grad():
             eval_points = eval_points.detach().requires_grad_(True)
-            B = self.__jac(eval_points)
+            B_treat = self.__jac(eval_points)
+
+            B_ctrl = None
+            if self.use_contrastive_jacobian and x_ntc_by_cond is not None:
+                ctrl_points = self.__control_eval_points(p, c, x_ntc_by_cond, device)
+                if ctrl_points is not None:
+                    ctrl_points = ctrl_points.detach().requires_grad_(True)
+                    B_ctrl = self.__jac(ctrl_points)
+            if B_ctrl is not None:
+                B = (B_treat - B_ctrl).abs()
+            else:
+                B = B_treat
         
         W = self.gate(deterministic=fix_gate)
-        G = W @ B
+        G = (W.unsqueeze(-1) * B).sum(dim=1)
         return G / (G.max(dim=1, keepdim=True).values + 1e-8)
     
     
