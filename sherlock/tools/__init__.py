@@ -4,3 +4,4 @@ from ._single import run_single, eval_single
 from ._IO import load_results, save_results
 from ._clustering import cluster_rho, group2name
 from ._datasets import PerturbMatchingDataset
+from ._analysis import ev_sig
