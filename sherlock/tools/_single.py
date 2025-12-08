@@ -20,6 +20,7 @@ from ._models import VAE
 from ._trainers import VAETrainer
 
 
+
 def run_single(
     adata,
     batch_size=4096,
@@ -100,7 +101,54 @@ def run_single(
     )
 
     best_vae, param_store = trainer.fit()
-    return {'model': best_vae, 'param_store': param_store}
+    
+        # Create comprehensive training dictionary
+    training_config = {
+        # Training parameters
+        'batch_size': batch_size,
+        'shuffle': shuffle,
+        'num_workers': num_workers,
+        'lr': lr,
+        'num_epochs': num_epochs,
+        'validate_every': validate_every,
+        'patience': patience,
+        
+        # Model architecture parameters
+        'input_dim': adata.shape[-1],
+        'latent_dim': latent_dim,
+        'perturbs': int(len(np.unique(dataset.P_indices))),
+        'conds': int(len(np.unique(dataset.C_indices))),
+        'rank': vae.rank if hasattr(vae, 'rank') else None,
+        'use_conditions': use_conditions,
+        'shift': vae.shift if hasattr(vae, 'shift') else None,
+        
+        # Temperature parameters
+        'tau_init': tau_init,
+        'tau_end': tau_end,
+        
+        # Loss weight parameters
+        'l0_lambda': vae.l0_lambda if hasattr(vae, 'l0_lambda') else None,
+        'l1_lambda': vae.l1_lambda if hasattr(vae, 'l1_lambda') else None,
+        'l2_lambda': vae.l2_lambda if hasattr(vae, 'l2_lambda') else None,
+        'H_lambda': vae.H_lambda if hasattr(vae, 'H_lambda') else None,
+        'ce_lambda': vae.ce_lambda if hasattr(vae, 'ce_lambda') else None,
+        'ntc_lambda': vae.ntc_lambda if hasattr(vae, 'ntc_lambda') else None,
+        'pert_lambda': vae.pert_lambda if hasattr(vae, 'pert_lambda') else None,
+        'cov_lambda': vae.cov_lambda if hasattr(vae, 'cov_lambda') else None,
+        
+        # Gate parameters
+        'gate_init_p': vae.gate_init_p if hasattr(vae, 'gate_init_p') else None,
+        
+        # Data parameters
+        'treat_effect_key': treat_effect_key,
+        'device': str(device)
+    }
+    
+    return {
+        'model': best_vae, 
+        'param_store': param_store,
+        'training_config': training_config
+    }
 
 @torch.no_grad()
 def _gen_uns(model, adata, ds, obsm_key, uns_key):

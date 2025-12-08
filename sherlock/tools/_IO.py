@@ -1,7 +1,6 @@
 import torch
 import pyro
 from pathlib import Path
-
 def save_results(results, path: str) -> None:
     """
     Save everything needed to reconstruct and load a VAE from just `path`.
@@ -28,9 +27,12 @@ def save_results(results, path: str) -> None:
         "state_dict": model.state_dict(),
         "meta": {"torch": torch.__version__},
         "pyro_param_store": results['param_store'],
+        "training_config": results['training_config'],
     }
 
     payload["pyro_param_store"] = results['param_store']
+    
+    
 
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -58,3 +60,36 @@ def load_results(path: str):
     pyro.get_param_store().set_state(ckpt["pyro_param_store"])
 
     return model
+
+
+def load_training_config(path: str) -> dict:
+    """
+    Load only the training configuration dictionary from a saved model checkpoint.
+    
+    Parameters
+    ----------
+    path : str
+        Path to the saved model checkpoint (.pth file)
+    
+    Returns
+    -------
+    dict
+        Training configuration dictionary containing all training parameters,
+        model hyperparameters, and training history
+        
+    Examples
+    --------
+    >>> config = slk.tl.load_training_config('../data/model_20241107_103826.pth')
+    >>> print(f"Learning rate: {config['lr']}")
+    >>> print(f"L0 lambda: {config['l0_lambda']}")
+    >>> print(f"Final loss: {config['train_history']['total_loss'][-1]}")
+    """
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+
+    if "training_config" not in ckpt:
+        # Return empty dict if no training config was saved (backwards compatibility)
+        print(f"Warning: No training_config found in checkpoint {path}")
+        return {}
+
+    return ckpt["training_config"]
+
