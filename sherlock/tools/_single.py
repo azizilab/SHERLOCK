@@ -4,6 +4,7 @@ import multiprocessing as mp
 import numpy as np
 import pyro
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import pyro.poutine as poutine
 from typing import Literal
@@ -213,7 +214,92 @@ def _gen_uns(model, adata, ds, obsm_key, uns_key):
     cfs_mat = compute_counterfactual(model, x_ntc_mat, x_p, P, conds)
     uns_data['cfs_mat'] = cfs_mat
 
+    # Explained Variance (Condition x P x G)
+    ev_list = []
+    device = next(model.parameters()).device
+
+    for cond_label, cond_idx in zip(cond_unique, conds):
+        x_ntc_cond = x_ntc_mat[cond_idx]   # (cells_in_cond, G) NTC for this condition
+        ev_pg = _explained_variance(
+            model,
+            x_ntc_cond=x_ntc_cond,
+            cond_idx=cond_idx,
+            device=device,
+        )
+        ev_list.append(ev_pg)
+    uns_data['explained_variance'] = np.stack(ev_list, axis=0)  # (C, P, G)
+
+    #name saving
+    uns_data['conditions'] = np.array(cond_unique)
+    idx_to_pert = {idx: name for name, idx in ds.perturbation_dict.items()}
+    pert_names = [idx_to_pert[i] for i in range(len(idx_to_pert))]
+    uns_data['perts'] = np.array(pert_names)
+
     adata.uns[uns_key] = uns_data
+
+@torch.no_grad()
+def _explained_variance(model, x_ntc_cond, cond_idx, device=None):
+    if device is None:
+        device = next(model.parameters()).device
+
+    if isinstance(x_ntc_cond, np.ndarray):
+        x_ntc = torch.as_tensor(x_ntc_cond, dtype=torch.float32, device=device)
+    else:
+        x_ntc = x_ntc_cond.to(device=device, dtype=torch.float32)
+
+    n_cells, G = x_ntc.shape
+    num_p = model.perturbs
+
+    if n_cells < 2:
+        return np.zeros((num_p, G), dtype=np.float32)
+
+    # --- work on log-normalized scale for the denominator ---
+    lib = x_ntc.sum(dim=1, keepdim=True) + 1e-8
+    x_ntc_norm = torch.log1p(x_ntc / lib * 1e4)  # e.g. CPM then log1p
+    var_total = x_ntc_norm.var(dim=0, unbiased=True)  # (G,)
+
+    # abduct z0
+    z0_hat = model._abduct_z0(x_ntc)          # (n_cells, d)
+    lib_ntc = x_ntc.sum(dim=1, keepdim=True)  # (n_cells, 1)
+
+    logits0 = model.z_decoder(z0_hat)
+    mu_prob0 = F.softmax(logits0, dim=-1)
+    mu0 = lib_ntc * mu_prob0                 # (n_cells, G)
+
+    ev_pg = torch.zeros(num_p, G, device=device, dtype=torch.float32)
+    cond_idx_long = torch.tensor(int(cond_idx), dtype=torch.long, device=device)
+
+    for p_idx in range(num_p):
+        p_vec = torch.full((n_cells,), p_idx, dtype=torch.long, device=device)
+
+        z_cf = model.latent_counterfactual(
+            x_ntc=x_ntc,
+            x_p=x_ntc,
+            p=p_vec,
+            c_from=cond_idx_long,
+            c_to=cond_idx_long,
+        )
+
+        logits1 = model.z_decoder(z_cf)
+        mu_prob1 = F.softmax(logits1, dim=-1)
+        mu1 = lib_ntc * mu_prob1
+
+        # log-normalize the predicted means to match denominator scale
+        mu0_norm = torch.log1p(mu0 / lib_ntc * 1e4)
+        mu1_norm = torch.log1p(mu1 / lib_ntc * 1e4)
+
+        delta = mu1_norm - mu0_norm               # (n_cells, G)
+
+        mean_shift = delta.mean(dim=0)           # (G,)
+        # var_shift = delta.var(dim=0, unbiased=True)   # (G,)
+
+        ev = mean_shift.pow(2) / (var_total + 1e-8)
+        # ev = var_shift / (var_total + 1e-8)
+
+        ev_pg[p_idx] = ev
+
+    return ev_pg.cpu().numpy().astype(np.float32)
+
 
 @torch.no_grad()
 def compute_counterfactual(model, x_ntc_mat, x_p, P, cond_list):
