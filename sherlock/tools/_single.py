@@ -211,7 +211,7 @@ def _gen_uns(model, adata, ds, obsm_key, uns_key):
     conds = torch.tensor([ds.condition_dict[c] for c in cond_unique], dtype=torch.int32)
 
 
-    cfs_mat = compute_counterfactual(model, x_ntc_mat, x_p, P, conds)
+    cfs_mat = compute_counterfactual(model, x_ntc_mat, x_p, P, C, conds, seed=0, n_ctrl_samples=10)
     uns_data['cfs_mat'] = cfs_mat
 
     # Explained Variance (Condition x P x G)
@@ -302,43 +302,103 @@ def _explained_variance(model, x_ntc_cond, cond_idx, device=None):
 
 
 @torch.no_grad()
-def compute_counterfactual(model, x_ntc_mat, x_p, P, cond_list):
-    u = np.unique(P)
-    cf_mat = np.zeros((len(u), len(cond_list), len(cond_list)), dtype=np.float32)
+def compute_counterfactual(model, x_ntc_mat, x_p, P, C, cond_list, seed = 44, n_ctrl_samples = 10):
+    device = next(model.parameters()).device
 
-    for i in range(len(cond_list)):
-        c_from = cond_list[i]
-        
-        x_ntc = x_ntc_mat[i]
+    x_p_t = torch.as_tensor(x_p, dtype=torch.float32, device=device)
+    P_t = torch.as_tensor(P, dtype=torch.long, device=device)
+    C_t = torch.as_tensor(C, dtype=torch.long, device=device)
+    cond_list_t = torch.as_tensor(cond_list, dtype=torch.long, device=device)
 
-        m, n = x_ntc.shape[0], x_p.shape[0]
-        idx = np.random.permutation(m)[:n] if m >= n else np.random.randint(0, m, size=n)
-        x_ntc = torch.tensor(x_ntc[idx], dtype=torch.float32)
+    ctrl_by_cond = []
+    for x in x_ntc_mat:
+        t = torch.as_tensor(x, dtype=torch.float32, device=device)
+        if t.ndim == 1:
+            t = t.unsqueeze(0)
+        ctrl_by_cond.append(t)
 
-        for j in range(i + 1, len(cond_list)):
-            if i == j:
+    unique_p = torch.unique(P_t, sorted=True)
+    cf_mat_sum = torch.zeros((unique_p.numel(), cond_list_t.numel(), cond_list_t.numel()), device=device, dtype=torch.float32)
+
+    # helper to sample matched NTC cells
+    def sample_matched_ntc(generator, deterministic_mean: bool = False):
+        n_cells, G = x_p_t.shape
+        matched = torch.empty((n_cells, G), device=device)
+        for cond_idx, ctrl in enumerate(ctrl_by_cond):
+            mask = (C_t == cond_idx)
+            if not mask.any():
                 continue
-            c_to = cond_list[j]
+            if ctrl.size(0) == 0:
+                raise ValueError(f"No NTC cells available for condition index {cond_idx}.")
+            if deterministic_mean:
+                mean_ctrl = ctrl.mean(dim=0, keepdim=True)
+                matched[mask] = mean_ctrl.expand(mask.sum(), -1)
+            else:
+                sample_idx = torch.randint(ctrl.size(0), (mask.sum().item(),), generator=generator, device=device)
+                matched[mask] = ctrl[sample_idx]
+        return matched
 
-            cfs_base = model.latent_counterfactual(x_ntc, x_p, P, c_from, c_from).detach().cpu().numpy()  # cell x d
-            cfs      = model.latent_counterfactual(x_ntc, x_p, P, c_from, c_to   ).detach().cpu().numpy()  # cell x d
+    deterministic = (seed is None) or (n_ctrl_samples is not None and int(n_ctrl_samples) <= 0)
+    n_samples = 1 if deterministic else max(1, int(n_ctrl_samples))
+    for s in range(n_samples):
+        rng = None
+        if not deterministic and seed is not None:
+            rng = torch.Generator(device=device)
+            rng.manual_seed(int(seed) + s)
 
-            # pseudo-bulk by mean over P (groups in u)
-            bulk_cfs_base = np.stack([cfs_base[P == g].mean(axis=0) for g in u], axis=0)  # p x d
-            bulk_cfs      = np.stack([cfs     [P == g].mean(axis=0) for g in u], axis=0)  # p x d
+        matched_ntc = sample_matched_ntc(rng, deterministic_mean=deterministic)
 
-            distances = np.linalg.norm(bulk_cfs - bulk_cfs_base, axis=1).astype(np.float32)  # p
-            cf_mat[:, i, j] = distances
+        for i, c_from in enumerate(cond_list_t):
+            mask_from = (C_t == c_from)
+            if not mask_from.any():
+                continue
 
-    return cf_mat
+            x_ntc_from = matched_ntc[mask_from]
+            x_p_from = x_p_t[mask_from]
+            P_from = P_t[mask_from]
 
+            cfs_base, cfs_base_std = model.latent_counterfactual(
+                x_ntc_from, x_p_from, P_from, c_from, c_from, return_std=True
+            )  # cell x d
 
+            for j, c_to in enumerate(cond_list_t):
+                if i == j:
+                    continue
 
+                cfs, _ = model.latent_counterfactual(
+                    x_ntc_from, x_p_from, P_from, c_from, c_to, return_std=True
+                )  # cell x d
 
+                bulk_base = []
+                bulk_cf = []
+                bulk_scale = []
+                for p_val in unique_p:
+                    mask_p = (P_from == p_val)
+                    if mask_p.any():
+                        bulk_base.append(cfs_base[mask_p].mean(dim=0))
+                        bulk_cf.append(cfs[mask_p].mean(dim=0))
+                        bulk_scale.append(cfs_base_std[mask_p].mean(dim=0))
+                    else:
+                        bulk_base.append(torch.zeros_like(cfs_base[0]))
+                        bulk_cf.append(torch.zeros_like(cfs[0]))
+                        bulk_scale.append(torch.ones_like(cfs_base[0]) * 1e-3)
 
+                bulk_base = torch.stack(bulk_base, dim=0)
+                bulk_cf = torch.stack(bulk_cf, dim=0)
+                bulk_scale = torch.stack(bulk_scale, dim=0).clamp_min(1e-6)
+
+                distances = torch.linalg.norm((bulk_cf - bulk_base) / bulk_scale, dim=1)  # p
+                cf_mat_sum[:, i, j] += distances
+
+    cf_mat = cf_mat_sum / float(n_samples)
+    return cf_mat.cpu().numpy().astype(np.float32)
 
 @torch.no_grad()
-def eval_single(model, adata, obsm_key: str = "z", uns_key: str="results") -> None:
+def eval_single(model, adata, obsm_key: str = "z", uns_key: str="results", param_store=None) -> None:
+    if param_store is not None:
+        pyro.clear_param_store()
+        pyro.get_param_store().set_state(param_store)
+
     model.eval()
     device = torch.device('cpu')
     model.to(device)

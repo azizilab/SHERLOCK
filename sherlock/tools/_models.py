@@ -194,21 +194,6 @@ class VAE(nn.Module):
         eyeP = torch.eye(P_, dtype=L.dtype, device=L.device)
         Sigma_P = L @ L.T + (sigma_P**2) * eyeP
         return Sigma_P
-
-    @torch.no_grad()
-    def enforce_decoder_basis(self):
-        """
-        Orthonormalize first decoder layer columns and fix signs for stability.
-        """
-        if not isinstance(self.z_decoder[0], nn.Linear):
-            return
-        W = self.z_decoder[0].weight  # (hidden, latent_dim)
-        Q, _ = torch.linalg.qr(W, mode="reduced")
-        idx = Q.abs().argmax(dim=0)
-        signs = torch.sign(Q[idx, torch.arange(Q.size(1), device=Q.device)])
-        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-        Q = Q * signs
-        W.copy_(Q)
     
     def __poe(self, z0_loc, z0_scale, lin_shift):
         device = z0_loc.device
@@ -475,7 +460,7 @@ class VAE(nn.Module):
     # ------------------------------ counterfactual helpers ---------------------------- #
     
     @torch.no_grad()
-    def _abduct_z0(self, x_ntc):
+    def _abduct_z0(self, x_ntc, return_std: bool = True):
         """
         q(z0_hat | x_ntc)
         """
@@ -483,7 +468,10 @@ class VAE(nn.Module):
         lib_ntc = x_ntc.sum(dim=1, keepdim=True)
         med_ntc = torch.median(lib_ntc).item()
         x_ntc_n = torch.log1p(x_ntc / lib_ntc * med_ntc)
-        z0_mu, _ = self.z0_encoder(x_ntc_n).chunk(2, dim=-1)
+        z0_mu, z0_logvar = self.z0_encoder(x_ntc_n).chunk(2, dim=-1)
+        z0_std = (0.5 * z0_logvar).exp()
+        if return_std:
+            return z0_mu, z0_std
         return z0_mu
     
     @torch.no_grad()
@@ -496,14 +484,17 @@ class VAE(nn.Module):
         return z0 + (mu_to - mu_from)
     
     @torch.no_grad()
-    def latent_counterfactual(self, x_ntc, x_p, p, c_from=None, c_to=None):
+    def latent_counterfactual(self, x_ntc, x_p, p, c_from=None, c_to=None, return_std= False):
         """
         q(z | z0_cf, p)
         """
         device = x_p.device
         # abuduct and shift
-        z0_hat = self._abduct_z0(x_ntc)
-        z0_cf = self._do_shift_z0(z0_hat, c_from=c_from, c_to=c_to)
+        z0_hat_ctrl, z0_std_ctrl = self._abduct_z0(x_ntc, return_std=True)
+
+        # incorporate evidence from the observed perturbed cell
+        x_p_n = self._mednorm(x_p)
+        z_obs_mu, _ = self.z_encoder(x_p_n).chunk(2, dim=-1)
         
         # predict with CF
         self.eval()
@@ -516,13 +507,36 @@ class VAE(nn.Module):
         
         W = self.gate(deterministic=True)
         pert_shift = A[p] * W[p]
+
+        # PoE-informed inversion of perturbation effect
+        W_scale = pyro.param("W_scale").detach().to(device)
+        eps = 1e-6
+        W_var = ((W_scale ** 2) * (W[p] ** 2)).clamp_min(eps)
+        z0_var_ctrl = z0_std_ctrl.pow(2).clamp_min(eps)
+        alpha = z0_var_ctrl / (z0_var_ctrl + W_var)
+        z0_from_p = z_obs_mu - alpha * pert_shift
+        var_from_p = (z0_var_ctrl * W_var) / (z0_var_ctrl + W_var)
+        var_from_p = var_from_p.clamp_min(eps)
+
+        # precision-weighted fusion of control and perturbed evidence
+        prec_ctrl = 1.0 / (z0_var_ctrl + eps)
+        prec_p = 1.0 / (var_from_p + eps)
+        fused_var = 1.0 / (prec_ctrl + prec_p + eps)
+        z0_hat = fused_var * (prec_ctrl * z0_hat_ctrl + prec_p * z0_from_p)
+        z0_std = fused_var.sqrt()
+
+        z0_cf = self._do_shift_z0(z0_hat, c_from=c_from, c_to=c_to)
         z0_cf_masked = z0_cf * (1. - W[p])
 
         if self.shift == 'poe':
-            z_loc_cf, _ = self.__poe(z0_cf_masked, torch.ones_like(z0_cf_masked), pert_shift)
+            z_loc_cf, z_var_cf = self.__poe(z0_cf_masked, z0_std, pert_shift)
+            z_std_cf = z_var_cf.sqrt()
         elif self.shift == 'linear':
             z_loc_cf = z0_cf_masked + pert_shift
+            z_std_cf = z0_std
         else:
             raise ValueError("Invalid shift type")
         
+        if return_std:
+            return z_loc_cf, z_std_cf
         return z_loc_cf
