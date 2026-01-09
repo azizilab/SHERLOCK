@@ -401,3 +401,110 @@ class VAE(nn.Module):
             raise ValueError("Invalid shift type")
         
         return z_loc_cf
+    
+class cVAE(nn.Module):
+    def __init__(
+            self, 
+            input_dim,  
+            latent_dim, 
+            perturbs,
+            conds,
+            use_conditions=False,
+            hidden_dim=128,
+            *kwargs
+        ):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.latent_dim = latent_dim
+        self.perturbs = perturbs
+        self.conds = conds
+        self.use_conditions = use_conditions
+        self.hidden_dim = hidden_dim
+
+        # embeddings 
+        self.p_emb = nn.Embedding(perturbs, latent_dim)
+        self.c_emb = nn.Embedding(conds, latent_dim)
+
+        cond_dim = latent_dim + (latent_dim if use_conditions else 0)
+
+        # prior layers
+        self.input_to_hidden_prior = nn.Linear(input_dim + cond_dim, hidden_dim)
+        self.h_to_mu_prior = nn.Linear(hidden_dim, latent_dim)
+        self.h_to_logvar_prior = nn.Linear(hidden_dim, latent_dim)
+
+        # posterior layers
+        self.input_to_hidden_posterior = nn.Linear(2*input_dim + cond_dim, hidden_dim)
+        self.h_to_mu_posterior = nn.Linear(hidden_dim, latent_dim)
+        self.h_to_logvar_posterior = nn.Linear(hidden_dim, latent_dim)
+
+
+        # decoder layers
+        self.z_to_h = nn.Linear(latent_dim + cond_dim, hidden_dim)
+        self.h_to_nb = nn.Linear(hidden_dim, 2 * input_dim)
+
+
+    def cond_emb(self, p, c=None):
+        p = self.p_emb(p)
+        if self.use_conditions and c is not None:
+            c = self.c_emb(c)
+            return torch.cat((p, c), dim=1)
+        else:
+            return p
+        
+    def prior(self, x_ntc, p, c=None):
+        cond = self.cond_emb(p, c)
+        input_combined = torch.cat((x_ntc, cond), dim=1)
+        h = F.relu(self.input_to_hidden_prior(input_combined))
+        mu, logvar = self.h_to_mu_prior(h), self.h_to_logvar_prior(h)
+
+        LOGVAR_MIN, LOGVAR_MAX = -6.0, 6.0   # start tighter; can widen later
+
+        logvar = torch.clamp(logvar, LOGVAR_MIN, LOGVAR_MAX)
+
+        return mu, logvar
+
+    
+    def posterior(self, X_ntc, X_pert, p, c=None):
+        cond = self.cond_emb(p, c)
+        x = torch.cat((X_ntc, X_pert), dim=1)
+        input_combined = torch.cat((x, cond), dim=1)
+        h = F.relu(self.input_to_hidden_posterior(input_combined))
+        mu, logvar = self.h_to_mu_posterior(h), self.h_to_logvar_posterior(h)
+
+        LOGVAR_MIN, LOGVAR_MAX = -6.0, 6.0   # start tighter; can widen later
+
+        logvar = torch.clamp(logvar, LOGVAR_MIN, LOGVAR_MAX)
+
+    
+        return mu, logvar
+    
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        epsilon = torch.randn_like(logvar)
+        return mu + std * epsilon
+    
+    def decoder(self, z, p, c=None):
+        cond = self.cond_emb(p, c)
+        # Decode z and c to reconstruct x
+        input_combined = torch.cat((z, cond), dim=1)
+        # Hidden layer
+        h = F.relu(self.z_to_h(input_combined))
+
+        out = self.h_to_nb(h)
+        log_mu, log_theta = out.chunk(2, dim=-1)
+
+        log_mu = torch.clamp(log_mu, -10.0, 10.0)
+        log_theta = torch.clamp(log_theta, -10.0, 10.0)
+
+        mu = torch.exp(log_mu)
+        theta = torch.exp(log_theta)
+                                
+        return mu, theta 
+    
+    def forward(self, X_ntc, X_pert, p, c=None):
+        mu_q, logvar_q = self.posterior(X_ntc, X_pert, p, c)
+        mu_p, logvar_p = self.prior(X_ntc, p, c)
+        z = self.reparameterize(mu_q, logvar_q)
+        mu, theta = self.decoder(z, p, c)
+        return mu, theta, mu_q, logvar_q, mu_p, logvar_p # return mu and sigma for reconstructed loss and KL divergence 
