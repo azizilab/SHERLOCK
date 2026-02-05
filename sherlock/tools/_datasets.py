@@ -149,6 +149,7 @@ class PerturbMatchingDataset(Dataset):
         # unique conditions
         cond_unique = np.unique(condlbl)
         pert_unique = np.unique(pertlbl)
+        
 
         self.perturbation_dict = {p: i for i, p in enumerate(pert_unique)}
         self.condition_dict = {c: i for i, c in enumerate(cond_unique)}
@@ -159,7 +160,7 @@ class PerturbMatchingDataset(Dataset):
 
 
         # ── expression matrix ───────────────────────────────────────────
-        self.X_ntc = [ntc_anndata[ntc_anndata.obs.treatment == cond].X.toarray() for cond in cond_unique]
+        self.X_ntc = [ntc_anndata[ntc_anndata.obs[treatment_key] == cond].X.toarray() for cond in cond_unique]
         self.X_pert = pert_anndata.X.toarray() if hasattr(pert_anndata.X, "toarray") else pert_anndata.X
 
         self.P = pert_anndata.obs[p_key].values
