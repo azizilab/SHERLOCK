@@ -9,5 +9,6 @@ from . import plotting as pl
 from . import preprocessing as pp
 from . import tools as tl
 from . import _configs as configs
+from . import benchmarks as bm
 
-sys.modules.update({f"{__name__}.{m}": globals()[m] for m in ["tl", "pp", "pl", "configs"]})
+sys.modules.update({f"{__name__}.{m}": globals()[m] for m in ["tl", "pp", "pl", "configs", "bm"]})
