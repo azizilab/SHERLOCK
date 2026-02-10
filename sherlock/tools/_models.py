@@ -259,8 +259,13 @@ class VAE(nn.Module):
             )
 
             # gated perturbation shift (no condition branch)
-            z0_loc_mod = z0_loc * (1.0 - W[p])
+            z0_loc_mod = z0_loc #* (1.0 - W[p])
+            
             lin_shift = A[p] * W[p]
+            if len(lin_shift.shape) != 2: #p == -1 is no perturbation.
+                comb_mask = (p != -1).float().unsqueeze(-1)
+                lin_shift = lin_shift * comb_mask
+                lin_shift = lin_shift.sum(dim=1)
 
             if self.shift == 'poe':
                 z_loc, z_var = self.__poe(z0_loc_mod, z0_scale, lin_shift)
@@ -274,7 +279,25 @@ class VAE(nn.Module):
 
             cls_logits = self.cls_head(z)
             pyro.deterministic("cls_logits", cls_logits)
-            CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
+
+            if p.ndim == 1:
+                # ----- single-class classification -----
+                CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
+
+            else:
+                # ----- multi-label classification (predict K perturbations) -----
+                B, P = cls_logits.shape
+                target = torch.zeros((B, P), device=cls_logits.device, dtype=cls_logits.dtype)
+
+                mask = (p != -1)                      # (B, K)  only for valid perturbations
+                p_safe = p.clamp(min=0)               # replace -1 with 0 for safe scatter
+
+                # Put 1s at the valid perturbation indices
+                target.scatter_(1, p_safe, mask.to(target.dtype))
+
+                # BCE over classes (multi-label)
+                CE_loss = F.binary_cross_entropy_with_logits(cls_logits, target, reduction="sum")
+
             pyro.factor("CE_loss", -self.ce_lambda*CE_loss)
 
             logits_p = self.__decode(x_p, z, self.z_decoder, theta, "x_p")

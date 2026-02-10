@@ -36,13 +36,14 @@ def run_single(
     validate_every=10,
     device=torch.device('cpu'),
     patience=20,
+    combinatorial=False,
     **kwargs,
 ):
 
     if num_workers > 0:
         ctx = mp.get_context("spawn")
 
-    dataset = PerturbMatchingDataset(adata)
+    dataset = PerturbMatchingDataset(adata, combinatorial=combinatorial)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -61,7 +62,7 @@ def run_single(
     default_vae_args = dict(
         input_dim=adata.shape[-1],
         latent_dim=latent_dim,
-        perturbs=int(len(np.unique(dataset.P_indices))),
+        perturbs=np.max(dataset.P_indices)+1,
         conds=int(len(np.unique(dataset.C_indices))),
         tau=tau_init,
         use_conditions=use_conditions,
@@ -173,8 +174,8 @@ def _gen_uns(model, adata, ds, obsm_key, uns_key):
     uns_data['W'] = W
 
     x_p = torch.tensor(ds.X_pert).float()
-    p2g = model.pert_to_target_graph(x_p, P, fix_gate=True)
-    uns_data['p2g'] = p2g.cpu().detach().numpy()
+    # p2g = model.pert_to_target_graph(x_p, P, fix_gate=True)
+    # uns_data['p2g'] = p2g.cpu().detach().numpy()
 
     x_ntc_mat = ds.X_ntc # list over cond: cells x genes
 
