@@ -28,7 +28,6 @@ class PerturbBenchmarkDataset(Dataset):
             raise KeyError(f"AnnData.obs missing '{p_key}'")
 
         self.P_names = anndata.obs[p_key].astype(str).values
-
         if pd.isna(self.P_names).any():
             raise ValueError(f"obs['{p_key}'] contains NaN")
 

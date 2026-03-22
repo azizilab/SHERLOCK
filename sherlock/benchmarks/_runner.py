@@ -3,20 +3,14 @@ from __future__ import annotations
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, random_split
-from dataclasses import dataclass
-from typing import Dict, Any
+
+from sherlock import configs as slk_configs
+from sherlock.benchmarks._types import BenchmarkResult
+from sherlock.benchmarks.models.base._base_trainer import BaseTrainer
+from sherlock.benchmarks.models.scgen._benchmark import run_scgen_benchmark
 
 from ._datasets import PerturbBenchmarkDataset
 from .models import MODEL_REGISTRY
-
-
-
-@dataclass
-class BenchmarkResult:
-    model_name: str
-    model: torch.nn.Module | None
-    metrics: Dict[str, float]
-    extras: Dict[str, Any]
 
 
 def run_benchmark(
@@ -38,40 +32,56 @@ def run_benchmark(
 ) -> BenchmarkResult:
     model = model.lower()
 
+    # scGen does not fit the native torch benchmark pipeline,
+    # so I route it through its own benchmark helper here.
+    if model == "scgen":
+        pert_col = slk_configs.get_config("pert_key")
+        control_label = slk_configs.get_config("ntc_label")
+
+        # keeping this to a short list for now so notebook runs stay reasonable
+        holdout_perts = ["CCNK", "GPS1", "PSMG3", "FBXL14", "NCBP2", "BOP1"]
+        print("scGen holdouts:", holdout_perts)
+
+        return run_scgen_benchmark(
+            adata,
+            pert_col=pert_col,
+            control_label=control_label,
+            holdout_perts=holdout_perts,
+            min_cells=30,
+            target_sum=1e4,
+            train_frac=0.8,
+            seed=seed,
+            n_epochs=num_epochs,
+            treat_effect=treat_effect,
+        )
+
     if model not in MODEL_REGISTRY:
         raise ValueError(
             f"Unknown benchmark model '{model}'. "
             f"Available: {sorted(MODEL_REGISTRY.keys())}"
         )
-    entry = MODEL_REGISTRY.get(model)
 
-    if entry is None or entry.get("model") is None or entry.get("trainer") is None:
+    entry = MODEL_REGISTRY[model]
+    ModelClass = entry.get("model")
+    if ModelClass is None:
         raise NotImplementedError(f"Benchmark model '{model}' not implemented yet.")
 
     if isinstance(device, str):
         device = torch.device(device)
 
-    # Dataset
+    # native benchmark dataset used by the torch models
     ds = PerturbBenchmarkDataset(adata)
 
-    # Split
+    # random train / val split for native models
     n = len(ds)
     n_val = int(round(val_frac * n))
     n_train = n - n_val
+
     gen = torch.Generator().manual_seed(seed)
     train_ds, val_ds = random_split(ds, [n_train, n_val], generator=gen)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-
-
-    entry = MODEL_REGISTRY.get(model)
-
-    if entry is None:
-        raise NotImplementedError(f"Benchmark model '{model}' not implemented yet.")
-    
-    ModelClass = entry["model"]
-    TrainerClass = entry["trainer"]
 
     net = ModelClass(
         input_dim=adata.shape[1],
@@ -81,8 +91,12 @@ def run_benchmark(
         dropout=dropout,
     ).to(device)
 
+    TrainerClass = entry.get("trainer", BaseTrainer)
+    if TrainerClass is None:
+        raise NotImplementedError(f"Trainer for model '{model}' not implemented yet.")
+
     trainer = TrainerClass(
-        cVAE=net,
+        model=net,
         dataloader=train_loader,
         val_dataloader=val_loader,
         treat_effect=treat_effect,
