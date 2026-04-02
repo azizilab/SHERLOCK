@@ -182,24 +182,24 @@ def _gen_uns(model, adata, ds, obsm_key, uns_key):
     cond_unique = adata.obs[treatment_key].unique()
     conds = torch.tensor([ds.condition_dict[c] for c in cond_unique], dtype=torch.int32)
 
-
-    cfs_mat = compute_counterfactual(model, x_ntc_mat, x_p, P, conds)
-    uns_data['cfs_mat'] = cfs_mat
-
     # Explained Variance (Condition x P x G)
     ev_list = []
     device = next(model.parameters()).device
 
     for cond_label, cond_idx in zip(cond_unique, conds):
         x_ntc_cond = x_ntc_mat[cond_idx]   # (cells_in_cond, G) NTC for this condition
-        ev_pg = _explained_variance(
+        ev_pg = _counterfactual_effect_size(
             model,
             x_ntc_cond=x_ntc_cond,
             cond_idx=cond_idx,
             device=device,
         )
         ev_list.append(ev_pg)
-    uns_data['explained_variance'] = np.stack(ev_list, axis=0)  # (C, P, G)
+    uns_data['counterfactual_effect_size'] = np.stack(ev_list, axis=0)  # (C, P, G)
+
+    # Condition-Perturbation Interaction (P, C, C)
+    cpi = condition_perturbation_interaction(model, device=device)
+    uns_data['condition_perturbation_interaction'] = cpi  # (P, C, C)
 
     #name saving
     uns_data['conditions'] = np.array(cond_unique)
@@ -210,7 +210,7 @@ def _gen_uns(model, adata, ds, obsm_key, uns_key):
     adata.uns[uns_key] = uns_data
 
 @torch.no_grad()
-def _explained_variance(model, x_ntc_cond, cond_idx, device=None):
+def _counterfactual_effect_size(model, x_ntc_cond, cond_idx, device=None):
     if device is None:
         device = next(model.parameters()).device
 
@@ -272,42 +272,51 @@ def _explained_variance(model, x_ntc_cond, cond_idx, device=None):
 
     return ev_pg.cpu().numpy().astype(np.float32)
 
-
 @torch.no_grad()
-def compute_counterfactual(model, x_ntc_mat, x_p, P, cond_list):
-    u = np.unique(P)
-    cf_mat = np.zeros((len(u), len(cond_list), len(cond_list)), dtype=np.float32)
+def condition_perturbation_interaction(model, device=None):
+    if device is None:
+        device = next(model.parameters()).device
 
-    for i in range(len(cond_list)):
-        c_from = cond_list[i]
-        
-        x_ntc = x_ntc_mat[i]
+    P, C, d = model.perturbs, model.conds, model.latent_dim
 
-        m, n = x_ntc.shape[0], x_p.shape[0]
-        idx = np.random.permutation(m)[:n] if m >= n else np.random.randint(0, m, size=n)
-        x_ntc = torch.tensor(x_ntc[idx], dtype=torch.float32)
+    # MAP perturbation effect vectors: A[p] * W[p]
+    rho_map = model.rho_enc(model.p_emb.weight)                    # (P, d)
+    L = model.qr()                                                  # (P, rank)
+    sigma = pyro.param("sigma_fac").detach().to(device)
+    Sigma_P = L @ L.T + sigma.pow(2) * torch.eye(P, device=device)
+    chol_P = torch.linalg.cholesky(Sigma_P)
+    A = chol_P @ rho_map                                            # (P, d)
+    W = model.gate(deterministic=True)                              # (P, d)
+    v = A * W                                                       # (P, d)
 
-        for j in range(i + 1, len(cond_list)):
-            if i == j:
-                continue
-            c_to = cond_list[j]
+    # Condition-specific prior variance
+    if model.use_conditions:
+        z0_var_c = model.c_emb_logvar.weight.exp().to(device)      # (C, d)
+    else:
+        z0_var_c = torch.ones(C, d, device=device)
 
-            cfs_base = model.latent_counterfactual(x_ntc, x_p, P, c_from, c_from).detach().cpu().numpy()  # cell x d
-            cfs      = model.latent_counterfactual(x_ntc, x_p, P, c_from, c_to   ).detach().cpu().numpy()  # cell x d
+    if model.shift == 'poe':
+        W_scale = pyro.param("W_scale").detach().to(device)        # (d,)
+        W_var = W_scale.pow(2)
+        precision_c = 1.0 / (z0_var_c + 1e-8) + 1.0 / (W_var + 1e-8)  # (C, d)
+        z_var_c = 1.0 / precision_c                                # (C, d)
+        scale_c = z_var_c / (W_var + 1e-8)                        # (C, d)
+        # effect[p, c, :] = scale_c[c, :] * v[p, :]
+        effect = v.unsqueeze(1) * scale_c.unsqueeze(0)             # (P, C, d)
+    else:
+        # linear shift: effect is condition-independent
+        effect = v.unsqueeze(1).expand(P, C, d).clone()            # (P, C, d)
 
-            # pseudo-bulk by mean over P (groups in u)
-            bulk_cfs_base = np.stack([cfs_base[P == g].mean(axis=0) for g in u], axis=0)  # p x d
-            bulk_cfs      = np.stack([cfs     [P == g].mean(axis=0) for g in u], axis=0)  # p x d
+    # Pairwise condition distances per perturbation
+    e1 = effect.unsqueeze(2)    # (P, C, 1, d)
+    e2 = effect.unsqueeze(1)    # (P, 1, C, d)
+    raw = torch.norm(e1 - e2, dim=-1)  # (P, C, C)
 
-            distances = np.linalg.norm(bulk_cfs - bulk_cfs_base, axis=1).astype(np.float32)  # p
-            cf_mat[:, i, j] = distances
+    # Normalize by mean effect magnitude 
+    norm_factor = torch.norm(effect, dim=-1).mean().clamp(min=1e-8)
+    score = raw / norm_factor
 
-    return cf_mat
-
-
-
-
-
+    return score.cpu().numpy().astype(np.float32)
 
 @torch.no_grad()
 def eval_single(model, adata, obsm_key: str = "z", uns_key: str="results") -> None:

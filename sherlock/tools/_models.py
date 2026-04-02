@@ -332,46 +332,6 @@ class VAE(nn.Module):
             z_std = (0.5 * z_logvar).exp()
             pyro.sample("z", dist.Normal(z_mu, z_std).to_event(1))
 
-# ------------------------------ jaccobian helpers ---------------------------- #
-    
-    @torch.no_grad()
-    def __eval_points(self, x_p, p):
-        self.eval()
-        z_mu, _ = self.z_encoder(torch.cat([x_p], dim=-1)).chunk(2, dim=-1)
-        eval_points = []
-        for pp in torch.unique(p):
-            mask = (p == pp)
-            eval_points.append(z_mu[mask].mean(dim=0, keepdim=True))
-        return torch.cat(eval_points, dim=0)
-    
-    # (1, d) -> (1, G) -> (G,)
-    def __decode_one_sample(self, z_single):
-        return self.z_decoder(z_single.unsqueeze(0)).squeeze(0)
-    
-    def __jac(self, eval_points):
-        self.eval()
-        f = jacrev(self.__decode_one_sample)
-        J = vmap(f)(eval_points) # (P, G, d)
-        B = J.mean(dim=0).transpose(0,1).contiguous().abs() # (d, G)
-        return B
-    
-    @torch.no_grad()
-    def pert_to_target_graph(self, x_p, p, fix_gate=True):
-        device = x_p.device
-        eval_points = self.__eval_points(x_p, p)
-        
-        # turn on local gradient for jacobian
-        with torch.enable_grad():
-            eval_points = eval_points.detach().requires_grad_(True)
-            B = self.__jac(eval_points)
-        
-        W = self.gate(deterministic=fix_gate)
-        G = W @ B
-        return G / (G.max(dim=1, keepdim=True).values + 1e-8)
-    
-    
-    # ------------------------------ counterfactual helpers ---------------------------- #
-    
     @torch.no_grad()
     def _abduct_z0(self, x_ntc):
         """
