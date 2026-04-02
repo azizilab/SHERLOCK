@@ -88,12 +88,12 @@ def plot_zcorr(adata, uns_key='results'):
 
 def plot_ev(adata, uns_key='results', cond_idx=0, cmin=None, cmax=None, top_n=None):
     """
-    Plot explained variance (perturbations × genes) for a single condition.
+    Plot condition-perturbation interaction (perturbations × genes) for a single condition.
 
     Parameters
     ----------
     adata : AnnData
-        AnnData with `adata.uns[uns_key]['explained_variance']`.
+        AnnData with `adata.uns[uns_key]['condition_perturbation_interaction']`.
     uns_key : str, default 'results'
         Key in `adata.uns` where results are stored.
     cond_idx : int, default 0
@@ -109,7 +109,7 @@ def plot_ev(adata, uns_key='results', cond_idx=0, cmin=None, cmax=None, top_n=No
     uns = adata.uns[uns_key]
 
     # (C, P, G) → (P, G) for chosen condition
-    ev_pg = uns["explained_variance"][cond_idx]  # shape (P, G)
+    ev_pg = uns["condition_perturbation_interaction"][cond_idx]  # shape (P, G)
 
     pert_names = np.array(uns["perts"])
     gene_names = np.array(adata.var_names)
@@ -145,7 +145,7 @@ def plot_ev(adata, uns_key='results', cond_idx=0, cmin=None, cmax=None, top_n=No
 
     g.ax_heatmap.set_xlabel("Genes")
     g.ax_heatmap.set_ylabel("Perturbations")
-    g.ax_heatmap.set_title(f"Explained variance – condition {cond_idx}")
+    g.ax_heatmap.set_title(f"Condition-perturbation interaction – condition {cond_idx}")
 
     plt.show()
 
@@ -154,8 +154,8 @@ def _ev_results_from_uns(adata, cond_idx=0, uns_key="results", store_key="ev_res
     """Internal helper to fetch EV, pvals, qvals, perts, genes for a condition."""
     uns = adata.uns[uns_key]
 
-    if "explained_variance" not in uns:
-        raise KeyError(f"adata.uns['{uns_key}']['explained_variance'] not found.")
+    if "condition_perturbation_interaction" not in uns:
+        raise KeyError(f"adata.uns['{uns_key}']['condition_perturbation_interaction'] not found.")
 
     if store_key not in uns or cond_idx not in uns[store_key]:
         raise KeyError(
