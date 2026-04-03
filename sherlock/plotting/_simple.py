@@ -490,9 +490,10 @@ def plot_cf_bipartite(
     adata : AnnData
     cond_idx : int, default 0
         Index into the condition axis of ``counterfactual_effect_size``.
-    pert_name : str or None, default None
-        * ``str``  – draw only this single perturbation (centred).
-        * ``None`` – draw all perturbations together (top_n genes each).
+    pert_name : str or list of str or None, default None
+        * ``str``       – single perturbation (centred when alone).
+        * ``list[str]`` – subset of perturbations.
+        * ``None``      – all perturbations.
     top_n : int, default 20
         Number of top target genes to show per perturbation (ranked by effect size).
     uns_key : str, default 'results'
@@ -506,17 +507,21 @@ def plot_cf_bipartite(
     cf, perts, genes = _get_cf_data(adata, uns_key=uns_key, cf_key=cf_key)
     cf_cond = cf[cond_idx]  # (P, G)
 
-    if pert_name is not None:
-        matches = np.where(perts == pert_name)[0]
-        if len(matches) == 0:
-            raise ValueError(
-                f"Perturbation '{pert_name}' not found. Available: {list(perts)}"
-            )
-        p_indices = [int(matches[0])]
-        pert_subset = [pert_name]
-    else:
+    if pert_name is None:
         pert_subset = list(perts)
         p_indices = list(range(len(perts)))
+    else:
+        names = [pert_name] if isinstance(pert_name, str) else list(pert_name)
+        pert_subset, p_indices = [], []
+        missing = [n for n in names if n not in perts]
+        if missing:
+            raise ValueError(
+                f"Perturbation(s) not found: {missing}. Available: {list(perts)}"
+            )
+        for n in names:
+            idx = int(np.where(perts == n)[0][0])
+            pert_subset.append(n)
+            p_indices.append(idx)
 
     # build edge list
     edges = []
