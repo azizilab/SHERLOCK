@@ -88,7 +88,7 @@ def plot_zcorr(adata, uns_key='results'):
 
 def plot_ev(adata, uns_key='results', cond_idx=0, cmin=None, cmax=None, top_n=None):
     """
-    Plot condition-perturbation interaction (perturbations × genes) for a single condition.
+    Plot perturbation-target interaction (perturbations × genes) for a single condition.
 
     Parameters
     ----------

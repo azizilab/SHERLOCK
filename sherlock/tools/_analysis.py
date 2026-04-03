@@ -30,7 +30,7 @@ def ev_sig(
     Parameters
     ----------
     adata : AnnData
-        AnnData object with adata.uns[uns_key]['explained_variance']
+        AnnData object with adata.uns[uns_key]["counterfactual_effect_size"]
         of shape (C, P, G).
     cond_idx : int, default 0
         Index of condition along the first axis of explained_variance.
@@ -62,7 +62,7 @@ def ev_sig(
     uns = adata.uns[uns_key]
 
     # Explained variance for this condition: shape (P, G)
-    ev_all = np.asarray(uns["explained_variance"][cond_idx], dtype=float)
+    ev_all = np.asarray(uns["counterfactual_effect_size"][cond_idx], dtype=float)
     P, G = ev_all.shape
 
     z_all = np.zeros_like(ev_all)
