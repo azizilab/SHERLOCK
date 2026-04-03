@@ -198,7 +198,7 @@ def _gen_uns(model, adata, ds, obsm_key, uns_key):
     uns_data['counterfactual_effect_size'] = np.stack(ev_list, axis=0)  # (C, P, G)
 
     # Condition-Perturbation Interaction (P, C, C)
-    cpi = condition_perturbation_interaction(model, device=device)
+    cpi = condition_perturbation_interaction(model, adata, ds, obsm_key)
     uns_data['condition_perturbation_interaction'] = cpi  # (P, C, C)
 
     #name saving
@@ -273,50 +273,73 @@ def _counterfactual_effect_size(model, x_ntc_cond, cond_idx, device=None):
     return ev_pg.cpu().numpy().astype(np.float32)
 
 @torch.no_grad()
-def condition_perturbation_interaction(model, device=None):
-    if device is None:
-        device = next(model.parameters()).device
+def condition_perturbation_interaction(model, adata, ds, obsm_key):
+    """
+    Condition-perturbation interaction: drug centroid separation normalized by
+    NTC baseline separation, both measured in z-space via the same z_encoder.
 
-    P, C, d = model.perturbs, model.conds, model.latent_dim
+    score[p, c1, c2] = ||mean_z(p, c1) − mean_z(p, c2)||
+                       / ||mean_z_ntc(c1) − mean_z_ntc(c2)||
 
-    # MAP perturbation effect vectors: A[p] * W[p]
-    rho_map = model.rho_enc(model.p_emb.weight)                    # (P, d)
-    L = model.qr()                                                  # (P, rank)
-    sigma = pyro.param("sigma_fac").detach().to(device)
-    Sigma_P = L @ L.T + sigma.pow(2) * torch.eye(P, device=device)
-    chol_P = torch.linalg.cholesky(Sigma_P)
-    A = chol_P @ rho_map                                            # (P, d)
-    W = model.gate(deterministic=True)                              # (P, d)
-    v = A * W                                                       # (P, d)
+    Returns: (P, C, C) float32 array, NaN where a perturbation has no cells
+             in one of the two conditions.
+    """
+    p_key = get_config("pert_key")
+    treatment_key = get_config("treatment_key")
 
-    # Condition-specific prior variance
-    if model.use_conditions:
-        z0_var_c = model.c_emb_logvar.weight.exp().to(device)      # (C, d)
-    else:
-        z0_var_c = torch.ones(C, d, device=device)
+    device = next(model.parameters()).device
 
-    if model.shift == 'poe':
-        W_scale = pyro.param("W_scale").detach().to(device)        # (d,)
-        W_var = W_scale.pow(2)
-        precision_c = 1.0 / (z0_var_c + 1e-8) + 1.0 / (W_var + 1e-8)  # (C, d)
-        z_var_c = 1.0 / precision_c                                # (C, d)
-        scale_c = z_var_c / (W_var + 1e-8)                        # (C, d)
-        # effect[p, c, :] = scale_c[c, :] * v[p, :]
-        effect = v.unsqueeze(1) * scale_c.unsqueeze(0)             # (P, C, d)
-    else:
-        # linear shift: effect is condition-independent
-        effect = v.unsqueeze(1).expand(P, C, d).clone()            # (P, C, d)
+    z_all = np.array(adata.obsm[obsm_key], dtype=np.float32)   # (N, d), NTC rows are NaN
+    pert_col = np.array(adata.obs[p_key].values, dtype=str)
+    cond_col = np.array(adata.obs[treatment_key].values, dtype=str)
 
-    # Pairwise condition distances per perturbation
-    e1 = effect.unsqueeze(2)    # (P, C, 1, d)
-    e2 = effect.unsqueeze(1)    # (P, 1, C, d)
-    raw = torch.norm(e1 - e2, dim=-1)  # (P, C, C)
+    P, C, d = model.perturbs, model.conds, z_all.shape[1]
 
-    # Normalize by mean effect magnitude 
-    norm_factor = torch.norm(effect, dim=-1).mean().clamp(min=1e-8)
-    score = raw / norm_factor
+    idx_to_pert = {v: k for k, v in ds.perturbation_dict.items()}
+    idx_to_cond = {v: k for k, v in ds.condition_dict.items()}
+    pert_names = [idx_to_pert[i] for i in range(P)]
+    cond_names = [idx_to_cond[i] for i in range(C)]
 
-    return score.cpu().numpy().astype(np.float32)
+    valid = ~np.isnan(z_all).any(axis=1)
+
+    def _mednorm(x_t: torch.Tensor) -> torch.Tensor:
+        lib = x_t.sum(dim=1, keepdim=True)
+        med = torch.median(lib).item()
+        return torch.log1p(x_t / lib * med)
+
+    # ASSUME POE 
+    ntc_centroids = np.full((C, d), np.nan, dtype=np.float32)
+    for c in range(C):
+        X_ntc_c = ds.X_ntc[c].astype(np.float32)
+        if X_ntc_c.shape[0] == 0:
+            continue
+        X_t = torch.tensor(X_ntc_c, device=device)
+        z0_mu, _ = model.z0_encoder(_mednorm(X_t)).chunk(2, dim=-1)
+        ntc_centroids[c] = z0_mu.mean(dim=0).cpu().numpy()
+
+    # NTC pairwise separation  (C, C)
+    n1 = ntc_centroids[:, np.newaxis, :]
+    n2 = ntc_centroids[np.newaxis, :, :]
+    ntc_sep = np.linalg.norm(n1 - n2, axis=-1)
+
+    # Drug centroids — direct string match on obs columns
+    centroids = np.full((P, C, d), np.nan, dtype=np.float32)
+    for p, pname in enumerate(pert_names):
+        for c, cname in enumerate(cond_names):
+            mask = valid & (pert_col == pname) & (cond_col == cname)
+            if mask.any():
+                centroids[p, c] = z_all[mask].mean(axis=0)
+
+    # Drug pairwise separation  (P, C, C)
+    e1 = centroids[:, :, np.newaxis, :]
+    e2 = centroids[:, np.newaxis, :, :]
+    drug_sep = np.linalg.norm(e1 - e2, axis=-1)
+
+    # Normalize by NTC baseline — preserves ranking, makes score cross-dataset comparable
+    with np.errstate(divide='ignore', invalid='ignore'):
+        score = drug_sep / ntc_sep[np.newaxis, :, :]
+
+    return score.astype(np.float32)
 
 @torch.no_grad()
 def eval_single(model, adata, obsm_key: str = "z", uns_key: str="results") -> None:
