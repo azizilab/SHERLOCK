@@ -163,7 +163,7 @@ def _ev_results_from_uns(adata, cond_idx=0, uns_key="results", store_key="ev_res
             f"Run ev_sig(...) first for cond_idx={cond_idx}."
         )
 
-    ev = np.asarray(uns["explained_variance"][cond_idx], dtype=float)  # (P, G)
+    ev = np.asarray(uns["condition_perturbation_interaction"][cond_idx], dtype=float)  # (P, G)
     pvals = np.asarray(uns[store_key][cond_idx]["pvals"], dtype=float)
     qvals = np.asarray(uns[store_key][cond_idx]["qvals"], dtype=float)
 
