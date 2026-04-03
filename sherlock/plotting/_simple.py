@@ -371,6 +371,7 @@ def _draw_bipartite_nx(
     node_size=800,
     pert_color="#4C72B0",
     gene_color="#DD8452",
+    gene_overlap_color="#2CA02C",
     edge_color="#999999",
     label_fontsize=8,
 ):
@@ -449,18 +450,48 @@ def _draw_bipartite_nx(
                 rotation=45, rotation_mode="anchor")
 
     # --- gene nodes + labels ---
-    nx.draw_networkx_nodes(
-        G, pos, ax=ax,
-        nodelist=list(gene_ids.values()),
-        node_color=gene_color,
-        node_size=node_size,
-        edgecolors="white", linewidths=1.0,
-    )
+    # count incoming edges per gene to identify overlaps
+    gene_degree = {g: sum(1 for p, gg, _ in edges if gg == g) for g in gene_nodes}
+
+    unique_genes = [g for g in gene_nodes if gene_degree[g] == 1]
+    overlap_genes = [g for g in gene_nodes if gene_degree[g] > 1]
+
+    if unique_genes:
+        nx.draw_networkx_nodes(
+            G, pos, ax=ax,
+            nodelist=[gene_ids[g] for g in unique_genes],
+            node_color=gene_color,
+            node_size=node_size,
+            edgecolors="white", linewidths=1.0,
+        )
+    if overlap_genes:
+        nx.draw_networkx_nodes(
+            G, pos, ax=ax,
+            nodelist=[gene_ids[g] for g in overlap_genes],
+            node_color=gene_overlap_color,
+            node_size=node_size,
+            edgecolors="white", linewidths=1.0,
+        )
+
     for g in gene_nodes:
+        color = gene_overlap_color if gene_degree[g] > 1 else gene_color
         x, y = pos[gene_ids[g]]
         ax.text(x, y - 0.07, g, ha="center", va="top",
-                fontsize=label_fontsize, color=gene_color,
+                fontsize=label_fontsize, color=color,
                 rotation=45, rotation_mode="anchor")
+
+    # --- legend ---
+    legend_handles = [
+        plt.scatter([], [], s=40, color=pert_color,
+                    edgecolors="white", linewidths=0.5, label="Perturbation / drug"),
+        plt.scatter([], [], s=40, color=gene_color,
+                    edgecolors="white", linewidths=0.5, label="Gene target (unique)"),
+        plt.scatter([], [], s=40, color=gene_overlap_color,
+                    edgecolors="white", linewidths=0.5,
+                    label="Gene target (shared across perturbations)"),
+    ]
+    ax.legend(handles=legend_handles, loc="upper right", frameon=True,
+              fontsize=label_fontsize, scatterpoints=1)
 
     ax.set_xlim(-0.1, 1.1)
     ax.set_ylim(-0.35, 1.35)
