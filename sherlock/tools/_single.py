@@ -272,28 +272,55 @@ def _counterfactual_effect_size(model, x_ntc_cond, cond_idx, device=None):
 
     return ev_pg.cpu().numpy().astype(np.float32)
 
-@torch.no_grad()
+def _silhouette_pair(z_c1: np.ndarray, z_c2: np.ndarray) -> float:
+    """
+    Mean silhouette score for a 2-condition split in z-space.
+    Scale- and rotation-invariant → comparable across model runs.
+    Returns float in [-1, 1]: 1=separated, 0=boundary, <0=mixed.
+    """
+    n1, n2 = len(z_c1), len(z_c2)
+    if n1 < 2 or n2 < 2:
+        return np.nan
+    d11 = np.linalg.norm(z_c1[:, np.newaxis] - z_c1[np.newaxis], axis=-1)
+    d22 = np.linalg.norm(z_c2[:, np.newaxis] - z_c2[np.newaxis], axis=-1)
+    d12 = np.linalg.norm(z_c1[:, np.newaxis] - z_c2[np.newaxis], axis=-1)
+    a1 = d11.sum(axis=1) / (n1 - 1)
+    b1 = d12.mean(axis=1)
+    s1 = (b1 - a1) / np.maximum(a1, b1)
+    a2 = d22.sum(axis=1) / (n2 - 1)
+    b2 = d12.mean(axis=0)
+    s2 = (b2 - a2) / np.maximum(a2, b2)
+    return float(np.concatenate([s1, s2]).mean())
+
+
 def condition_perturbation_interaction(model, adata, ds, obsm_key):
     """
-    Condition-perturbation interaction: drug centroid separation normalized by
-    NTC baseline separation, both measured in z-space via the same z_encoder.
+    Condition-perturbation interaction via silhouette score in z-space.
 
-    score[p, c1, c2] = ||mean_z(p, c1) − mean_z(p, c2)||
-                       / ||mean_z_ntc(c1) − mean_z_ntc(c2)||
+    score[p, c1, c2] = mean silhouette of cells with perturbation p,
+                       labeled by condition (c1 vs c2).
 
-    Returns: (P, C, C) float32 array, NaN where a perturbation has no cells
+    Range [-1, 1]:
+      +1 : conditions perfectly separated for this drug
+       0 : conditions on the boundary
+      <0 : conditions mixed (what you see as mixing in UMAP)
+
+    Scale- and rotation-invariant: both a_i (intra-condition) and b_i
+    (inter-condition) distances are in the same z-space, so their ratio
+    is unaffected by uniform scaling or rotation between runs.
+    This makes the score comparable across model runs and datasets.
+
+    Returns: (P, C, C) float32 array, NaN where a perturbation has <2 cells
              in one of the two conditions.
     """
     p_key = get_config("pert_key")
     treatment_key = get_config("treatment_key")
 
-    device = next(model.parameters()).device
-
-    z_all = np.array(adata.obsm[obsm_key], dtype=np.float32)   # (N, d), NTC rows are NaN
+    z_all = np.array(adata.obsm[obsm_key], dtype=np.float32)
     pert_col = np.array(adata.obs[p_key].values, dtype=str)
     cond_col = np.array(adata.obs[treatment_key].values, dtype=str)
 
-    P, C, d = model.perturbs, model.conds, z_all.shape[1]
+    P, C = model.perturbs, model.conds
 
     idx_to_pert = {v: k for k, v in ds.perturbation_dict.items()}
     idx_to_cond = {v: k for k, v in ds.condition_dict.items()}
@@ -302,42 +329,15 @@ def condition_perturbation_interaction(model, adata, ds, obsm_key):
 
     valid = ~np.isnan(z_all).any(axis=1)
 
-    def _mednorm(x_t: torch.Tensor) -> torch.Tensor:
-        lib = x_t.sum(dim=1, keepdim=True)
-        med = torch.median(lib).item()
-        return torch.log1p(x_t / lib * med)
-
-    # ASSUME POE 
-    ntc_centroids = np.full((C, d), np.nan, dtype=np.float32)
-    for c in range(C):
-        X_ntc_c = ds.X_ntc[c].astype(np.float32)
-        if X_ntc_c.shape[0] == 0:
-            continue
-        X_t = torch.tensor(X_ntc_c, device=device)
-        z0_mu, _ = model.z0_encoder(_mednorm(X_t)).chunk(2, dim=-1)
-        ntc_centroids[c] = z0_mu.mean(dim=0).cpu().numpy()
-
-    # NTC pairwise separation  (C, C)
-    n1 = ntc_centroids[:, np.newaxis, :]
-    n2 = ntc_centroids[np.newaxis, :, :]
-    ntc_sep = np.linalg.norm(n1 - n2, axis=-1)
-
-    # Drug centroids — direct string match on obs columns
-    centroids = np.full((P, C, d), np.nan, dtype=np.float32)
+    score = np.full((P, C, C), np.nan, dtype=np.float32)
     for p, pname in enumerate(pert_names):
-        for c, cname in enumerate(cond_names):
-            mask = valid & (pert_col == pname) & (cond_col == cname)
-            if mask.any():
-                centroids[p, c] = z_all[mask].mean(axis=0)
-
-    # Drug pairwise separation  (P, C, C)
-    e1 = centroids[:, :, np.newaxis, :]
-    e2 = centroids[:, np.newaxis, :, :]
-    drug_sep = np.linalg.norm(e1 - e2, axis=-1)
-
-    # Normalize by NTC baseline — preserves ranking, makes score cross-dataset comparable
-    with np.errstate(divide='ignore', invalid='ignore'):
-        score = drug_sep / ntc_sep[np.newaxis, :, :]
+        for c1 in range(C):
+            for c2 in range(c1 + 1, C):
+                mask_c1 = valid & (pert_col == pname) & (cond_col == cond_names[c1])
+                mask_c2 = valid & (pert_col == pname) & (cond_col == cond_names[c2])
+                s = _silhouette_pair(z_all[mask_c1], z_all[mask_c2])
+                score[p, c1, c2] = s
+                score[p, c2, c1] = s
 
     return score.astype(np.float32)
 
