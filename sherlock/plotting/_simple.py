@@ -93,11 +93,11 @@ def plot_ev(adata, uns_key='results', cond_idx=0, cmin=None, cmax=None, top_n=No
     Parameters
     ----------
     adata : AnnData
-        AnnData with `adata.uns[uns_key]['condition_perturbation_interaction']`.
+        AnnData with `adata.uns[uns_key]['counterfactual_effect_size']`.
     uns_key : str, default 'results'
         Key in `adata.uns` where results are stored.
     cond_idx : int, default 0
-        Index of condition along the first axis of `explained_variance`.
+        Index of condition along the first axis of `counterfactual_effect_size`.
     cmin : float or None, default None
         Minimum value for colormap (vmin).
     cmax : float or None, default None
@@ -109,7 +109,7 @@ def plot_ev(adata, uns_key='results', cond_idx=0, cmin=None, cmax=None, top_n=No
     uns = adata.uns[uns_key]
 
     # (C, P, G) → (P, G) for chosen condition
-    ev_pg = uns["condition_perturbation_interaction"][cond_idx]  # shape (P, G)
+    ev_pg = uns["counterfactual_effect_size"][cond_idx]  # shape (P, G)
 
     pert_names = np.array(uns["perts"])
     gene_names = np.array(adata.var_names)
@@ -154,8 +154,8 @@ def _ev_results_from_uns(adata, cond_idx=0, uns_key="results", store_key="ev_res
     """Internal helper to fetch EV, pvals, qvals, perts, genes for a condition."""
     uns = adata.uns[uns_key]
 
-    if "condition_perturbation_interaction" not in uns:
-        raise KeyError(f"adata.uns['{uns_key}']['condition_perturbation_interaction'] not found.")
+    if "counterfactual_effect_size" not in uns:
+        raise KeyError(f"adata.uns['{uns_key}']['counterfactual_effect_size'] not found.")
 
     if store_key not in uns or cond_idx not in uns[store_key]:
         raise KeyError(
@@ -163,7 +163,7 @@ def _ev_results_from_uns(adata, cond_idx=0, uns_key="results", store_key="ev_res
             f"Run ev_sig(...) first for cond_idx={cond_idx}."
         )
 
-    ev = np.asarray(uns["condition_perturbation_interaction"][cond_idx], dtype=float)  # (P, G)
+    ev = np.asarray(uns["counterfactual_effect_size"][cond_idx], dtype=float)  # (P, G)
     pvals = np.asarray(uns[store_key][cond_idx]["pvals"], dtype=float)
     qvals = np.asarray(uns[store_key][cond_idx]["qvals"], dtype=float)
 
