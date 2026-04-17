@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import Dataset, Sampler, DataLoader
+from torch.utils.data import Dataset, Sampler
 import numpy as np
 import pandas as pd
 import random
