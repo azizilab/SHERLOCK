@@ -102,9 +102,27 @@ class VAETrainer:
 
                 # CE / acc
                 cls_logits = self.vae.cls_head(z)
-                val_ce_sum += F.cross_entropy(cls_logits, P, reduction="sum").item()
-                val_correct += (cls_logits.argmax(dim=-1) == P).sum().item()
-                val_n += P.size(0)
+                if P.ndim == 1:
+                    val_ce_sum += F.cross_entropy(cls_logits, P.long(), reduction="sum").item()
+                    val_correct += (cls_logits.argmax(dim=-1) == P).sum().item()
+                    val_n += P.size(0)
+
+                else:
+                    B, Pn = cls_logits.shape
+                    mask = (P != -1)
+                    k = mask.sum(dim=1).max().item()  # typically 2
+
+                    # multi-hot targets for BCE
+                    tgt = torch.zeros((B, Pn), device=cls_logits.device, dtype=cls_logits.dtype)
+                    tgt.scatter_(1, P.clamp(min=0).long(), mask.float())
+
+                    val_ce_sum += F.binary_cross_entropy_with_logits(cls_logits, tgt, reduction="sum").item()
+
+                    # "set" accuracy: both true labels must be in top-k predictions
+                    topk = cls_logits.topk(k=k, dim=1).indices  # (B,k)
+                    hit = (topk.unsqueeze(2) == P.clamp(min=0).long().unsqueeze(1)) & mask.unsqueeze(1)
+                    val_correct += (hit.any(dim=1).sum(dim=1) == mask.sum(dim=1)).sum().item()
+                    val_n += B
 
                 # decode means for R²/ATE
                 total_ntc = X_ntc.sum(-1, keepdim=True)
@@ -192,24 +210,52 @@ class VAETrainer:
                 ate = float("nan")
                 preds_p_n, preds_ntc_n, all_P = stats["preds_p_n"], stats["preds_ntc_n"], stats["all_P"]
                 ds = self.dataloader.dataset
-                n_perts = len(getattr(ds, "perturbation_dict", {}))
                 n_genes = preds_p_n.shape[1] if preds_p_n.size else 0
-                if n_perts > 0 and n_genes > 0 and all_P.size > 0:
-                    effect = np.zeros((n_perts, n_genes))
-                    for pert_name, j in ds.perturbation_dict.items():
-                        mask = (all_P == j)
-                        if not mask.any():
-                            continue
-                        effect[j] = preds_p_n[mask].mean(0) - preds_ntc_n[mask].mean(0)
-                    effect_df = pd.DataFrame(
-                        effect,
-                        index=list(ds.perturbation_dict.keys()),
-                        columns=self.treat_effect.var_names,
-                    )
-                    effect_aligned = effect_df.loc[self.treat_effect.obs_names, self.treat_effect.var_names]
-                    x = effect_aligned.values.ravel()
-                    y = self.treat_effect.X.ravel()
-                    ate = pearsonr(x, y)[0]
+
+                # index -> name (so effect_df uses string labels)
+                idx2pert = {i: name for name, i in getattr(ds, "perturbation_dict", {}).items()}
+
+                if all_P.ndim == 1:
+                    combos = all_P.astype(np.int64).reshape(-1, 1)  # (N,1)
+                else:
+                    combos = all_P.astype(np.int64).copy()          # (N,2)
+                    # canonicalize order so (a,b) == (b,a); keep (-1) as second slot
+                    a = combos[:, 0]
+                    b = combos[:, 1]
+                    swap = (b != -1) & (a > b)
+                    combos[swap, 0], combos[swap, 1] = combos[swap, 1], combos[swap, 0]
+
+                uniq_combos = np.unique(combos, axis=0)
+                n_perts = uniq_combos.shape[0]
+
+                effect = np.zeros((n_perts, n_genes))
+                for j, key in enumerate(uniq_combos):
+                    if key.shape[0] == 1:
+                        mask = (combos[:, 0] == key[0])
+                    else:
+                        mask = (combos[:, 0] == key[0]) & (combos[:, 1] == key[1])
+
+                    if not mask.any():
+                        continue
+                    effect[j] = preds_p_n[mask].mean(0) - preds_ntc_n[mask].mean(0)
+
+                # string names for combo index
+                def combo_name(k):
+                    p1 = idx2pert.get(int(k[0]), str(int(k[0])))
+                    if k.shape[0] == 1 or int(k[1]) == -1:
+                        return p1
+                    p2 = idx2pert.get(int(k[1]), str(int(k[1])))
+                    return f"{p1}+{p2}"
+
+                effect_df = pd.DataFrame(
+                    effect,
+                    index=[combo_name(k) for k in uniq_combos],
+                    columns=self.treat_effect.var_names,
+                )
+                effect_aligned = effect_df.loc[self.treat_effect.obs_names, self.treat_effect.var_names]
+                x = effect_aligned.values.ravel()
+                y = self.treat_effect.X.ravel()
+                ate = pearsonr(x, y)[0]
 
                 self._last_valid = dict(
                     CE=stats["ce_loss"],
@@ -220,6 +266,7 @@ class VAETrainer:
                     pi25=stats["pi25"],
                     pi99=stats["pi99"],
                 )
+
 
             # persistent tqdm display (no NA flicker)
             epoch_bar.set_postfix(

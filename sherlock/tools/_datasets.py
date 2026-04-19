@@ -132,7 +132,7 @@ class PerturbMatchingDataset(Dataset):
 
     """
 
-    def __init__(self, anndata, seed: int | None = None):
+    def __init__(self, anndata, seed: int | None = None, combinatorial: bool = False):
         rng = np.random.default_rng(seed)
 
         p_key = get_config('pert_key')
@@ -146,12 +146,29 @@ class PerturbMatchingDataset(Dataset):
         pertlbl      = pert_anndata.obs[p_key].values
         condlbl = pert_anndata.obs[treatment_key].values
 
+        if pd.isna(pertlbl).any() or pd.isna(condlbl).any():
+            raise ValueError(f"obs contains NA / NaN in {p_key} or {treatment_key}.")
+        
         # unique conditions
         cond_unique = np.unique(condlbl)
-        pert_unique = np.unique(pertlbl)
-        
 
-        self.perturbation_dict = {p: i for i, p in enumerate(pert_unique)}
+        self.combinatorial = combinatorial
+        pert_unique = np.unique(pertlbl)
+        if not combinatorial:
+            pert_unique = np.unique(pertlbl)
+            self.perturbation_dict = {p: i for i, p in enumerate(pert_unique)}
+        else:
+            # combinatorial behavior: split on "+"
+            parts = []
+            for p in pertlbl:
+                s = str(p)
+                if "+" in s:
+                    parts.extend([x.strip() for x in s.split("+") if x.strip()])
+                else:
+                    parts.append(s.strip())
+            pert_unique = np.unique(np.array(parts, dtype=object))
+            self.perturbation_dict = {p: i for i, p in enumerate(pert_unique)}
+
         self.condition_dict = {c: i for i, c in enumerate(cond_unique)}
 
         # if perturbation is on var, find indices
@@ -167,15 +184,30 @@ class PerturbMatchingDataset(Dataset):
         self.C = pert_anndata.obs[treatment_key].values
         self.C_ntc = ntc_anndata.obs[treatment_key].values
 
-        # Convert P and C to indices
-        self.P_indices = np.array([self.perturbation_dict[p] for p in self.P])
+        # Convert C to indices
         self.C_indices = np.array([self.condition_dict[c] for c in self.C])
         self.C_ntc_indices = np.array([self.condition_dict[c] for c in self.C_ntc])
+        # Convert P to indices
+        if not combinatorial:
+            self.P_indices = np.array([self.perturbation_dict[p] for p in self.P])
+        else:
+            # Nx2 indices: [p1, p2], with p2=-1 if single perturbation
+            P2 = np.full((len(self.P), 2), -1, dtype=int)
 
+            for i, p in enumerate(self.P):
+                s = str(p).strip()
+                if "+" in s:
+                    toks = [x.strip() for x in s.split("+") if x.strip()]
+                    # take first two if more than 2 are ever present
+                    if len(toks) >= 1:
+                        P2[i, 0] = self.perturbation_dict[toks[0]]
+                    if len(toks) >= 2:
+                        P2[i, 1] = self.perturbation_dict[toks[1]]
+                else:
+                    P2[i, 0] = self.perturbation_dict[s]
 
-        # quick NA / NaN guard
-        if pd.isna(pertlbl).any() or pd.isna(condlbl).any():
-            raise ValueError(f"obs contains NA / NaN in {p_key} or f{treatment_key}.")
+            self.P_indices = P2
+
 
         self.rng = rng
 

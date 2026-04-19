@@ -39,13 +39,14 @@ def run_single(
     de_align_lambda=1e-3,
     device=torch.device('cpu'),
     patience=20,
+    combinatorial=False,
     **kwargs,
 ):
 
     if num_workers > 0:
         ctx = mp.get_context("spawn")
 
-    dataset = PerturbMatchingDataset(adata)
+    dataset = PerturbMatchingDataset(adata, combinatorial=combinatorial)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -85,7 +86,7 @@ def run_single(
     default_vae_args = dict(
         input_dim=adata.shape[-1],
         latent_dim=latent_dim,
-        perturbs=int(len(np.unique(dataset.P_indices))),
+        perturbs=np.max(dataset.P_indices)+1,
         conds=int(len(np.unique(dataset.C_indices))),
         tau=tau_init,
         use_conditions=use_conditions,
@@ -201,18 +202,11 @@ def _gen_uns(model, adata, ds, obsm_key, uns_key):
     uns_data['W'] = W
 
     x_p = torch.tensor(ds.X_pert).float()
-    x_ntc_mat = ds.X_ntc  # list over cond: cells x genes
-    C = torch.from_numpy(ds.C_indices).long()
-    x_ntc_by_cond = [torch.tensor(x, dtype=torch.float32) for x in x_ntc_mat]
-    p2g = model.pert_to_target_graph(x_p, P, c=C, x_ntc_by_cond=x_ntc_by_cond, fix_gate=True)
-    uns_data['p2g'] = p2g.cpu().detach().numpy()
+    # p2g = model.pert_to_target_graph(x_p, P, fix_gate=True)
+    # uns_data['p2g'] = p2g.cpu().detach().numpy()
 
     cond_unique = adata.obs[treatment_key].unique()
     conds = torch.tensor([ds.condition_dict[c] for c in cond_unique], dtype=torch.int32)
-
-
-    cfs_mat = compute_counterfactual(model, x_ntc_mat, x_p, P, C, conds, seed=0, n_ctrl_samples=10)
-    uns_data['cfs_mat'] = cfs_mat
 
     # Explained Variance (Condition x P x G)
     ev_list = []
@@ -220,14 +214,18 @@ def _gen_uns(model, adata, ds, obsm_key, uns_key):
 
     for cond_label, cond_idx in zip(cond_unique, conds):
         x_ntc_cond = x_ntc_mat[cond_idx]   # (cells_in_cond, G) NTC for this condition
-        ev_pg = _explained_variance(
+        ev_pg = _counterfactual_effect_size(
             model,
             x_ntc_cond=x_ntc_cond,
             cond_idx=cond_idx,
             device=device,
         )
         ev_list.append(ev_pg)
-    uns_data['explained_variance'] = np.stack(ev_list, axis=0)  # (C, P, G)
+    uns_data['counterfactual_effect_size'] = np.stack(ev_list, axis=0)  # (C, P, G)
+
+    # Condition-Perturbation Interaction (P, C, C)
+    cpi = condition_perturbation_interaction(model, adata, ds, obsm_key)
+    uns_data['condition_perturbation_interaction'] = cpi  # (P, C, C)
 
     #name saving
     uns_data['conditions'] = np.array(cond_unique)
@@ -238,7 +236,7 @@ def _gen_uns(model, adata, ds, obsm_key, uns_key):
     adata.uns[uns_key] = uns_data
 
 @torch.no_grad()
-def _explained_variance(model, x_ntc_cond, cond_idx, device=None):
+def _counterfactual_effect_size(model, x_ntc_cond, cond_idx, device=None):
     if device is None:
         device = next(model.parameters()).device
 
@@ -300,98 +298,74 @@ def _explained_variance(model, x_ntc_cond, cond_idx, device=None):
 
     return ev_pg.cpu().numpy().astype(np.float32)
 
+def _silhouette_pair(z_c1: np.ndarray, z_c2: np.ndarray) -> float:
+    """
+    Mean silhouette score for a 2-condition split in z-space.
+    Scale- and rotation-invariant → comparable across model runs.
+    Returns float in [-1, 1]: 1=separated, 0=boundary, <0=mixed.
+    """
+    n1, n2 = len(z_c1), len(z_c2)
+    if n1 < 2 or n2 < 2:
+        return np.nan
+    d11 = np.linalg.norm(z_c1[:, np.newaxis] - z_c1[np.newaxis], axis=-1)
+    d22 = np.linalg.norm(z_c2[:, np.newaxis] - z_c2[np.newaxis], axis=-1)
+    d12 = np.linalg.norm(z_c1[:, np.newaxis] - z_c2[np.newaxis], axis=-1)
+    a1 = d11.sum(axis=1) / (n1 - 1)
+    b1 = d12.mean(axis=1)
+    s1 = (b1 - a1) / np.maximum(a1, b1)
+    a2 = d22.sum(axis=1) / (n2 - 1)
+    b2 = d12.mean(axis=0)
+    s2 = (b2 - a2) / np.maximum(a2, b2)
+    return float(np.concatenate([s1, s2]).mean())
 
-@torch.no_grad()
-def compute_counterfactual(model, x_ntc_mat, x_p, P, C, cond_list, seed = 44, n_ctrl_samples = 10):
-    device = next(model.parameters()).device
 
-    x_p_t = torch.as_tensor(x_p, dtype=torch.float32, device=device)
-    P_t = torch.as_tensor(P, dtype=torch.long, device=device)
-    C_t = torch.as_tensor(C, dtype=torch.long, device=device)
-    cond_list_t = torch.as_tensor(cond_list, dtype=torch.long, device=device)
+def condition_perturbation_interaction(model, adata, ds, obsm_key):
+    """
+    Condition-perturbation interaction via silhouette score in z-space.
 
-    ctrl_by_cond = []
-    for x in x_ntc_mat:
-        t = torch.as_tensor(x, dtype=torch.float32, device=device)
-        if t.ndim == 1:
-            t = t.unsqueeze(0)
-        ctrl_by_cond.append(t)
+    score[p, c1, c2] = mean silhouette of cells with perturbation p,
+                       labeled by condition (c1 vs c2).
 
-    unique_p = torch.unique(P_t, sorted=True)
-    cf_mat_sum = torch.zeros((unique_p.numel(), cond_list_t.numel(), cond_list_t.numel()), device=device, dtype=torch.float32)
+    Range [-1, 1]:
+      +1 : conditions perfectly separated for this drug
+       0 : conditions on the boundary
+      <0 : conditions mixed (what you see as mixing in UMAP)
 
-    # helper to sample matched NTC cells
-    def sample_matched_ntc(generator, deterministic_mean: bool = False):
-        n_cells, G = x_p_t.shape
-        matched = torch.empty((n_cells, G), device=device)
-        for cond_idx, ctrl in enumerate(ctrl_by_cond):
-            mask = (C_t == cond_idx)
-            if not mask.any():
-                continue
-            if ctrl.size(0) == 0:
-                raise ValueError(f"No NTC cells available for condition index {cond_idx}.")
-            if deterministic_mean:
-                mean_ctrl = ctrl.mean(dim=0, keepdim=True)
-                matched[mask] = mean_ctrl.expand(mask.sum(), -1)
-            else:
-                sample_idx = torch.randint(ctrl.size(0), (mask.sum().item(),), generator=generator, device=device)
-                matched[mask] = ctrl[sample_idx]
-        return matched
+    Scale- and rotation-invariant: both a_i (intra-condition) and b_i
+    (inter-condition) distances are in the same z-space, so their ratio
+    is unaffected by uniform scaling or rotation between runs.
+    This makes the score comparable across model runs and datasets.
 
-    deterministic = (seed is None) or (n_ctrl_samples is not None and int(n_ctrl_samples) <= 0)
-    n_samples = 1 if deterministic else max(1, int(n_ctrl_samples))
-    for s in range(n_samples):
-        rng = None
-        if not deterministic and seed is not None:
-            rng = torch.Generator(device=device)
-            rng.manual_seed(int(seed) + s)
+    Returns: (P, C, C) float32 array, NaN where a perturbation has <2 cells
+             in one of the two conditions.
+    """
+    p_key = get_config("pert_key")
+    treatment_key = get_config("treatment_key")
 
-        matched_ntc = sample_matched_ntc(rng, deterministic_mean=deterministic)
+    z_all = np.array(adata.obsm[obsm_key], dtype=np.float32)
+    pert_col = np.array(adata.obs[p_key].values, dtype=str)
+    cond_col = np.array(adata.obs[treatment_key].values, dtype=str)
 
-        for i, c_from in enumerate(cond_list_t):
-            mask_from = (C_t == c_from)
-            if not mask_from.any():
-                continue
+    P, C = model.perturbs, model.conds
 
-            x_ntc_from = matched_ntc[mask_from]
-            x_p_from = x_p_t[mask_from]
-            P_from = P_t[mask_from]
+    idx_to_pert = {v: k for k, v in ds.perturbation_dict.items()}
+    idx_to_cond = {v: k for k, v in ds.condition_dict.items()}
+    pert_names = [idx_to_pert[i] for i in range(P)]
+    cond_names = [idx_to_cond[i] for i in range(C)]
 
-            cfs_base, cfs_base_std = model.latent_counterfactual(
-                x_ntc_from, x_p_from, P_from, c_from, c_from, return_std=True
-            )  # cell x d
+    valid = ~np.isnan(z_all).any(axis=1)
 
-            for j, c_to in enumerate(cond_list_t):
-                if i == j:
-                    continue
+    score = np.full((P, C, C), np.nan, dtype=np.float32)
+    for p, pname in enumerate(pert_names):
+        for c1 in range(C):
+            for c2 in range(c1 + 1, C):
+                mask_c1 = valid & (pert_col == pname) & (cond_col == cond_names[c1])
+                mask_c2 = valid & (pert_col == pname) & (cond_col == cond_names[c2])
+                s = _silhouette_pair(z_all[mask_c1], z_all[mask_c2])
+                score[p, c1, c2] = s
+                score[p, c2, c1] = s
 
-                cfs, _ = model.latent_counterfactual(
-                    x_ntc_from, x_p_from, P_from, c_from, c_to, return_std=True
-                )  # cell x d
-
-                bulk_base = []
-                bulk_cf = []
-                bulk_scale = []
-                for p_val in unique_p:
-                    mask_p = (P_from == p_val)
-                    if mask_p.any():
-                        bulk_base.append(cfs_base[mask_p].mean(dim=0))
-                        bulk_cf.append(cfs[mask_p].mean(dim=0))
-                        bulk_scale.append(cfs_base_std[mask_p].mean(dim=0))
-                    else:
-                        bulk_base.append(torch.zeros_like(cfs_base[0]))
-                        bulk_cf.append(torch.zeros_like(cfs[0]))
-                        bulk_scale.append(torch.ones_like(cfs_base[0]) * 1e-3)
-
-                bulk_base = torch.stack(bulk_base, dim=0)
-                bulk_cf = torch.stack(bulk_cf, dim=0)
-                bulk_scale = torch.stack(bulk_scale, dim=0).clamp_min(1e-6)
-
-                distances = torch.linalg.norm((bulk_cf - bulk_base) / bulk_scale, dim=1)  # p
-                cf_mat_sum[:, i, j] += distances
-
-    cf_mat = cf_mat_sum / float(n_samples)
-    return cf_mat.cpu().numpy().astype(np.float32)
+    return score.astype(np.float32)
 
 @torch.no_grad()
 def eval_single(model, adata, obsm_key: str = "z", uns_key: str="results", param_store=None) -> None:

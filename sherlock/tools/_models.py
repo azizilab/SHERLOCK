@@ -286,8 +286,13 @@ class VAE(nn.Module):
             )
 
             # gated perturbation shift (no condition branch)
-            z0_loc_mod = z0_loc * (1.0 - W[p])
+            z0_loc_mod = z0_loc #* (1.0 - W[p])
+            
             lin_shift = A[p] * W[p]
+            if len(lin_shift.shape) != 2: #p == -1 is no perturbation.
+                comb_mask = (p != -1).float().unsqueeze(-1)
+                lin_shift = lin_shift * comb_mask
+                lin_shift = lin_shift.sum(dim=1)
 
             if self.shift == 'poe':
                 z_loc, z_var = self.__poe(z0_loc_mod, z0_scale, lin_shift)
@@ -301,7 +306,25 @@ class VAE(nn.Module):
 
             cls_logits = self.cls_head(z)
             pyro.deterministic("cls_logits", cls_logits)
-            CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
+
+            if p.ndim == 1:
+                # ----- single-class classification -----
+                CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
+
+            else:
+                # ----- multi-label classification (predict K perturbations) -----
+                B, P = cls_logits.shape
+                target = torch.zeros((B, P), device=cls_logits.device, dtype=cls_logits.dtype)
+
+                mask = (p != -1)                      # (B, K)  only for valid perturbations
+                p_safe = p.clamp(min=0)               # replace -1 with 0 for safe scatter
+
+                # Put 1s at the valid perturbation indices
+                target.scatter_(1, p_safe, mask.to(target.dtype))
+
+                # BCE over classes (multi-label)
+                CE_loss = F.binary_cross_entropy_with_logits(cls_logits, target, reduction="sum")
+
             pyro.factor("CE_loss", -self.ce_lambda*CE_loss)
 
             logits_p = self.__decode(x_p, z, self.z_decoder, theta, "x_p")
@@ -357,108 +380,6 @@ class VAE(nn.Module):
             z_std = (0.5 * z_logvar).exp()
             pyro.sample("z", dist.Normal(z_mu, z_std).to_event(1))
 
-# ------------------------------ jaccobian helpers ---------------------------- #
-    
-    @torch.no_grad()
-    def __eval_points(self, x_p, p):
-        self.eval()
-        x_p_n = self._mednorm(x_p)
-        z_mu, _ = self.z_encoder(x_p_n).chunk(2, dim=-1)
-        eval_points = []
-        # gather one eval point per perturbation index; fallback to global mean if absent
-        global_mean = z_mu.mean(dim=0, keepdim=True)
-        for pp in range(self.perturbs):
-            mask = (p == pp)
-            if mask.any():
-                eval_points.append(z_mu[mask].mean(dim=0, keepdim=True))
-            else:
-                eval_points.append(global_mean)
-        return torch.cat(eval_points, dim=0)
-
-    @torch.no_grad()
-    def __control_eval_points(self, p, c, x_ntc_by_cond, device):
-        """
-        Build per-perturbation control eval points from matching-condition NTC cells.
-        """
-        if x_ntc_by_cond is None or len(x_ntc_by_cond) == 0:
-            return None
-
-        # normalize control list to tensors on device
-        ctrl_list = []
-        for x in x_ntc_by_cond:
-            t = torch.as_tensor(x, device=device, dtype=torch.float32)
-            if t.ndim == 1:
-                t = t.unsqueeze(0)
-            ctrl_list.append(t)
-
-        # if no condition labels, fallback to global control mean for all perts
-        if c is None:
-            pooled = torch.cat(ctrl_list, dim=0)
-            z0_mu = self._abduct_z0(pooled)
-            ctrl_mean = z0_mu.mean(dim=0, keepdim=True)
-            return ctrl_mean.expand(self.perturbs, -1)
-
-        ctrl_points = []
-        global_mean = None
-        for pp in range(self.perturbs):
-            mask = (p == pp)
-            if not mask.any():
-                ctrl_points.append(None)
-                continue
-            cond_idx = c[mask][0].item()
-            if cond_idx >= len(ctrl_list):
-                ctrl_points.append(None)
-                continue
-            x_ntc = ctrl_list[cond_idx]
-            z0_mu = self._abduct_z0(x_ntc)
-            ctrl_points.append(z0_mu.mean(dim=0, keepdim=True))
-            if global_mean is None:
-                global_mean = ctrl_points[-1]
-        if global_mean is None:
-            return None
-        filled = [cp if cp is not None else global_mean for cp in ctrl_points]
-        return torch.cat(filled, dim=0)
-    
-    # (1, d) -> (1, G) -> (G,)
-    def __decode_one_sample(self, z_single):
-        return self.z_decoder(z_single.unsqueeze(0)).squeeze(0)
-    
-    def __jac(self, eval_points):
-        self.eval()
-        f = jacrev(self.__decode_one_sample)
-        J = vmap(f)(eval_points) # (P, G, d)
-        B = J.transpose(1, 2).contiguous().abs() # (P, d, G)
-        return B
-    
-    @torch.no_grad()
-    def pert_to_target_graph(self, x_p, p, c=None, x_ntc_by_cond=None, fix_gate=True):
-        device = x_p.device
-        x_p = self._mednorm(x_p)
-        eval_points = self.__eval_points(x_p, p)
-        
-        # turn on local gradient for jacobian
-        with torch.enable_grad():
-            eval_points = eval_points.detach().requires_grad_(True)
-            B_treat = self.__jac(eval_points)
-
-            B_ctrl = None
-            if self.use_contrastive_jacobian and x_ntc_by_cond is not None:
-                ctrl_points = self.__control_eval_points(p, c, x_ntc_by_cond, device)
-                if ctrl_points is not None:
-                    ctrl_points = ctrl_points.detach().requires_grad_(True)
-                    B_ctrl = self.__jac(ctrl_points)
-            if B_ctrl is not None:
-                B = (B_treat - B_ctrl).abs()
-            else:
-                B = B_treat
-        
-        W = self.gate(deterministic=fix_gate)
-        G = (W.unsqueeze(-1) * B).sum(dim=1)
-        return G / (G.max(dim=1, keepdim=True).values + 1e-8)
-    
-    
-    # ------------------------------ counterfactual helpers ---------------------------- #
-    
     @torch.no_grad()
     def _abduct_z0(self, x_ntc, return_std: bool = True):
         """
@@ -537,6 +458,4 @@ class VAE(nn.Module):
         else:
             raise ValueError("Invalid shift type")
         
-        if return_std:
-            return z_loc_cf, z_std_cf
         return z_loc_cf
