@@ -301,3 +301,190 @@ class VAETrainer:
         if best_param_store is not None:
             pyro.get_param_store().set_state(best_param_store)
         return best_state, best_param_store
+
+
+# sVAETrainer shares the same training loop as cVAETrainer:
+# both use PerturbSimpleDataset yielding (x, p) batches with SVI.
+sVAETrainer = cVAETrainer
+
+
+class cVAETrainer:
+    """
+    Trains a cVAE model using Pyro SVI (Trace_ELBO).
+
+    Parameters
+    ----------
+    model        : cVAE instance.
+    dataloader   : DataLoader yielding (x, p) batches.
+    treat_effect : AnnData with ground-truth ATEs used for validation.
+    lr           : Adam learning rate.
+    num_epochs   : maximum training epochs.
+    validate_every : epoch interval between validation passes.
+    patience     : early-stopping patience (epochs without ELBO improvement).
+    device       : torch device.
+    seed         : RNG seed.
+    """
+
+    def __init__(
+        self,
+        model,
+        dataloader: DataLoader,
+        treat_effect,
+        lr: float = 3e-4,
+        num_epochs: int = 200,
+        validate_every: int = 10,
+        patience: int = 30,
+        device: torch.device = torch.device("cpu"),
+        seed: int = 0,
+        non_blocking_copy: bool = True,
+    ):
+        self.model = model
+        self.dataloader = dataloader
+        self.treat_effect = treat_effect
+        self.num_epochs = int(num_epochs)
+        self.validate_every = max(1, int(validate_every))
+        self.patience = patience
+        self.non_blocking_copy = non_blocking_copy
+
+        self.device = device
+        self.model.to(self.device)
+
+        pyro.clear_param_store()
+        self.svi = SVI(self.model.model, self.model.guide, Adam({"lr": lr}), loss=Trace_ELBO())
+
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+
+        self._last_valid = dict(R2=float("nan"), ATE=float("nan"))
+        self.history: list[dict] = []
+
+    def _to_device(self, x, p):
+        nb = self.non_blocking_copy
+        return (
+            x.to(self.device, dtype=torch.float32, non_blocking=nb),
+            p.to(self.device, dtype=torch.long, non_blocking=nb),
+        )
+
+    def _validate(self, val_loader: DataLoader) -> dict:
+        self.model.eval()
+        preds_all, actuals_all, p_all = [], [], []
+
+        with torch.no_grad():
+            for x, p in val_loader:
+                x, p = self._to_device(x, p)
+                recon = self.model.get_recon(x, p)
+                preds_all.append(recon.cpu().numpy())
+                actuals_all.append(x.cpu().numpy())
+                p_all.append(p.cpu().numpy())
+
+        preds   = np.concatenate(preds_all,   axis=0)
+        actuals = np.concatenate(actuals_all, axis=0)
+        p_idx   = np.concatenate(p_all,       axis=0)
+
+        r2 = r2_score(actuals.ravel(), preds.ravel())
+
+        # ── ATE correlation ───────────────────────────────────────────
+        ate = float("nan")
+        ds = val_loader.dataset
+        idx2pert = ds.idx_to_pert()
+        ntc_idx  = ds.ntc_idx
+
+        def _lognorm(x):
+            lib = x.sum(axis=1, keepdims=True)
+            return np.log2(1e4 * x / np.clip(lib, 1e-8, None) + 1.0)
+
+        preds_ln = _lognorm(preds)
+        ntc_mask = p_idx == ntc_idx
+
+        if ntc_mask.sum() > 0:
+            ntc_mean = preds_ln[ntc_mask].mean(axis=0)
+            pred_effects: dict[str, np.ndarray] = {}
+            for pidx in np.unique(p_idx[~ntc_mask]):
+                name = idx2pert.get(int(pidx))
+                if name is None:
+                    continue
+                pred_effects[name] = preds_ln[p_idx == pidx].mean(axis=0) - ntc_mean
+
+            common_perts = [n for n in pred_effects if n in self.treat_effect.obs_names]
+            common_genes = [g for g in ds.var_names if g in self.treat_effect.var_names]
+
+            if len(common_perts) >= 2 and len(common_genes) >= 1:
+                te_df   = pd.DataFrame(
+                    self.treat_effect[common_perts, common_genes].X,
+                    index=common_perts, columns=common_genes,
+                )
+                pred_mat = np.stack(
+                    [pred_effects[n][[ds.var_names.index(g) for g in common_genes]]
+                     for n in common_perts],
+                    axis=0,
+                )
+                ate = pearsonr(pred_mat.ravel(), te_df.values.ravel())[0]
+
+        return {"r2": r2, "ate": ate}
+
+    def fit(self, val_loader: DataLoader | None = None) -> tuple:
+        """
+        Train the cVAE.
+
+        Parameters
+        ----------
+        val_loader : optional validation DataLoader; falls back to train loader.
+
+        Returns
+        -------
+        (best_model, best_param_store)
+        """
+        _val_loader = val_loader if val_loader is not None else self.dataloader
+        dataset_size = len(self.dataloader.dataset)
+
+        best_elbo = float("inf")
+        best_state = None
+        best_param_store = None
+        patience_counter = 0
+
+        epoch_bar = tqdm(range(1, self.num_epochs + 1), desc="cVAE", dynamic_ncols=True)
+
+        for epoch in epoch_bar:
+            self.model.train()
+            epoch_loss = 0.0
+
+            for x, p in self.dataloader:
+                x, p = self._to_device(x, p)
+                epoch_loss += self.svi.step(x, p)
+
+            avg_elbo = epoch_loss / dataset_size
+
+            if epoch % self.validate_every == 0:
+                stats = self._validate(_val_loader)
+                self._last_valid["R2"]  = stats["r2"]
+                self._last_valid["ATE"] = stats["ate"]
+
+            self.history.append(
+                {"epoch": epoch, "elbo": avg_elbo, **self._last_valid}
+            )
+
+            epoch_bar.set_postfix(
+                ELBO=f"{avg_elbo:.4f}",
+                R2=f"{self._last_valid['R2']:.4f}"
+                if not math.isnan(self._last_valid["R2"]) else "nan",
+                ATE=f"{self._last_valid['ATE']:.4f}"
+                if not math.isnan(self._last_valid["ATE"]) else "nan",
+            )
+
+            if avg_elbo < best_elbo or epoch < self.num_epochs // 4:
+                best_elbo = avg_elbo
+                best_state = copy.deepcopy(self.model)
+                best_param_store = copy.deepcopy(pyro.get_param_store().get_state())
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    print(f"Early stopping at epoch {epoch} (best ELBO={best_elbo:.4f})")
+                    break
+
+        pyro.clear_param_store()
+        if best_param_store is not None:
+            pyro.get_param_store().set_state(best_param_store)
+        return best_state, best_param_store

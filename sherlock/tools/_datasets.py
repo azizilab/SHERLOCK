@@ -237,3 +237,85 @@ class PerturbMatchingDataset(Dataset):
         x_ntc   = self.X_ntc[c_idx][ntc_idx]
 
         return x_p, x_ntc, p_idx, c_idx
+
+
+class PerturbSimpleDataset(Dataset):
+    """
+    Flat dataset of (expression, perturbation_index) pairs for all cells.
+
+    Unlike PerturbMatchingDataset, every cell — perturbed *and* NTC — is
+    included.  NTC is assigned index 0; non-NTC perturbations follow in
+    sorted order.  No on-the-fly NTC pairing is performed.
+
+    This is the dataset used by cVAE (and by the universal eval loop in
+    PerturbModelBase.eval()) because all models can accept a plain
+    (x, p_idx) batch.
+
+    Parameters
+    ----------
+    anndata    : AnnData with obs[pert_key] containing perturbation labels.
+    pert_key   : column in anndata.obs with perturbation labels.
+    ntc_label  : label for non-targeting control cells.
+    subset_obs : optional boolean mask or integer indices to select a subset.
+    """
+
+    def __init__(
+        self,
+        anndata,
+        pert_key: str = "pert",
+        ntc_label: str = "NTC",
+        subset_obs=None,
+    ):
+        if subset_obs is not None:
+            anndata = anndata[subset_obs]
+
+        self.pert_key = pert_key
+        self.ntc_label = ntc_label
+
+        X = anndata.X
+        self.X = (X.toarray() if hasattr(X, "toarray") else np.asarray(X)).astype(np.float32)
+
+        raw_labels = anndata.obs[pert_key].values
+        if pd.isna(raw_labels).any():
+            raise ValueError(f"obs['{pert_key}'] contains NaN values.")
+
+        unique_perts = np.unique(raw_labels)
+        if ntc_label not in unique_perts:
+            raise ValueError(
+                f"ntc_label '{ntc_label}' not found in obs['{pert_key}']. "
+                f"Available: {unique_perts[:10].tolist()} …"
+            )
+
+        # NTC → 0, everything else alphabetically
+        non_ntc = sorted(p for p in unique_perts if p != ntc_label)
+        self.perturbation_dict: dict[str, int] = {
+            p: i for i, p in enumerate([ntc_label] + non_ntc)
+        }
+        self.P_indices = np.array(
+            [self.perturbation_dict[p] for p in raw_labels], dtype=np.int64
+        )
+        self.var_names: list[str] = anndata.var_names.tolist()
+
+    def __len__(self) -> int:
+        return self.X.shape[0]
+
+    def __getitem__(self, idx: int):
+        return (
+            torch.from_numpy(self.X[idx]),
+            torch.tensor(self.P_indices[idx], dtype=torch.long),
+        )
+
+    @property
+    def ntc_idx(self) -> int:
+        return self.perturbation_dict[self.ntc_label]
+
+    @property
+    def n_perturbs(self) -> int:
+        return len(self.perturbation_dict)
+
+    @property
+    def input_dim(self) -> int:
+        return self.X.shape[1]
+
+    def idx_to_pert(self) -> dict[int, str]:
+        return {i: p for p, i in self.perturbation_dict.items()}
