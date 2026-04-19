@@ -91,10 +91,15 @@ class VAE(nn.Module):
         ntc_lambda=1e-5,
         pert_lambda=1.0,
         cov_lambda=1e-4,
+        gate_row_repulsion_lambda=1e-3,
         gate_init_p=0.5,
         rank=6,
         use_conditions=False,
         shift='poe',
+        use_contrastive_jacobian=False,
+        use_de_align_loss=False,
+        de_align_lambda=1e-3,
+        treat_effect_map=None,
     ):
         super().__init__()
         assert shift in ['poe', 'linear'], "shift must be 'poe' or 'linear'"
@@ -116,6 +121,10 @@ class VAE(nn.Module):
         self.ntc_lambda = float(ntc_lambda)
         self.pert_lambda = float(pert_lambda)
         self.cov_lambda = float(cov_lambda)
+        self.gate_row_repulsion_lambda = float(gate_row_repulsion_lambda)
+        self.use_contrastive_jacobian = bool(use_contrastive_jacobian)
+        self.use_de_align_loss = bool(use_de_align_loss)
+        self.de_align_lambda = float(de_align_lambda)
 
         # embeddings / condition prior params
         self.p_emb = nn.Embedding(perturbs, latent_dim)
@@ -159,12 +168,23 @@ class VAE(nn.Module):
         # low-rank covariance (params live on module device)
         self.qr = QRCov(self.perturbs, self.rank)
 
+        # optional supervision: target DE per perturbation (perturbs x genes)
+        if treat_effect_map is not None:
+            self.register_buffer("treat_effect_map", treat_effect_map.float())
+        else:
+            self.treat_effect_map = None
+
     # --- helpers ---
     @torch.no_grad()
     def _corr(self, M, eps=1e-8):
         d = torch.sqrt(torch.clamp(torch.diag(M), min=eps))
         denom = torch.outer(d, d)
         return M / torch.clamp(denom, min=eps)
+
+    def _mednorm(self, x: torch.Tensor) -> torch.Tensor:
+        lib = x.sum(dim=1, keepdim=True)
+        med = torch.median(lib).item()
+        return torch.log1p(x / torch.clamp(lib, min=1e-8) * med)
 
     @torch.no_grad()
     def _get_cov(self):
@@ -237,6 +257,13 @@ class VAE(nn.Module):
         p_col = col_usage / (col_usage.sum() + 1e-8)
         entropy_col = -(p_col * (p_col + 1e-8).log()).sum()
         pyro.factor("col_entropy", + self.H_lambda * entropy_col)
+        # encourage perturbations to use different latent gates
+        if self.perturbs > 1:
+            W_norm = W / (W.norm(dim=1, keepdim=True) + 1e-8)
+            sim = W_norm @ W_norm.T
+            off_diag = sim[~torch.eye(self.perturbs, device=device, dtype=torch.bool)]
+            repulsion = (off_diag ** 2).mean()
+            pyro.factor("gate_row_repulsion", - self.gate_row_repulsion_lambda * repulsion)
 
         with pyro.plate("cells", x_p.size(0)):
             if self.use_conditions:
@@ -308,16 +335,37 @@ class VAE(nn.Module):
                 infer={"scale": self.pert_lambda},
             )
 
+            # optional DE alignment loss against provided targets
+            if self.use_de_align_loss and self.treat_effect_map is not None:
+                # reuse decoded logits to avoid extra passes
+                mu_p = theta * logits_p.exp()          # batch x genes
+                mu_ntc = theta * logits_ntc.exp()
+                P_max = self.perturbs
+
+                # per-pert sums via scatter for speed
+                sum_p = torch.zeros(P_max, self.input_dim, device=device)
+                sum_ntc = torch.zeros_like(sum_p)
+                cnt = torch.zeros(P_max, device=device)
+
+                expand_idx = p.unsqueeze(1).expand(-1, self.input_dim)
+                sum_p.scatter_add_(0, expand_idx, mu_p)
+                sum_ntc.scatter_add_(0, expand_idx, mu_ntc)
+                cnt.scatter_add_(0, p, torch.ones_like(p, dtype=sum_p.dtype))
+
+                mask = cnt > 0
+                if mask.any():
+                    mean_p = sum_p[mask] / (cnt[mask].unsqueeze(1) + 1e-8)
+                    mean_ntc = sum_ntc[mask] / (cnt[mask].unsqueeze(1) + 1e-8)
+                    pred_eff = mean_p - mean_ntc
+                    target = self.treat_effect_map.to(pred_eff.device)[:P_max][mask]
+                    loss = F.mse_loss(pred_eff, target)
+                    pyro.factor("de_align_loss", - self.de_align_lambda * loss)
+
     def guide(self, x_p, x_ntc, p, c):
         pyro.module("VAE", self)
 
-        def mednorm(x):
-            lib = x.sum(dim=1, keepdim=True)
-            med = torch.median(lib).item()
-            return torch.log1p(x / lib * med)
-
-        x_p = mednorm(x_p)
-        x_ntc = mednorm(x_ntc)
+        x_p = self._mednorm(x_p)
+        x_ntc = self._mednorm(x_ntc)
 
         q_loc = self.rho_enc(self.p_emb.weight)
         with pyro.plate("perturbations", self.perturbs):
@@ -333,7 +381,7 @@ class VAE(nn.Module):
             pyro.sample("z", dist.Normal(z_mu, z_std).to_event(1))
 
     @torch.no_grad()
-    def _abduct_z0(self, x_ntc):
+    def _abduct_z0(self, x_ntc, return_std: bool = True):
         """
         q(z0_hat | x_ntc)
         """
@@ -341,7 +389,10 @@ class VAE(nn.Module):
         lib_ntc = x_ntc.sum(dim=1, keepdim=True)
         med_ntc = torch.median(lib_ntc).item()
         x_ntc_n = torch.log1p(x_ntc / lib_ntc * med_ntc)
-        z0_mu, _ = self.z0_encoder(x_ntc_n).chunk(2, dim=-1)
+        z0_mu, z0_logvar = self.z0_encoder(x_ntc_n).chunk(2, dim=-1)
+        z0_std = (0.5 * z0_logvar).exp()
+        if return_std:
+            return z0_mu, z0_std
         return z0_mu
     
     @torch.no_grad()
@@ -354,14 +405,17 @@ class VAE(nn.Module):
         return z0 + (mu_to - mu_from)
     
     @torch.no_grad()
-    def latent_counterfactual(self, x_ntc, x_p, p, c_from=None, c_to=None):
+    def latent_counterfactual(self, x_ntc, x_p, p, c_from=None, c_to=None, return_std= False):
         """
         q(z | z0_cf, p)
         """
         device = x_p.device
         # abuduct and shift
-        z0_hat = self._abduct_z0(x_ntc)
-        z0_cf = self._do_shift_z0(z0_hat, c_from=c_from, c_to=c_to)
+        z0_hat_ctrl, z0_std_ctrl = self._abduct_z0(x_ntc, return_std=True)
+
+        # incorporate evidence from the observed perturbed cell
+        x_p_n = self._mednorm(x_p)
+        z_obs_mu, _ = self.z_encoder(x_p_n).chunk(2, dim=-1)
         
         # predict with CF
         self.eval()
@@ -374,12 +428,33 @@ class VAE(nn.Module):
         
         W = self.gate(deterministic=True)
         pert_shift = A[p] * W[p]
+
+        # PoE-informed inversion of perturbation effect
+        W_scale = pyro.param("W_scale").detach().to(device)
+        eps = 1e-6
+        W_var = ((W_scale ** 2) * (W[p] ** 2)).clamp_min(eps)
+        z0_var_ctrl = z0_std_ctrl.pow(2).clamp_min(eps)
+        alpha = z0_var_ctrl / (z0_var_ctrl + W_var)
+        z0_from_p = z_obs_mu - alpha * pert_shift
+        var_from_p = (z0_var_ctrl * W_var) / (z0_var_ctrl + W_var)
+        var_from_p = var_from_p.clamp_min(eps)
+
+        # precision-weighted fusion of control and perturbed evidence
+        prec_ctrl = 1.0 / (z0_var_ctrl + eps)
+        prec_p = 1.0 / (var_from_p + eps)
+        fused_var = 1.0 / (prec_ctrl + prec_p + eps)
+        z0_hat = fused_var * (prec_ctrl * z0_hat_ctrl + prec_p * z0_from_p)
+        z0_std = fused_var.sqrt()
+
+        z0_cf = self._do_shift_z0(z0_hat, c_from=c_from, c_to=c_to)
         z0_cf_masked = z0_cf * (1. - W[p])
 
         if self.shift == 'poe':
-            z_loc_cf, _ = self.__poe(z0_cf_masked, torch.ones_like(z0_cf_masked), pert_shift)
+            z_loc_cf, z_var_cf = self.__poe(z0_cf_masked, z0_std, pert_shift)
+            z_std_cf = z_var_cf.sqrt()
         elif self.shift == 'linear':
             z_loc_cf = z0_cf_masked + pert_shift
+            z_std_cf = z0_std
         else:
             raise ValueError("Invalid shift type")
         

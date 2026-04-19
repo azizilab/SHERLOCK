@@ -34,6 +34,9 @@ def run_single(
     treat_effect_key="treat_effect",
     use_conditions=False,
     validate_every=10,
+    use_contrastive_jacobian=False,
+    use_de_align_loss=False,
+    de_align_lambda=1e-3,
     device=torch.device('cpu'),
     patience=20,
     combinatorial=False,
@@ -58,6 +61,27 @@ def run_single(
 
     pyro.clear_param_store()
 
+    # ---- optional DE alignment targets
+    treat_effect_map = None
+    if use_de_align_loss:
+        if treat_effect_key not in adata.uns:
+            raise ValueError(f"Requested DE alignment but uns['{treat_effect_key}'] is missing.")
+        te = adata.uns[treat_effect_key]
+        if hasattr(te, "to_df"):
+            te_df = te.to_df()
+        else:
+            te_df = pd.DataFrame(
+                getattr(te, "X", None),
+                index=getattr(te, "obs_names", None),
+                columns=getattr(te, "var_names", None),
+            )
+        te_df = te_df.reindex(columns=adata.var_names, fill_value=0.0)
+        effect_mat = np.zeros((len(dataset.perturbation_dict), adata.n_vars), dtype=np.float32)
+        for name, idx in dataset.perturbation_dict.items():
+            if name in te_df.index:
+                effect_mat[idx] = te_df.loc[name].to_numpy(dtype=np.float32)
+        treat_effect_map = torch.tensor(effect_mat, dtype=torch.float32, device=device)
+
     # ---- VAE defaults from run_single args
     default_vae_args = dict(
         input_dim=adata.shape[-1],
@@ -66,6 +90,10 @@ def run_single(
         conds=int(len(np.unique(dataset.C_indices))),
         tau=tau_init,
         use_conditions=use_conditions,
+        use_contrastive_jacobian=use_contrastive_jacobian,
+        use_de_align_loss=use_de_align_loss,
+        de_align_lambda=de_align_lambda,
+        treat_effect_map=treat_effect_map,
     )
 
     # ---- Filter user kwargs to ONLY those accepted by VAE.__init__
@@ -176,8 +204,6 @@ def _gen_uns(model, adata, ds, obsm_key, uns_key):
     x_p = torch.tensor(ds.X_pert).float()
     # p2g = model.pert_to_target_graph(x_p, P, fix_gate=True)
     # uns_data['p2g'] = p2g.cpu().detach().numpy()
-
-    x_ntc_mat = ds.X_ntc # list over cond: cells x genes
 
     cond_unique = adata.obs[treatment_key].unique()
     conds = torch.tensor([ds.condition_dict[c] for c in cond_unique], dtype=torch.int32)
@@ -342,7 +368,11 @@ def condition_perturbation_interaction(model, adata, ds, obsm_key):
     return score.astype(np.float32)
 
 @torch.no_grad()
-def eval_single(model, adata, obsm_key: str = "z", uns_key: str="results") -> None:
+def eval_single(model, adata, obsm_key: str = "z", uns_key: str="results", param_store=None) -> None:
+    if param_store is not None:
+        pyro.clear_param_store()
+        pyro.get_param_store().set_state(param_store)
+
     model.eval()
     device = torch.device('cpu')
     model.to(device)
