@@ -9,6 +9,8 @@ from torch.func import jacrev, vmap
 import numpy as np
 
 from ._base import PerturbModelBase
+from .._configs import get_config
+
 
 
 class HardConcreteGate(nn.Module):
@@ -100,6 +102,9 @@ class VAE(PerturbModelBase):
         use_conditions=False,
         shift='poe',
         use_synergy=False,
+        use_de_align_loss=False,
+        de_align_lambda=1e-3,
+        treat_effect_map=None,
     ):
         super().__init__()
         assert shift in ['poe', 'linear'], "shift must be 'poe' or 'linear'"
@@ -123,9 +128,9 @@ class VAE(PerturbModelBase):
         self.pert_lambda = float(pert_lambda)
         self.cov_lambda = float(cov_lambda)
         self.gate_row_repulsion_lambda = float(gate_row_repulsion_lambda)
-        self.use_contrastive_jacobian = bool(use_contrastive_jacobian)
         self.use_de_align_loss = bool(use_de_align_loss)
         self.de_align_lambda = float(de_align_lambda)
+        self.treat_effect_map = treat_effect_map
 
         # embeddings / condition prior params
         self.p_emb = nn.Embedding(perturbs, latent_dim)
@@ -497,7 +502,7 @@ class VAE(PerturbModelBase):
             z_std_cf = z0_std
         else:
             raise ValueError("Invalid shift type")
-
+        
         return z_loc_cf
 
     # ------------------------------ PerturbModelBase interface ----------------------------- #
@@ -527,10 +532,8 @@ class VAE(PerturbModelBase):
         return library * mu_prob
 
     # ------------------------------ Sherlock-specific helpers ----------------------------- #
-
     @torch.no_grad()
-    def _explained_variance(self, x_ntc_cond, cond_idx, device=None):
-        """Per-perturbation explained variance of NTC expression relative to total NTC variance."""
+    def _counterfactual_effect_size(self, x_ntc_cond, cond_idx, device=None):
         if device is None:
             device = next(self.parameters()).device
 
@@ -540,60 +543,122 @@ class VAE(PerturbModelBase):
             x_ntc = x_ntc_cond.to(device=device, dtype=torch.float32)
 
         n_cells, G = x_ntc.shape
+        num_p = self.perturbs
+
         if n_cells < 2:
-            return np.zeros((self.perturbs, G), dtype=np.float32)
+            return np.zeros((num_p, G), dtype=np.float32)
 
+        # --- work on log-normalized scale for the denominator ---
         lib = x_ntc.sum(dim=1, keepdim=True) + 1e-8
-        x_ntc_norm = torch.log1p(x_ntc / lib * 1e4)
-        var_total  = x_ntc_norm.var(dim=0, unbiased=True)
+        x_ntc_norm = torch.log1p(x_ntc / lib * 1e4)  # e.g. CPM then log1p
+        var_total = x_ntc_norm.var(dim=0, unbiased=True)  # (G,)
 
-        z0_hat  = self._abduct_z0(x_ntc)
-        lib_ntc = x_ntc.sum(dim=1, keepdim=True)
+        # abduct z0
+        z0_hat = self._abduct_z0(x_ntc, return_std=False)  # (n_cells, d)
+        lib_ntc = x_ntc.sum(dim=1, keepdim=True)  # (n_cells, 1)
 
-        logits0  = self.z_decoder(z0_hat)
+        logits0 = self.z_decoder(z0_hat)
         mu_prob0 = F.softmax(logits0, dim=-1)
-        mu0      = lib_ntc * mu_prob0
+        mu0 = lib_ntc * mu_prob0                 # (n_cells, G)
 
-        ev_pg         = torch.zeros(self.perturbs, G, device=device, dtype=torch.float32)
+        ev_pg = torch.zeros(num_p, G, device=device, dtype=torch.float32)
         cond_idx_long = torch.tensor(int(cond_idx), dtype=torch.long, device=device)
 
-        for p_idx in range(self.perturbs):
+        for p_idx in range(num_p):
             p_vec = torch.full((n_cells,), p_idx, dtype=torch.long, device=device)
-            z_cf  = self.latent_counterfactual(
-                x_ntc=x_ntc, x_p=x_ntc, p=p_vec,
-                c_from=cond_idx_long, c_to=cond_idx_long,
+
+            z_cf = self.latent_counterfactual(
+                x_ntc=x_ntc,
+                x_p=x_ntc,
+                p=p_vec,
+                c_from=cond_idx_long,
+                c_to=cond_idx_long,
             )
-            logits1  = self.z_decoder(z_cf)
-            mu1      = lib_ntc * F.softmax(logits1, dim=-1)
+
+            logits1 = self.z_decoder(z_cf)
+            mu_prob1 = F.softmax(logits1, dim=-1)
+            mu1 = lib_ntc * mu_prob1
+
+            # log-normalize the predicted means to match denominator scale
             mu0_norm = torch.log1p(mu0 / lib_ntc * 1e4)
             mu1_norm = torch.log1p(mu1 / lib_ntc * 1e4)
-            mean_shift  = (mu1_norm - mu0_norm).mean(dim=0)
-            ev_pg[p_idx] = mean_shift.pow(2) / (var_total + 1e-8)
 
+            delta = mu1_norm - mu0_norm               # (n_cells, G)
+
+            mean_shift = delta.mean(dim=0)           # (G,)
+            # var_shift = delta.var(dim=0, unbiased=True)   # (G,)
+
+            ev = mean_shift.pow(2) / (var_total + 1e-8)
+            # ev = var_shift / (var_total + 1e-8)
+
+            ev_pg[p_idx] = ev
         return ev_pg.cpu().numpy().astype(np.float32)
+    
+    @staticmethod
+    @torch.no_grad()
+    def _silhouette_pair(z_c1: np.ndarray, z_c2: np.ndarray) -> float:
+        """
+        Mean silhouette score for a 2-condition split in z-space.
+        Scale- and rotation-invariant → comparable across model runs.
+        Returns float in [-1, 1]: 1=separated, 0=boundary, <0=mixed.
+        """
+        n1, n2 = len(z_c1), len(z_c2)
+        if n1 < 2 or n2 < 2:
+            return np.nan
+        d11 = np.linalg.norm(z_c1[:, np.newaxis] - z_c1[np.newaxis], axis=-1)
+        d22 = np.linalg.norm(z_c2[:, np.newaxis] - z_c2[np.newaxis], axis=-1)
+        d12 = np.linalg.norm(z_c1[:, np.newaxis] - z_c2[np.newaxis], axis=-1)
+        a1 = d11.sum(axis=1) / (n1 - 1)
+        b1 = d12.mean(axis=1)
+        s1 = (b1 - a1) / np.maximum(a1, b1)
+        a2 = d22.sum(axis=1) / (n2 - 1)
+        b2 = d12.mean(axis=0)
+        s2 = (b2 - a2) / np.maximum(a2, b2)
+        return float(np.concatenate([s1, s2]).mean())
 
     @torch.no_grad()
-    def compute_counterfactual(self, x_ntc_mat, x_p, P, cond_list):
-        """Counterfactual shift distances across conditions × perturbations."""
-        u      = np.unique(P)
-        cf_mat = np.zeros((len(u), len(cond_list), len(cond_list)), dtype=np.float32)
+    def condition_perturbation_interaction(self, adata, ds, obsm_key):
+        """
+        Condition-perturbation interaction via silhouette score in z-space.
 
-        for i in range(len(cond_list)):
-            c_from = cond_list[i]
-            x_ntc  = x_ntc_mat[i]
-            m, n   = x_ntc.shape[0], x_p.shape[0]
-            idx    = np.random.permutation(m)[:n] if m >= n else np.random.randint(0, m, size=n)
-            x_ntc  = torch.tensor(x_ntc[idx], dtype=torch.float32)
+        score[p, c1, c2] = mean silhouette of cells with perturbation p,
+                        labeled by condition (c1 vs c2).
 
-            for j in range(i + 1, len(cond_list)):
-                c_to     = cond_list[j]
-                cfs_base = self.latent_counterfactual(x_ntc, x_p, P, c_from, c_from).detach().cpu().numpy()
-                cfs      = self.latent_counterfactual(x_ntc, x_p, P, c_from, c_to  ).detach().cpu().numpy()
-                bulk_base = np.stack([cfs_base[P == g].mean(0) for g in u])
-                bulk_cf   = np.stack([cfs     [P == g].mean(0) for g in u])
-                cf_mat[:, i, j] = np.linalg.norm(bulk_cf - bulk_base, axis=1).astype(np.float32)
+        Range [-1, 1]:
+        +1 : conditions perfectly separated for this drug
+        0 : conditions on the boundary
+        <0 : conditions mixed
 
-        return cf_mat
+        Returns: (P, C, C) float32 array, NaN where a perturbation has <2 cells
+                in one of the two conditions.
+        """
+        p_key = get_config("pert_key")
+        treatment_key = get_config("treatment_key")
+
+        z_all = np.array(adata.obsm[obsm_key], dtype=np.float32)
+        pert_col = np.array(adata.obs[p_key].values, dtype=str)
+        cond_col = np.array(adata.obs[treatment_key].values, dtype=str)
+
+        P, C = self.perturbs, self.conds
+
+        idx_to_pert = {v: k for k, v in ds.perturbation_dict.items()}
+        idx_to_cond = {v: k for k, v in ds.condition_dict.items()}
+        pert_names = [idx_to_pert[i] for i in range(P)]
+        cond_names = [idx_to_cond[i] for i in range(C)]
+
+        valid = ~np.isnan(z_all).any(axis=1)
+
+        score = np.full((P, C, C), np.nan, dtype=np.float32)
+        for p, pname in enumerate(pert_names):
+            for c1 in range(C):
+                for c2 in range(c1 + 1, C):
+                    mask_c1 = valid & (pert_col == pname) & (cond_col == cond_names[c1])
+                    mask_c2 = valid & (pert_col == pname) & (cond_col == cond_names[c2])
+                    s = self._silhouette_pair(z_all[mask_c1], z_all[mask_c2])
+                    score[p, c1, c2] = s
+                    score[p, c2, c1] = s
+
+        return score.astype(np.float32)
 
     @torch.no_grad()
     def _eval(self, adata, obsm_key: str, device: torch.device) -> dict:
@@ -669,22 +734,34 @@ class VAE(PerturbModelBase):
         # ── gate weights W ────────────────────────────────────────────
         result["W"] = self.gate(deterministic=True).cpu().detach().numpy()
 
-        # ── counterfactual shift matrix ───────────────────────────────
-        x_p   = torch.tensor(ds.X_pert, dtype=torch.float32)
-        P_t   = torch.from_numpy(ds.P_indices)
-        conds = torch.tensor(
-            [ds.condition_dict[c] for c in adata.obs[treatment_key].unique()],
-            dtype=torch.int32,
-        )
-        result["cfs_mat"] = self.compute_counterfactual(ds.X_ntc, x_p, P_t, conds)
-
         # ── explained variance (condition × perturbation × gene) ─────
-        ev_list = [
-            self._explained_variance(ds.X_ntc[int(c)], c, device=device) for c in conds
-        ]
-        result["explained_variance"] = np.stack(ev_list, axis=0)
+        x_ntc_mat = ds.X_ntc # list over cond: cells x genes
 
-        # ── label arrays ─────────────────────────────────────────────
-        result["conditions"] = np.array(adata.obs[treatment_key].unique())
+        cond_unique = adata.obs[treatment_key].unique()
+        conds = torch.tensor([ds.condition_dict[c] for c in cond_unique], dtype=torch.int32)
+
+        ev_list = []
+        device = next(self.parameters()).device
+
+        for cond_label, cond_idx in zip(cond_unique, conds):
+            x_ntc_cond = x_ntc_mat[cond_idx]   # (cells_in_cond, G) NTC for this condition
+            ev_pg = self._counterfactual_effect_size(
+                x_ntc_cond=x_ntc_cond,
+                cond_idx=cond_idx,
+                device=device,
+            )
+            ev_list.append(ev_pg)
+        result['counterfactual_effect_size'] = np.stack(ev_list, axis=0)  # (C, P, G)
+
+        # Condition-Perturbation Interaction (P, C, C)
+        cpi = self.condition_perturbation_interaction(adata, ds, obsm_key)
+        result['condition_perturbation_interaction'] = cpi  # (P, C, C)
+
+        # save everything
+        result['conditions'] = np.array(cond_unique)
+        idx_to_pert = {idx: name for name, idx in ds.perturbation_dict.items()}
+        pert_names = [idx_to_pert[i] for i in range(len(idx_to_pert))]
+        result['perts'] = np.array(pert_names)
+        adata.uns['result'] = result
 
         return result

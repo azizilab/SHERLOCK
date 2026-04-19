@@ -196,8 +196,6 @@ class VAETrainer:
                 self._last_tau = tau_curr
 
                 epoch_loss += self.svi.step(X_p, X_ntc, P, C)
-                # stabilize decoder basis after each update
-                self.vae.enforce_decoder_basis()
                 self.global_step += 1
 
             avg_elbo = epoch_loss / dataset_size
@@ -301,11 +299,6 @@ class VAETrainer:
         if best_param_store is not None:
             pyro.get_param_store().set_state(best_param_store)
         return best_state, best_param_store
-
-
-# sVAETrainer shares the same training loop as cVAETrainer:
-# both use PerturbSimpleDataset yielding (x, p) batches with SVI.
-sVAETrainer = cVAETrainer
 
 
 class cVAETrainer:
@@ -488,3 +481,8 @@ class cVAETrainer:
         if best_param_store is not None:
             pyro.get_param_store().set_state(best_param_store)
         return best_state, best_param_store
+
+
+# sVAETrainer shares the same training loop as cVAETrainer:
+# both use PerturbSimpleDataset yielding (x, p) batches with SVI.
+sVAETrainer = cVAETrainer
