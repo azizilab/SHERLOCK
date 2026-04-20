@@ -151,6 +151,7 @@ def run(
 
         model_obj = cVAE(
             input_dim=dataset.input_dim,
+            latent_dim=latent_dim,
             n_perturbs=dataset.n_perturbs,
             **cvae_kwargs,
         ).to(device)

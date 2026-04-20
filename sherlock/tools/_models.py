@@ -5,7 +5,6 @@ import torch.nn.functional as F
 import pyro
 import pyro.distributions as dist
 from pyro.distributions import constraints
-from torch.func import jacrev, vmap
 import numpy as np
 
 from ._base import PerturbModelBase
@@ -426,18 +425,12 @@ class VAE(PerturbModelBase):
             pyro.sample("z", dist.Normal(z_mu, z_std).to_event(1))
 
     @torch.no_grad()
-    def _abduct_z0(self, x_ntc, return_std: bool = True):
-        """
-        q(z0_hat | x_ntc)
-        """
+    def _abduct_z0(self, x_ntc):
         self.eval()
         lib_ntc = x_ntc.sum(dim=1, keepdim=True)
         med_ntc = torch.median(lib_ntc).item()
         x_ntc_n = torch.log1p(x_ntc / lib_ntc * med_ntc)
-        z0_mu, z0_logvar = self.z0_encoder(x_ntc_n).chunk(2, dim=-1)
-        z0_std = (0.5 * z0_logvar).exp()
-        if return_std:
-            return z0_mu, z0_std
+        z0_mu, _ = self.z0_encoder(x_ntc_n).chunk(2, dim=-1)
         return z0_mu
     
     @torch.no_grad()
@@ -450,59 +443,33 @@ class VAE(PerturbModelBase):
         return z0 + (mu_to - mu_from)
     
     @torch.no_grad()
-    def latent_counterfactual(self, x_ntc, x_p, p, c_from=None, c_to=None, return_std= False):
+    def latent_counterfactual(self, x_ntc, x_p, p, c_from=None, c_to=None):
         """
         q(z | z0_cf, p)
         """
         device = x_p.device
-        # abuduct and shift
-        z0_hat_ctrl, z0_std_ctrl = self._abduct_z0(x_ntc, return_std=True)
+        z0_hat = self._abduct_z0(x_ntc)
+        z0_cf = self._do_shift_z0(z0_hat, c_from=c_from, c_to=c_to)
 
-        # incorporate evidence from the observed perturbed cell
-        x_p_n = self._mednorm(x_p)
-        z_obs_mu, _ = self.z_encoder(x_p_n).chunk(2, dim=-1)
-        
-        # predict with CF
         self.eval()
-        L = self.qr()                                           
+        L = self.qr()
         sigma = pyro.param("sigma_fac").detach().to(x_ntc.device)
         row_cov = L @ L.T + sigma.pow(2) * torch.eye(self.perturbs, device=device)
-        chol_P = torch.linalg.cholesky(row_cov)                 
-        q_rho_mean = self.rho_enc(self.p_emb.weight).detach()     # (P, d)
+        chol_P = torch.linalg.cholesky(row_cov)
+        q_rho_mean = self.rho_enc(self.p_emb.weight).detach()
         A = chol_P @ q_rho_mean
-        
+
         W = self.gate(deterministic=True)
         pert_shift = A[p] * W[p]
-
-        # PoE-informed inversion of perturbation effect
-        W_scale = pyro.param("W_scale").detach().to(device)
-        eps = 1e-6
-        W_var = ((W_scale ** 2) * (W[p] ** 2)).clamp_min(eps)
-        z0_var_ctrl = z0_std_ctrl.pow(2).clamp_min(eps)
-        alpha = z0_var_ctrl / (z0_var_ctrl + W_var)
-        z0_from_p = z_obs_mu - alpha * pert_shift
-        var_from_p = (z0_var_ctrl * W_var) / (z0_var_ctrl + W_var)
-        var_from_p = var_from_p.clamp_min(eps)
-
-        # precision-weighted fusion of control and perturbed evidence
-        prec_ctrl = 1.0 / (z0_var_ctrl + eps)
-        prec_p = 1.0 / (var_from_p + eps)
-        fused_var = 1.0 / (prec_ctrl + prec_p + eps)
-        z0_hat = fused_var * (prec_ctrl * z0_hat_ctrl + prec_p * z0_from_p)
-        z0_std = fused_var.sqrt()
-
-        z0_cf = self._do_shift_z0(z0_hat, c_from=c_from, c_to=c_to)
         z0_cf_masked = z0_cf * (1. - W[p])
 
         if self.shift == 'poe':
-            z_loc_cf, z_var_cf = self.__poe(z0_cf_masked, z0_std, pert_shift)
-            z_std_cf = z_var_cf.sqrt()
+            z_loc_cf, _ = self.__poe(z0_cf_masked, torch.ones_like(z0_cf_masked), pert_shift)
         elif self.shift == 'linear':
             z_loc_cf = z0_cf_masked + pert_shift
-            z_std_cf = z0_std
         else:
             raise ValueError("Invalid shift type")
-        
+
         return z_loc_cf
 
     # ------------------------------ PerturbModelBase interface ----------------------------- #
@@ -531,6 +498,47 @@ class VAE(PerturbModelBase):
         library = x.sum(dim=-1, keepdim=True)
         return library * mu_prob
 
+    # ------------------------------ PerturbModelBase overrides ---------------------------- #
+
+    @torch.no_grad()
+    def _run_inference(self, dataset, device, batch_size=1024):
+        """
+        Global-mednorm encoding — matches old eval_single behaviour where the
+        median library size is computed over the entire dataset in one shot
+        rather than per batch.
+        """
+        from torch.utils.data import DataLoader
+
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+        x_list, p_list = [], []
+        for x, p in loader:
+            x_list.append(x)
+            p_list.append(p)
+
+        x_all = torch.cat(x_list, dim=0).to(device, dtype=torch.float32)
+        p_all = torch.cat(p_list, dim=0)
+
+        lib_all = x_all.sum(dim=1, keepdim=True)
+        med = torch.median(lib_all).item()
+        x_norm_all = torch.log1p(x_all / lib_all * med)
+
+        z_parts, recon_parts = [], []
+        for i in range(0, x_all.size(0), batch_size):
+            xb_norm = x_norm_all[i : i + batch_size]
+            lib_b   = lib_all[i : i + batch_size]
+            z_mu, _ = self.z_encoder(xb_norm).chunk(2, dim=-1)
+            logits   = self.z_decoder(z_mu)
+            mu_prob  = F.softmax(logits, dim=-1)
+            z_parts.append(z_mu.cpu().numpy())
+            recon_parts.append((lib_b * mu_prob).cpu().numpy())
+
+        return (
+            np.concatenate(z_parts,     axis=0).astype(np.float32),
+            np.concatenate(recon_parts, axis=0).astype(np.float32),
+            p_all.numpy(),
+        )
+
     # ------------------------------ Sherlock-specific helpers ----------------------------- #
     @torch.no_grad()
     def _counterfactual_effect_size(self, x_ntc_cond, cond_idx, device=None):
@@ -554,7 +562,7 @@ class VAE(PerturbModelBase):
         var_total = x_ntc_norm.var(dim=0, unbiased=True)  # (G,)
 
         # abduct z0
-        z0_hat = self._abduct_z0(x_ntc, return_std=False)  # (n_cells, d)
+        z0_hat = self._abduct_z0(x_ntc)  # (n_cells, d)
         lib_ntc = x_ntc.sum(dim=1, keepdim=True)  # (n_cells, 1)
 
         logits0 = self.z_decoder(z0_hat)
@@ -585,17 +593,11 @@ class VAE(PerturbModelBase):
 
             delta = mu1_norm - mu0_norm               # (n_cells, G)
 
-            mean_shift = delta.mean(dim=0)           # (G,)
-            # var_shift = delta.var(dim=0, unbiased=True)   # (G,)
-
-            ev = mean_shift.pow(2) / (var_total + 1e-8)
-            # ev = var_shift / (var_total + 1e-8)
-
-            ev_pg[p_idx] = ev
+            mean_shift = delta.mean(dim=0)
+            ev_pg[p_idx] = mean_shift.pow(2) / (var_total + 1e-8)
         return ev_pg.cpu().numpy().astype(np.float32)
     
     @staticmethod
-    @torch.no_grad()
     def _silhouette_pair(z_c1: np.ndarray, z_c2: np.ndarray) -> float:
         """
         Mean silhouette score for a 2-condition split in z-space.
@@ -662,24 +664,8 @@ class VAE(PerturbModelBase):
 
     @torch.no_grad()
     def _eval(self, adata, obsm_key: str, device: torch.device) -> dict:
-        """
-        VAE-specific extras merged into adata.uns by the base eval().
-
-        The base already stores z_corr (all cells) and perts.  This hook
-        adds: classifier accuracy, rho_corr from the learned covariance,
-        pseudobulk z_corr for non-NTC cells only (z_corr_pert, matching
-        rho_corr dimensions), z_rho_corr, gate weights W, counterfactual
-        shift matrix, and per-perturbation explained variance.
-
-        z for perturbed cells is read from adata.obsm[obsm_key] (written by
-        the base eval loop).  AnnData propagates obsm on subsetting, so
-        adata[perturbed_mask].obsm[obsm_key] gives the (n_perturbed, d) rows
-        aligned with PerturbMatchingDataset.P_indices.
-        """
-        import numpy as np
         from scipy.stats import spearmanr, pearsonr
         from ._datasets import PerturbMatchingDataset
-        from .._configs import get_config
 
         p_key         = get_config("pert_key")
         ntc_label     = get_config("ntc_label")
@@ -707,25 +693,25 @@ class VAE(PerturbModelBase):
         result["rho_corr"] = rho_corr
 
         # ── pseudobulk z_corr for non-NTC cells (matches rho_corr dims) ─
-        num_p       = self.perturbs
-        P_idx       = torch.from_numpy(ds.P_indices)
-        z_all_pert  = torch.as_tensor(z_np, dtype=torch.float32)
-        z_bar       = torch.zeros(num_p, self.latent_dim)
+        num_p      = self.perturbs
+        P_idx      = torch.from_numpy(ds.P_indices)
+        z_all_pert = torch.as_tensor(z_np, dtype=torch.float32)
+        z_bar      = torch.zeros(num_p, self.latent_dim)
         for pidx in range(num_p):
             mask = P_idx == pidx
             if mask.any():
                 z_bar[pidx] = z_all_pert[mask].mean(0)
-        z_corr_pert = torch.corrcoef(z_bar)
-        result["z_corr_pert"] = z_corr_pert.numpy()
+        z_corr = torch.corrcoef(z_bar)
+        result["z_corr"] = z_corr.numpy()
 
-        # ── z_corr_pert vs rho_corr ───────────────────────────────────
+        # ── z_corr vs rho_corr ────────────────────────────────────────
         def _flat_triu(M):
             M   = torch.tensor(M) if not torch.is_tensor(M) else M
             idx = torch.triu_indices(M.size(0), M.size(1), offset=1)
             return M[idx[0], idx[1]]
 
-        r_s, p_s = spearmanr(_flat_triu(rho_corr), _flat_triu(z_corr_pert))
-        r_p, p_p = pearsonr( _flat_triu(rho_corr), _flat_triu(z_corr_pert))
+        r_s, p_s = spearmanr(_flat_triu(rho_corr), _flat_triu(z_corr))
+        r_p, p_p = pearsonr( _flat_triu(rho_corr), _flat_triu(z_corr))
         result["z_rho_corr"] = {
             "spearman_r": r_s, "spearman_p": p_s,
             "pearson_r":  r_p, "pearson_p":  p_p,
@@ -743,7 +729,7 @@ class VAE(PerturbModelBase):
         ev_list = []
         device = next(self.parameters()).device
 
-        for cond_label, cond_idx in zip(cond_unique, conds):
+        for _, cond_idx in zip(cond_unique, conds):
             x_ntc_cond = x_ntc_mat[cond_idx]   # (cells_in_cond, G) NTC for this condition
             ev_pg = self._counterfactual_effect_size(
                 x_ntc_cond=x_ntc_cond,
@@ -757,11 +743,8 @@ class VAE(PerturbModelBase):
         cpi = self.condition_perturbation_interaction(adata, ds, obsm_key)
         result['condition_perturbation_interaction'] = cpi  # (P, C, C)
 
-        # save everything
         result['conditions'] = np.array(cond_unique)
         idx_to_pert = {idx: name for name, idx in ds.perturbation_dict.items()}
-        pert_names = [idx_to_pert[i] for i in range(len(idx_to_pert))]
-        result['perts'] = np.array(pert_names)
-        adata.uns['result'] = result
+        result['perts'] = np.array([idx_to_pert[i] for i in range(len(idx_to_pert))])
 
         return result
