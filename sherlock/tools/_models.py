@@ -745,6 +745,6 @@ class VAE(PerturbModelBase):
 
         result['conditions'] = np.array(cond_unique)
         idx_to_pert = {idx: name for name, idx in ds.perturbation_dict.items()}
-        result['perts'] = np.array([idx_to_pert[i] for i in range(len(idx_to_pert))])
+        result['rho_perts'] = np.array([idx_to_pert[i] for i in range(len(idx_to_pert))])
 
         return result

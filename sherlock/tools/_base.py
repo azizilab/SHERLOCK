@@ -197,23 +197,6 @@ class PerturbModelBase(ABC, nn.Module):
             "perts": perts,
         }
 
-        # Standardised delta-z correlation: mean(z_pert) - mean(z_NTC) for each
-        # non-NTC perturbation.  Used as the fair clustering representation across
-        # all model types.
-        ntc_idx = dataset.ntc_idx
-        z_ntc_cells = z_all[p_all == ntc_idx]
-        if len(z_ntc_cells) > 0:
-            z_ntc_mean = z_ntc_cells.mean(0)
-            non_ntc_items = sorted((i, n) for i, n in idx2pert.items() if i != ntc_idx)
-            delta_zs = []
-            for pidx, _ in non_ntc_items:
-                mask = p_all == pidx
-                dz = z_all[mask].mean(0) - z_ntc_mean if mask.any() else np.zeros_like(z_ntc_mean)
-                delta_zs.append(dz)
-            delta_z_mat = np.stack(delta_zs, axis=0).astype(np.float32)
-            uns_data["delta_z_corr"]  = np.corrcoef(delta_z_mat).astype(np.float32)
-            uns_data["delta_z_perts"] = np.array([n for _, n in non_ntc_items])
-
         uns_data.update(self._eval(adata, obsm_key=obsm_key, device=device))
         adata.uns[uns_key] = uns_data
 

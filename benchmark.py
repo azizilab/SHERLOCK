@@ -122,24 +122,23 @@ def compute_cf_ate_metrics(model, adata, treat_effect_adata) -> dict:
             pred_effects[name] = _lognorm(mu_cf_all[[i]]).squeeze(0) - ntc_ln
 
     elif isinstance(model, cVAE):
-        # Align estimator with VAE/sVAE: mean(z_cf) → decode once with median library.
-        # Encoder still conditions on p (cVAE's mechanism), but we remove the
-        # per-cell decode advantage by averaging in z-space before decoding.
-        ntc_p_t  = torch.full((x_ntc_t.shape[0],), ntc_idx, dtype=torch.long, device=device)
-        e_ntc    = model.pert_emb(torch.tensor([ntc_idx], dtype=torch.long, device=device))
-        lib_med  = torch.tensor([[x_ntc_t.sum(-1).median().item()]], device=device)
+        # Encode NTC with each label to get z-shift, but always decode with the
+        # NTC embedding so the decoder shortcut (pert_emb in decoder) cancels out.
+        ntc_p   = torch.full((x_ntc_t.shape[0],), ntc_idx, dtype=torch.long, device=device)
+        e_ntc   = model.pert_emb(ntc_p)
+        library = x_ntc_t.sum(-1, keepdim=True)
 
-        z_ntc_mean = model.get_z(x_ntc_t, ntc_p_t).mean(dim=0, keepdim=True)
-        mu_ntc     = model._decode_mu(z_ntc_mean, e_ntc, lib_med).detach().cpu().numpy()
-        ntc_ln     = _lognorm(mu_ntc).squeeze(0)
+        z_ntc  = model.get_z(x_ntc_t, ntc_p)
+        mu_ntc = model._decode_mu(z_ntc, e_ntc, library).detach().cpu().numpy()
+        ntc_ln = _lognorm(mu_ntc).mean(axis=0)
 
         for pidx, pname in idx2pert.items():
             if pname == ntc_label:
                 continue
-            p_t       = torch.full((x_ntc_t.shape[0],), pidx, dtype=torch.long, device=device)
-            z_cf_mean = model.get_z(x_ntc_t, p_t).mean(dim=0, keepdim=True)
-            mu_cf     = model._decode_mu(z_cf_mean, e_ntc, lib_med).detach().cpu().numpy()
-            pred_effects[pname] = _lognorm(mu_cf).squeeze(0) - ntc_ln
+            p_t   = torch.full((x_ntc_t.shape[0],), pidx, dtype=torch.long, device=device)
+            z_cf  = model.get_z(x_ntc_t, p_t)
+            mu_cf = model._decode_mu(z_cf, e_ntc, library).detach().cpu().numpy()
+            pred_effects[pname] = _lognorm(mu_cf).mean(axis=0) - ntc_ln
 
     else:
         # sVAE: encode NTC → z0, apply learned action_prior_mean[p] * binarized mask
@@ -253,21 +252,15 @@ def compute_clustering_metrics(adata, pathway_df_indexed, all_genes_filtered) ->
     }
 
     results  = adata.uns["results"]
-
-    # Use standardised delta-z correlation (fair across all model types).
-    if "delta_z_corr" in results:
-        C     = np.asarray(results["delta_z_corr"], dtype=float)
-        perts = results["delta_z_perts"]
-    else:
-        corr_key = "rho_corr" if "rho_corr" in results else "z_corr"
-        C        = np.asarray(results[corr_key], dtype=float)
-        perts    = results["perts"]
+    corr_key = "z_corr"
+    C        = np.asarray(results[corr_key], dtype=float)
 
     if C.ndim != 2 or C.shape[0] != C.shape[1]:
         return nan_dict
 
-    # perts[i] = perturbation name for row/col i of C
-    perts      = np.asarray(perts)                         # (P,) array of strings
+    # rho_perts aligns with rho_corr (non-NTC only); perts aligns with z_corr (all)
+    perts_key = "rho_perts" if (corr_key == "rho_corr" and "rho_perts" in results) else "perts"
+    perts      = results[perts_key]                        # (P,) array of strings
     pert_to_idx = {name: i for i, name in enumerate(perts)}
 
     # keep only pathway genes present in the matrix
@@ -388,7 +381,7 @@ def main():
     pathway_df_indexed.index.name = "gene"
 
     all_metrics: dict[str, dict] = {}
-    for model_name, display_name in [("vae", "SHERLOCK"), ("svae", "svae"), ("cvae", "cvae")]:
+    for model_name, display_name in [("svae", "svae"), ("cvae", "cvae")]:
         all_metrics[display_name] = benchmark_model(
             model_name, data, treat_effect_adata,
             pathway_df_indexed, all_genes_filtered,

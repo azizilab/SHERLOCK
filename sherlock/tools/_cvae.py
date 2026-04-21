@@ -159,7 +159,9 @@ class cVAE(PerturbModelBase):
         non_ntc_idx   = [i for i, _ in non_ntc_items]
         non_ntc_names = [n for _, n in non_ntc_items]
 
+        rho_corr = np.corrcoef(emb[non_ntc_idx]).astype(np.float32)
+
         return {
-            "pert_emb":       emb[non_ntc_idx],
-            "pert_emb_perts": np.array(non_ntc_names),
+            "rho_corr":  rho_corr,
+            "rho_perts": np.array(non_ntc_names),
         }

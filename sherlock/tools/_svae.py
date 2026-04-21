@@ -266,6 +266,10 @@ class sVAE(PerturbModelBase):
         idx_to_pert  = dataset.idx_to_pert()
         ntc_idx      = dataset.ntc_idx
 
+        # learned effect vectors: action_prior_mean * soft_mask  (P_all, d)
+        # Use sigmoid(log_alpha) instead of hard binary mask so perturbations with
+        # low-but-nonzero mask probability are not zeroed out and dropped by the
+        # row_std filter, which caused pathway genes to disappear from perts → NaN clustering.
         soft_mask = self.gumbel_action.get_proba().detach().cpu()         # (P_all, d)
         eff       = (self.action_prior_mean.detach().cpu() * soft_mask)   # (P_all, d)
 
@@ -275,10 +279,15 @@ class sVAE(PerturbModelBase):
         non_ntc_names = [n for _, n in non_ntc_items]
 
         eff_non_ntc   = eff[non_ntc_idx].numpy()               # (P, d)
+        row_std       = eff_non_ntc.std(axis=1)
+        keep          = row_std > 1e-8
+        eff_non_ntc   = eff_non_ntc[keep]
+        non_ntc_names = [n for n, k in zip(non_ntc_names, keep) if k]
+        rho_corr      = np.corrcoef(eff_non_ntc).astype(np.float32) if len(non_ntc_names) >= 2 else np.empty((0, 0), dtype=np.float32)
 
         return {
-            "action_eff":       eff_non_ntc,
-            "action_eff_perts": np.array(non_ntc_names),
+            "rho_corr":  rho_corr,
+            "rho_perts": np.array(non_ntc_names),
         }
 
     @torch.no_grad()
