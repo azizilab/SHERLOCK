@@ -13,6 +13,7 @@ NTC cells are included in training as a regular perturbation class (index 0).
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -138,3 +139,27 @@ class cVAE(PerturbModelBase):
         e = self.pert_emb(p)
         library = x.sum(-1, keepdim=True)
         return self._decode_mu(z, e, library)
+
+    @torch.no_grad()
+    def _eval(self, adata, obsm_key: str, device: torch.device) -> dict:
+        from ._datasets import PerturbSimpleDataset
+        from .._configs import get_config
+
+        p_key     = get_config("pert_key")
+        ntc_label = get_config("ntc_label")
+
+        dataset     = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label)
+        idx_to_pert = dataset.idx_to_pert()
+        ntc_idx     = dataset.ntc_idx
+
+        # learned perturbation embeddings  (P_all, emb_dim)
+        emb = self.pert_emb.weight.detach().cpu().numpy()
+
+        non_ntc_items = sorted((i, n) for i, n in idx_to_pert.items() if i != ntc_idx)
+        non_ntc_idx   = [i for i, _ in non_ntc_items]
+        non_ntc_names = [n for _, n in non_ntc_items]
+
+        return {
+            "pert_emb":       emb[non_ntc_idx],
+            "pert_emb_perts": np.array(non_ntc_names),
+        }

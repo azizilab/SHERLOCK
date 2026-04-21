@@ -7,6 +7,7 @@ https://proceedings.mlr.press/v213/lopez23a/
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -252,6 +253,33 @@ class sVAE(PerturbModelBase):
         return library * scale
 
     # ── sVAE-specific utilities ───────────────────────────────────────────────
+
+    @torch.no_grad()
+    def _eval(self, adata, obsm_key: str, device: torch.device) -> dict:
+        from ._datasets import PerturbSimpleDataset
+        from .._configs import get_config
+
+        p_key     = get_config("pert_key")
+        ntc_label = get_config("ntc_label")
+
+        dataset      = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label)
+        idx_to_pert  = dataset.idx_to_pert()
+        ntc_idx      = dataset.ntc_idx
+
+        soft_mask = self.gumbel_action.get_proba().detach().cpu()         # (P_all, d)
+        eff       = (self.action_prior_mean.detach().cpu() * soft_mask)   # (P_all, d)
+
+        # keep only non-NTC rows, in dataset index order
+        non_ntc_items = sorted((i, n) for i, n in idx_to_pert.items() if i != ntc_idx)
+        non_ntc_idx   = [i for i, _ in non_ntc_items]
+        non_ntc_names = [n for _, n in non_ntc_items]
+
+        eff_non_ntc   = eff[non_ntc_idx].numpy()               # (P, d)
+
+        return {
+            "action_eff":       eff_non_ntc,
+            "action_eff_perts": np.array(non_ntc_names),
+        }
 
     @torch.no_grad()
     def get_mask(self, deterministic: bool = False) -> torch.Tensor:
