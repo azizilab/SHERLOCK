@@ -266,28 +266,40 @@ class sVAE(PerturbModelBase):
         idx_to_pert  = dataset.idx_to_pert()
         ntc_idx      = dataset.ntc_idx
 
-        # learned effect vectors: action_prior_mean * soft_mask  (P_all, d)
-        # Use sigmoid(log_alpha) instead of hard binary mask so perturbations with
-        # low-but-nonzero mask probability are not zeroed out and dropped by the
-        # row_std filter, which caused pathway genes to disappear from perts → NaN clustering.
-        soft_mask = self.gumbel_action.get_proba().detach().cpu()         # (P_all, d)
-        eff       = (self.action_prior_mean.detach().cpu() * soft_mask)   # (P_all, d)
+        # Strict hard-mask evaluation to avoid soft-gating inflation.ß.
+        proba = self.gumbel_action.get_proba().detach().cpu()              # (P_all, d)
+        hard_mask = (proba > 0.45).to(proba.dtype)                          # (P_all, d)
+        means = self.action_prior_mean.detach().cpu()                      # (P_all, d)
+        eff = means * hard_mask                                            # (P_all, d)
 
         # keep only non-NTC rows, in dataset index order
         non_ntc_items = sorted((i, n) for i, n in idx_to_pert.items() if i != ntc_idx)
         non_ntc_idx   = [i for i, _ in non_ntc_items]
         non_ntc_names = [n for _, n in non_ntc_items]
 
-        eff_non_ntc   = eff[non_ntc_idx].numpy()               # (P, d)
-        row_std       = eff_non_ntc.std(axis=1)
-        keep          = row_std > 1e-8
-        eff_non_ntc   = eff_non_ntc[keep]
-        non_ntc_names = [n for n, k in zip(non_ntc_names, keep) if k]
-        rho_corr      = np.corrcoef(eff_non_ntc).astype(np.float32) if len(non_ntc_names) >= 2 else np.empty((0, 0), dtype=np.float32)
+        eff_non_ntc = eff[non_ntc_idx].numpy()                             # (P, d)
+        P = eff_non_ntc.shape[0]
+
+        if P >= 2:
+            X = eff_non_ntc - eff_non_ntc.mean(axis=1, keepdims=True)
+            row_norm = np.linalg.norm(X, axis=1)
+            nz = row_norm > 1e-12
+
+            rho_corr = np.zeros((P, P), dtype=np.float32)
+            if int(nz.sum()) >= 2:
+                Xn = X[nz] / row_norm[nz][:, None]
+                Cnz = np.clip(Xn @ Xn.T, -1.0, 1.0).astype(np.float32)
+                nz_idx = np.where(nz)[0]
+                rho_corr[np.ix_(nz_idx, nz_idx)] = Cnz
+            np.fill_diagonal(rho_corr, 1.0)
+            rho_perts = np.array(non_ntc_names)
+        else:
+            rho_corr = np.empty((0, 0), dtype=np.float32)
+            rho_perts = np.array([], dtype=object)
 
         return {
             "rho_corr":  rho_corr,
-            "rho_perts": np.array(non_ntc_names),
+            "rho_perts": rho_perts,
         }
 
     @torch.no_grad()

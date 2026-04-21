@@ -8,13 +8,12 @@ Average Treatment Effect — counterfactual (do-calculus from NTC cells):
   cf_ate_spearman_r  – Spearman r (same)
   cf_ate_r2          – R² (same)
   (VAE:  encode NTC → z0, apply PoE with masking: z_cf = z0*(1-W[p]) + shift/(W_scale²+1))
-  (cVAE: encode NTC with perturbed label → z_cf, decode with NTC embedding)
+  (cVAE: strict mode = encode NTC with NTC label, intervene only in decoder label)
   (sVAE: encode NTC → z0, apply action_prior_mean[p] * binarized_mask[p], decode)
 
 Latent geometry / clustering (rho_corr on pathway-gene subset):
   cluster_ari        – Adjusted Rand Index vs pathway labels
   cluster_ami        – Adjusted Mutual Information vs pathway labels
-  cluster_mean_purity – mean per-cluster purity (fraction majority-pathway)
   cluster_accuracy   – Hungarian-aligned assignment accuracy
 """
 
@@ -43,6 +42,7 @@ from sherlock.tools._cvae import cVAE
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 T_CLUSTER = 1.5  # hierarchical clustering cut threshold
+CVAE_CF_PROTOCOL = "strict_decoder_intervention"  # or "legacy_encoder_label_intervention"
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -53,14 +53,31 @@ def _lognorm(x: np.ndarray) -> np.ndarray:
     return np.log2(1e4 * x / np.clip(lib, 1e-8, None) + 1.0)
 
 
+def _abs_r_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    """Return a copy where all '*_r' metrics are absolute-valued."""
+    out = dict(metrics)
+    for k, v in out.items():
+        if k.endswith("_r") and np.isfinite(v):
+            out[k] = float(abs(v))
+    return out
+
+
 # ── metric functions ──────────────────────────────────────────────────────────
 
-def compute_cf_ate_metrics(model, adata, treat_effect_adata) -> dict:
+def compute_cf_ate_metrics(
+    model,
+    adata,
+    treat_effect_adata,
+    cvae_protocol: str = CVAE_CF_PROTOCOL,
+):
     """
     Counterfactual ATE: predict E[x | do(p)] by intervening on NTC cells.
     VAE  : encode NTC → z0, apply learned A[p]*W[p] shift, decode.
            Shift is cell-independent so using mean(z0) is exact.
-    cVAE : feed NTC cells through encoder+decoder with each perturbation label.
+    cVAE : strict_decoder_intervention (default):
+           encode NTC with NTC label only; apply do(p) in decoder only.
+           legacy_encoder_label_intervention:
+           encode NTC with target label p and decode with NTC embedding.
     sVAE : encode NTC → z0, apply action_prior_mean[p] * binarized_mask[p], decode.
     """
     _nan = {"cf_ate_pearson_r": np.nan, "cf_ate_spearman_r": np.nan, "cf_ate_r2": np.nan}
@@ -122,23 +139,44 @@ def compute_cf_ate_metrics(model, adata, treat_effect_adata) -> dict:
             pred_effects[name] = _lognorm(mu_cf_all[[i]]).squeeze(0) - ntc_ln
 
     elif isinstance(model, cVAE):
-        # Encode NTC with each label to get z-shift, but always decode with the
-        # NTC embedding so the decoder shortcut (pert_emb in decoder) cancels out.
         ntc_p   = torch.full((x_ntc_t.shape[0],), ntc_idx, dtype=torch.long, device=device)
-        e_ntc   = model.pert_emb(ntc_p)
         library = x_ntc_t.sum(-1, keepdim=True)
 
-        z_ntc  = model.get_z(x_ntc_t, ntc_p)
-        mu_ntc = model._decode_mu(z_ntc, e_ntc, library).detach().cpu().numpy()
-        ntc_ln = _lognorm(mu_ntc).mean(axis=0)
+        if cvae_protocol == "strict_decoder_intervention":
+            # Fair protocol: no target-label conditioning in the encoder.
+            z_ntc = model.get_z(x_ntc_t, ntc_p)
+            e_ntc = model.pert_emb(ntc_p)
+            mu_ntc = model._decode_mu(z_ntc, e_ntc, library).detach().cpu().numpy()
+            ntc_ln = _lognorm(mu_ntc).mean(axis=0)
 
-        for pidx, pname in idx2pert.items():
-            if pname == ntc_label:
-                continue
-            p_t   = torch.full((x_ntc_t.shape[0],), pidx, dtype=torch.long, device=device)
-            z_cf  = model.get_z(x_ntc_t, p_t)
-            mu_cf = model._decode_mu(z_cf, e_ntc, library).detach().cpu().numpy()
-            pred_effects[pname] = _lognorm(mu_cf).mean(axis=0) - ntc_ln
+            for pidx, pname in idx2pert.items():
+                if pname == ntc_label:
+                    continue
+                p_t = torch.full((x_ntc_t.shape[0],), pidx, dtype=torch.long, device=device)
+                e_p = model.pert_emb(p_t)
+                mu_cf = model._decode_mu(z_ntc, e_p, library).detach().cpu().numpy()
+                pred_effects[pname] = _lognorm(mu_cf).mean(axis=0) - ntc_ln
+
+        elif cvae_protocol == "legacy_encoder_label_intervention":
+            # Legacy protocol retained for ablation/reproducibility.
+            e_ntc = model.pert_emb(ntc_p)
+            z_ntc = model.get_z(x_ntc_t, ntc_p)
+            mu_ntc = model._decode_mu(z_ntc, e_ntc, library).detach().cpu().numpy()
+            ntc_ln = _lognorm(mu_ntc).mean(axis=0)
+
+            for pidx, pname in idx2pert.items():
+                if pname == ntc_label:
+                    continue
+                p_t = torch.full((x_ntc_t.shape[0],), pidx, dtype=torch.long, device=device)
+                z_cf = model.get_z(x_ntc_t, p_t)
+                mu_cf = model._decode_mu(z_cf, e_ntc, library).detach().cpu().numpy()
+                pred_effects[pname] = _lognorm(mu_cf).mean(axis=0) - ntc_ln
+
+        else:
+            raise ValueError(
+                f"Unknown cVAE protocol: {cvae_protocol}. "
+                "Use 'strict_decoder_intervention' or 'legacy_encoder_label_intervention'."
+            )
 
     else:
         # sVAE: encode NTC → z0, apply learned action_prior_mean[p] * binarized mask
@@ -185,11 +223,12 @@ def compute_cf_ate_metrics(model, adata, treat_effect_adata) -> dict:
     )
     pred_flat = pred_mat.ravel()
 
-    return {
+    metrics = {
         "cf_ate_pearson_r":  float(pearsonr(pred_flat, te_flat)[0]),
         "cf_ate_spearman_r": float(spearmanr(pred_flat, te_flat)[0]),
         "cf_ate_r2":         float(r2_score(te_flat, pred_flat)),
     }
+    return _abs_r_metrics(metrics)
 
 
 def _align_and_summarize(
@@ -199,7 +238,7 @@ def _align_and_summarize(
     cluster_col: str = "cluster",
     pathway_col: str = "pathway",
 ) -> dict:
-    """ARI, AMI, mean purity, Hungarian accuracy from cluster vs pathway labels."""
+    """ARI, AMI, and Hungarian accuracy from cluster vs pathway labels."""
     df = pd.merge(
         clusters_df[[gene_col, cluster_col]],
         pathway_df[[gene_col, pathway_col]],
@@ -228,15 +267,9 @@ def _align_and_summarize(
     ari = adjusted_rand_score(y_true, y_pred)
     ami = adjusted_mutual_info_score(y_true, y_pred)
 
-    purity_vals = [
-        float((g[pathway_col] == g[pathway_col].mode().iat[0]).mean())
-        for _, g in df.groupby(cluster_col)
-    ]
-
     return {
         "cluster_ari":          float(ari),
         "cluster_ami":          float(ami),
-        "cluster_mean_purity":  float(np.mean(purity_vals)),
         "cluster_accuracy":     accuracy,
     }
 
@@ -247,12 +280,12 @@ def compute_clustering_metrics(adata, pathway_df_indexed, all_genes_filtered) ->
     """
     nan_dict = {
         k: np.nan for k in [
-            "cluster_ari", "cluster_ami", "cluster_mean_purity", "cluster_accuracy"
+            "cluster_ari", "cluster_ami", "cluster_accuracy"
         ]
     }
 
     results  = adata.uns["results"]
-    corr_key = "z_corr"
+    corr_key = "rho_corr"
     C        = np.asarray(results[corr_key], dtype=float)
 
     if C.ndim != 2 or C.shape[0] != C.shape[1]:
@@ -260,10 +293,9 @@ def compute_clustering_metrics(adata, pathway_df_indexed, all_genes_filtered) ->
 
     # rho_perts aligns with rho_corr (non-NTC only); perts aligns with z_corr (all)
     perts_key = "rho_perts" if (corr_key == "rho_corr" and "rho_perts" in results) else "perts"
-    perts      = results[perts_key]                        # (P,) array of strings
+    perts      = results[perts_key]
     pert_to_idx = {name: i for i, name in enumerate(perts)}
 
-    # keep only pathway genes present in the matrix
     valid_genes = [g for g in all_genes_filtered if g in pert_to_idx]
     if len(valid_genes) < 4:
         return nan_dict
@@ -272,7 +304,6 @@ def compute_clustering_metrics(adata, pathway_df_indexed, all_genes_filtered) ->
     cov_subset = C[np.ix_(gene_ids, gene_ids)]
     cov_subset = np.clip(cov_subset, -1.0, 1.0)
 
-    # Drop rows/cols that contain any non-finite values (NaN/Inf).
     finite_mask = np.isfinite(cov_subset).all(axis=1)
     if int(finite_mask.sum()) < 4:
         return nan_dict
@@ -336,7 +367,16 @@ def benchmark_model(
     slk.tl.eval(model_obj, adata, obsm_key="z", uns_key="results", device=DEVICE)
 
     metrics: dict = {}
-    metrics.update(compute_cf_ate_metrics(model_obj, adata, treat_effect_adata))
+    if isinstance(model_obj, cVAE):
+        print(f"  cVAE ATE protocol             = {CVAE_CF_PROTOCOL}")
+    metrics.update(
+        compute_cf_ate_metrics(
+            model_obj,
+            adata,
+            treat_effect_adata,
+            cvae_protocol=CVAE_CF_PROTOCOL,
+        )
+    )
     metrics.update(compute_clustering_metrics(adata, pathway_df_indexed, all_genes_filtered))
 
     for k, v in metrics.items():
