@@ -183,14 +183,12 @@ def run(
             pin_memory=(device.type == "cuda"),
         )
 
-        pyro.clear_param_store()
-
         svae_params    = set(inspect.signature(sVAE.__init__).parameters) - {"self"}
         trainer_params = set(inspect.signature(sVAETrainer.__init__).parameters) - {"self"}
         svae_kwargs    = {k: kwargs[k] for k in kwargs if k in svae_params}
         trainer_kwargs = {k: kwargs[k] for k in kwargs if k in trainer_params and k not in {
             "model", "dataloader", "treat_effect", "lr", "num_epochs",
-            "validate_every", "device", "patience",
+            "validate_every", "device", "patience", "desc_name",
         }}
         unknown = [k for k in kwargs if k not in svae_params and k not in trainer_params]
         if unknown:
@@ -198,8 +196,8 @@ def run(
 
         model_obj = sVAE(
             input_dim=dataset.input_dim,
-            latent_dim=latent_dim,
             n_perturbs=dataset.n_perturbs,
+            latent_dim=latent_dim,
             **svae_kwargs,
         ).to(device)
 
@@ -212,6 +210,7 @@ def run(
             validate_every=validate_every,
             device=device,
             patience=patience,
+            desc_name="sVAE",
             **trainer_kwargs,
         )
 
