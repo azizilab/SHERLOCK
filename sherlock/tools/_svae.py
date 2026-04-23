@@ -2,115 +2,90 @@
 sVAE — Sparse Mechanism Shift VAE
 Lopez et al. (2023) "Learning Causal Representations of Single Cells
 via Sparse Mechanism Shift Modeling."  CLeaR 2023.
-https://proceedings.mlr.press/v213/lopez23a/
+
+Faithful PyTorch reimplementation of Genentech/sVAE SpikeSlabVAEModule
+(_module.py) and GumbelSigmoid (_utils.py), wrapped in PerturbModelBase
+for benchmarking. Uses scvi's Encoder and DecoderSCVI with NegativeBinomial
+likelihood. Training is done via a plain PyTorch Adam optimizer (no Pyro).
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import pyro
-import pyro.distributions as dist
+from torch.distributions import Normal
+from torch.distributions import kl_divergence as kl
+
+from scvi.nn import DecoderSCVI, Encoder
+from scvi.distributions import NegativeBinomial
 
 from ._base import PerturbModelBase
 
 
 # ── GumbelSigmoid ─────────────────────────────────────────────────────────────
+# Exact copy of Genentech/sVAE svae/_utils.py
 
 class GumbelSigmoid(nn.Module):
-    """
-    Per-perturbation per-latent-dim stochastic binary mask via Gumbel-sigmoid.
-
-    Adapted from Lopez et al. (2023) / Genentech/sVAE _utils.py.
-    Uses a straight-through estimator so gradients flow through the hard mask.
-
-    Parameters
-    ----------
-    n_perturbs : number of distinct perturbation labels
-    latent_dim : latent space dimensionality
-    tau        : temperature (lower → harder samples; 1.0 default)
-    drawhard   : if True, round y_soft → {0,1} with straight-through gradient
-    """
-
-    def __init__(
-        self,
-        n_perturbs: int,
-        latent_dim: int,
-        tau: float = 1.0,
-        drawhard: bool = True,
-    ):
-        super().__init__()
-        self.tau = tau
+    def __init__(self, num_action, num_latent, freeze=False, drawhard=True, tau=1):
+        super(GumbelSigmoid, self).__init__()
+        self.shape = (num_action, num_latent)
+        self.freeze = freeze
         self.drawhard = drawhard
-        self._frozen = False
-        # Initialised to 5 → P(mask=1) ≈ 0.993.
-        # The Beta sparsity prior drives log_alpha negative during training.
-        self.log_alpha = nn.Parameter(torch.full((n_perturbs, latent_dim), 5.0))
-        self.register_buffer("fixed_mask", torch.ones(n_perturbs, latent_dim))
+        self.log_alpha = nn.Parameter(torch.zeros(self.shape))
+        self.tau = tau
+        # useful to make sure these parameters will be pushed to the GPU
+        self.uniform = torch.distributions.uniform.Uniform(0, 1)
+        self.register_buffer("fixed_mask", torch.ones(self.shape))
+        self.reset_parameters()
 
-    def forward(self, actions: torch.Tensor) -> torch.Tensor:
-        """
-        Sample a mask for a batch of perturbation indices.
+    # changed this to draw one action per minibatch sample...
+    def forward(self, action):
+        bs = action.shape[0]
+        if self.freeze:
+            y = self.fixed_mask[action, :]
+            return y
+        else:
+            shape = tuple([bs] + [self.shape[1]])
+            logistic_noise = (
+                self.sample_logistic(shape)
+                .type(self.log_alpha.type())
+                .to(self.log_alpha.device)
+            )
+            y_soft = torch.sigmoid((self.log_alpha[action] + logistic_noise) / self.tau)
 
-        Parameters
-        ----------
-        actions : (B,) long tensor of perturbation indices
+            if self.drawhard:
+                y_hard = (y_soft > 0.5).type(y_soft.type())
 
-        Returns
-        -------
-        mask : (B, latent_dim) — hard {0,1} via straight-through (or soft)
-        """
-        if self._frozen:
-            return self.fixed_mask[actions]
+                # This weird line does two things:
+                #   1) at forward, we get a hard sample.
+                #   2) at backward, we differentiate the gumbel sigmoid
+                y = y_hard.detach() - y_soft.detach() + y_soft
 
-        la = self.log_alpha[actions]                          # (B, d)
-        u = torch.zeros_like(la).uniform_().clamp_(1e-6, 1.0 - 1e-6)
-        logistic_noise = u.log() - (1.0 - u).log()
-        y_soft = torch.sigmoid((la + logistic_noise) / self.tau)
+            else:
+                y = y_soft
 
-        if self.drawhard:
-            y_hard = (y_soft > 0.5).to(y_soft.dtype)
-            # Straight-through: hard sample in forward, soft in backward
-            return y_hard - y_soft.detach() + y_soft
-        return y_soft
+            return y
 
-    def get_proba(self) -> torch.Tensor:
-        """Marginal P(mask_kd = 1) = σ(log_alpha_kd).  Shape: (P, d)."""
-        return torch.sigmoid(self.log_alpha)
+    def get_proba(self):
+        """Returns probability of getting one"""
+        if self.freeze:
+            return self.fixed_mask
+        else:
+            return torch.sigmoid(self.log_alpha)
 
-    def freeze(self) -> None:
-        """Binarise at the 0.5 threshold and freeze for deterministic inference."""
+    def reset_parameters(self):
+        torch.nn.init.constant_(
+            self.log_alpha, 5
+        )  # 5)  # will yield a probability ~0.99. Inspired by DCDI
+
+    def sample_logistic(self, shape):
+        u = self.uniform.sample(shape)
+        return torch.log(u) - torch.log(1 - u)
+
+    def threshold(self):
         proba = self.get_proba()
-        self.fixed_mask.copy_((proba > 0.5).to(proba.dtype))
-        self._frozen = True
-
-    def set_temperature(self, tau: float) -> None:
-        self.tau = float(tau)
-
-
-# ── MLP helper ────────────────────────────────────────────────────────────────
-
-def _mlp(
-    input_dim: int,
-    output_dim: int,
-    n_hidden: int,
-    n_layers: int,
-    dropout: float,
-) -> nn.Sequential:
-    """Build a BatchNorm–ReLU–Dropout MLP."""
-    layers: list[nn.Module] = []
-    prev = input_dim
-    for _ in range(n_layers):
-        layers += [
-            nn.Linear(prev, n_hidden),
-            nn.BatchNorm1d(n_hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        ]
-        prev = n_hidden
-    layers.append(nn.Linear(prev, output_dim))
-    return nn.Sequential(*layers)
+        self.fixed_mask.copy_((proba > 0.5).type(proba.type()))
+        self.freeze = True
 
 
 # ── sVAE ──────────────────────────────────────────────────────────────────────
@@ -119,148 +94,212 @@ class sVAE(PerturbModelBase):
     """
     Sparse Mechanism Shift VAE (Lopez et al., CLeaR 2023).
 
+    Faithful PyTorch reimplementation of Genentech/sVAE SpikeSlabVAEModule,
+    wrapped in PerturbModelBase. Architecture mirrors the reference exactly:
+    scvi Encoder → z, scvi DecoderSCVI → NegativeBinomial likelihood,
+    GumbelSigmoid sparse mechanism shift prior on latent z.
+
     Parameters
     ----------
-    input_dim           : number of input genes (G)
-    latent_dim          : latent space dimensionality (d)
-    n_perturbs          : total perturbation labels including NTC (NTC = index 0)
+    input_dim           : G — number of input genes
+    n_perturbs          : number of perturbation labels (n_labels in reference)
+    latent_dim          : latent space dimensionality
     n_hidden            : hidden units per MLP layer
     n_layers            : number of hidden MLP layers in encoder and decoder
     dropout_rate        : dropout probability
-    sparse_mask_penalty : λ in Beta(1, λ) prior; higher → sparser masks
-    tau                 : GumbelSigmoid temperature (lower → harder samples)
-    beta                : β-VAE weight on the KL(z) divergence term
+    sparse_mask_penalty : Beta(1, λ) prior; higher λ → sparser masks
+    beta                : KL weight applied during warmup phase
     """
 
     def __init__(
         self,
         input_dim: int,
+        n_perturbs: int,
         latent_dim: int = 10,
-        n_perturbs: int = 1,
         n_hidden: int = 128,
         n_layers: int = 1,
         dropout_rate: float = 0.1,
-        sparse_mask_penalty: float = 10.0,
-        tau: float = 1.0,
+        sparse_mask_penalty: float = 1.0,
         beta: float = 1.0,
     ):
         super().__init__()
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
+        self.n_latent = latent_dim
         self.n_perturbs = n_perturbs
         self.sparse_mask_penalty = sparse_mask_penalty
         self.beta = beta
+        self.warmup = True
+        self.use_global_kl = True
+        self.use_chem_prior = True
 
-        # ── Encoder q(z|x) — does NOT condition on perturbation label ─────
-        self.encoder = _mlp(input_dim, 2 * latent_dim, n_hidden, n_layers, dropout_rate)
+        self.px_r = nn.Parameter(torch.randn(input_dim))
 
-        # ── Decoder p(x|z) ────────────────────────────────────────────────
-        self.decoder = _mlp(latent_dim, input_dim, n_hidden, n_layers, dropout_rate)
-
-        # ── NB dispersion per gene (unconstrained; softplus at use time) ──
-        self.px_r = nn.Parameter(torch.zeros(input_dim))
-
-        # ── Per-perturbation mean shift μ_d ∈ R^d ─────────────────────────
-        # Initialised near zero; sparsity prior keeps them small
-        self.action_prior_mean = nn.Parameter(
-            torch.randn(n_perturbs, latent_dim) * 0.01
+        # z encoder: n_input → n_latent (no batch/covariate conditioning)
+        self.z_encoder = Encoder(
+            input_dim,
+            latent_dim,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            dropout_rate=dropout_rate,
+            distribution="normal",
+            use_batch_norm=True,
+            return_dist=True,
+        )
+        # l encoder: defined to match reference architecture; library is computed
+        # deterministically as log(x.sum(1)) in inference (ql = None in reference)
+        self.l_encoder = Encoder(
+            input_dim,
+            1,
+            n_layers=1,
+            n_hidden=n_hidden,
+            dropout_rate=dropout_rate,
+            use_batch_norm=True,
+            return_dist=True,
+        )
+        # decoder: n_latent → n_input
+        self.decoder = DecoderSCVI(
+            latent_dim,
+            input_dim,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            use_batch_norm=True,
+            scale_activation="softmax",
         )
 
-        # ── Beta-prior logit weights w_d  (p_d = σ(w_d)) ─────────────────
-        self.action_prior_logit_weight = nn.Parameter(
-            torch.ones(n_perturbs, latent_dim)
+        # mu_a — per-perturbation latent mean shift
+        self.action_prior_mean = nn.Parameter(torch.randn(n_perturbs, latent_dim))
+        # p_a — logit weights for Beta prior
+        self.action_prior_logit_weight = nn.Parameter(torch.ones(n_perturbs, latent_dim))
+        # q_a — GumbelSigmoid binary mask
+        self.gumbel_action = GumbelSigmoid(num_action=n_perturbs, num_latent=latent_dim)
+
+    # ── forward methods (matching SpikeSlabVAEModule) ─────────────────────────
+
+    def inference(self, x: torch.Tensor) -> dict:
+        """Encoder — matches SpikeSlabVAEModule.inference()."""
+        library = torch.log(x.sum(1)).unsqueeze(1)
+        x_ = torch.log(1 + x)
+        qz, z = self.z_encoder(x_)
+        return dict(z=z, qz=qz, library=library)
+
+    def generative(self, z: torch.Tensor, library: torch.Tensor, p: torch.Tensor) -> dict:
+        """Generative model — matches SpikeSlabVAEModule.generative()."""
+        px_scale, _, px_rate, _ = self.decoder("gene", z, library)
+        px_r = torch.exp(self.px_r)
+        px = NegativeBinomial(mu=px_rate, theta=px_r, scale=px_scale)
+
+        # Priors
+        mask = self.gumbel_action(p)
+        mean_z = torch.index_select(self.action_prior_mean, 0, p)
+        if self.use_chem_prior:
+            pz = Normal(mean_z * mask, torch.ones_like(z))
+        else:
+            pz = Normal(torch.zeros_like(z), torch.ones_like(z))
+
+        return dict(px=px, pz=pz)
+
+    def loss(
+        self,
+        x: torch.Tensor,
+        p: torch.Tensor,
+        kl_weight: float = 1.0,
+        n_obs: int = 1,
+    ) -> torch.Tensor:
+        """
+        Training loss — matches SpikeSlabVAEModule.loss().
+
+        Parameters
+        ----------
+        x         : (B, G) raw counts
+        p         : (B,)   integer perturbation indices
+        kl_weight : KL annealing weight (1.0 = fully on)
+        n_obs     : total dataset size for loss scaling (scVI convention)
+        """
+        inf = self.inference(x)
+        gen = self.generative(inf["z"], inf["library"], p)
+
+        kl_divergence_z = kl(inf["qz"], gen["pz"]).sum(dim=1)
+        kl_divergence_l = 0.0
+
+        reconst_loss = -gen["px"].log_prob(x).sum(-1)
+
+        if self.warmup:
+            weighted_kl_local = (
+                self.beta * kl_weight * kl_divergence_z + kl_divergence_l
+            )
+        else:
+            weighted_kl_local = kl_divergence_z + kl_divergence_l
+
+        q_discrete = self.gumbel_action.get_proba()
+        prior_w = torch.ones_like(self.action_prior_logit_weight)
+        logp_qw = (
+            torch.distributions.Beta(prior_w, prior_w * self.sparse_mask_penalty)
+            .log_prob(q_discrete)
+            .sum()
         )
 
-        # ── GumbelSigmoid mask m_d ────────────────────────────────────────
-        self.gumbel_action = GumbelSigmoid(n_perturbs, latent_dim, tau=tau)
-
-    # ── Pyro generative model ─────────────────────────────────────────────────
-
-    def model(self, x: torch.Tensor, p: torch.Tensor) -> None:
-        pyro.module("svae", self)
-
-        N = x.shape[0]
-        theta = F.softplus(self.px_r) + 1e-3            # (G,) NB dispersion
-
-        # ── Global sparsity prior on mask probabilities ────────────────────
-        # Beta(1, λ) prior encourages q_proba → 0 (sparse masks).
-        # logp_mask is added as a factor so the ELBO includes it.
-        q_proba = self.gumbel_action.get_proba().clamp(1e-6, 1.0 - 1e-6)  # (P, d)
-        prior_w = torch.ones_like(q_proba)
-        logp_mask = torch.distributions.Beta(
-            prior_w, prior_w * self.sparse_mask_penalty
-        ).log_prob(q_proba).sum()
-        pyro.factor("mask_sparsity", logp_mask)
-
-        with pyro.plate("cells", N):
-            # Sparse prior: p(z|d) = N(μ_d ⊙ m_d, I)
-            mu_d  = self.action_prior_mean[p]      # (N, d)
-            mask  = self.gumbel_action(p)           # (N, d) straight-through
-            prior_loc = mu_d * mask                 # (N, d)
-
-            z = pyro.sample(
-                "z",
-                dist.Normal(prior_loc, torch.ones_like(prior_loc)).to_event(1),
+        if self.use_global_kl:
+            # practical implementation: set p_discrete = q_discrete (see paper)
+            kl_global = -logp_qw
+            total_loss = (
+                n_obs * torch.mean(reconst_loss + weighted_kl_local)
+                + kl_weight * kl_global
             )
+        else:
+            total_loss = n_obs * torch.mean(reconst_loss + weighted_kl_local)
 
-            # Decode: μ = library × softmax(decoder(z))
-            library = x.sum(dim=-1, keepdim=True)      # (N, 1)
-            scale   = F.softmax(self.decoder(z), dim=-1)  # (N, G)
-            mu      = library * scale                      # (N, G)
+        return total_loss
 
-            logits_nb = torch.log(mu + 1e-6) - torch.log(theta)
-            pyro.sample(
-                "x_obs",
-                dist.NegativeBinomial(total_count=theta, logits=logits_nb).to_event(1),
-                obs=x,
-            )
+    # ── reference utility methods ─────────────────────────────────────────────
 
-    # ── Pyro variational posterior ────────────────────────────────────────────
+    def freeze_params(self) -> None:
+        """Freeze decoder/encoder/px_r for test-time action-param fine-tuning."""
+        for param in self.decoder.parameters():
+            param.requires_grad = False
+        for param in self.z_encoder.parameters():
+            param.requires_grad = False
+        self.px_r.requires_grad = False
+        self.action_prior_logit_weight.requires_grad = False
 
-    def guide(self, x: torch.Tensor, p: torch.Tensor) -> None:
-        pyro.module("svae", self)
+        for _, mod in self.decoder.named_modules():
+            if isinstance(mod, nn.BatchNorm1d):
+                mod.momentum = 0
+        for _, mod in self.z_encoder.named_modules():
+            if isinstance(mod, nn.BatchNorm1d):
+                mod.momentum = 0
 
-        N     = x.shape[0]
-        x_norm = torch.log1p(x)                      # log(1 + counts)
-        out   = self.encoder(x_norm)
-        z_mu, z_log_sigma = out.chunk(2, dim=-1)
-        z_sigma = F.softplus(z_log_sigma) + 1e-4
-
-        with pyro.plate("cells", N):
-            pyro.sample("z", dist.Normal(z_mu, z_sigma).to_event(1))
+    def reinit_actsparse_and_freeze(self, loc) -> None:
+        """Reinit action params for held-out perturbations then binarize mask."""
+        with torch.no_grad():
+            self.action_prior_mean[loc] = 0
+            self.gumbel_action.log_alpha[loc] = 5
+        self.gumbel_action.threshold()
 
     # ── PerturbModelBase interface ────────────────────────────────────────────
 
     @torch.no_grad()
     def get_z(self, x: torch.Tensor, p: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
-        """
-        Posterior mean μ_z from the encoder.
-
-        The perturbation label *p* is not used — the encoder is
-        perturbation-agnostic by design.
-        """
-        x_norm = torch.log1p(x)
-        z_mu, _ = self.encoder(x_norm).chunk(2, dim=-1)
-        return z_mu
+        """Posterior mean μ_z from the encoder (perturbation-agnostic)."""
+        x_ = torch.log(1 + x)
+        qz, _ = self.z_encoder(x_)
+        return qz.loc
 
     @torch.no_grad()
     def get_recon(self, x: torch.Tensor, p: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
-        """Decode posterior mean z → expected NB mean (counts scale)."""
-        z       = self.get_z(x)
-        library = x.sum(dim=-1, keepdim=True)
-        scale   = F.softmax(self.decoder(z), dim=-1)
-        return library * scale
-
-    # ── sVAE-specific utilities ───────────────────────────────────────────────
+        """Decode posterior mean z → expected NB counts."""
+        x_ = torch.log(1 + x)
+        library = torch.log(x.sum(1)).unsqueeze(1)
+        qz, _ = self.z_encoder(x_)
+        _, _, px_rate, _ = self.decoder("gene", qz.loc, library)
+        return px_rate
 
     @torch.no_grad()
     def get_mask(self, deterministic: bool = False) -> torch.Tensor:
         """
-        Return mask probabilities (P × d) or the binarised hard mask.
+        Mask probabilities (P, d) or binarized hard mask.
 
         Parameters
         ----------
-        deterministic : if True return (proba > 0.5).float() — the hard mask
+        deterministic : if True, return (proba > 0.5).float()
         """
         proba = self.gumbel_action.get_proba()
         if deterministic:
