@@ -27,6 +27,11 @@ if TYPE_CHECKING:
 class PerturbModelBase(ABC, nn.Module):
     """Abstract base for all perturbation models in the sherlock package."""
 
+    def checkpoint_ctor_args(self) -> dict:
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement checkpoint_ctor_args() to support save/load"
+        )
+
     # ── abstract interface ────────────────────────────────────────────
 
     @abstractmethod
@@ -72,31 +77,330 @@ class PerturbModelBase(ABC, nn.Module):
         self,
         z: np.ndarray,
         p_indices: np.ndarray,
-        n_perturbs: int,
-    ) -> np.ndarray:
+        all_perts: np.ndarray,
+        perts: np.ndarray | None = None,
+        remove_ntc: bool = True,
+        use_rho: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Pseudobulk z correlation matrix over perturbation classes.
-
-        Averages z over cells sharing the same perturbation index, then
-        computes a Pearson correlation matrix across those mean vectors.
+        Perturbation-level Pearson correlation matrix.
 
         Parameters
         ----------
-        z          : (N, d) latent embeddings
+        z          : (N, d) encoder embeddings for every cell
         p_indices  : (N,)   integer perturbation index per cell
-        n_perturbs : total classes (including NTC)
+        all_perts  : (n_perturbs,) perturbation name for each integer index
+        perts      : optional subset of pert names to include; None = all
+        remove_ntc : exclude NTC perturbation (default True)
+        use_rho    : use model-specific embedding via _get_rho_embed (default
+                     True); False falls back to pseudobulk mean encoder z
 
         Returns
         -------
-        corr : (n_perturbs, n_perturbs)
+        corr  : (P, P) float32 Pearson correlation matrix
+        perts : (P,)   string array of included perturbation names
+        embed : (P, d) float32 embedding used to compute corr
         """
-        d = z.shape[1]
-        z_bar = np.zeros((n_perturbs, d), dtype=np.float32)
-        for pidx in range(n_perturbs):
-            mask = p_indices == pidx
-            if mask.any():
-                z_bar[pidx] = z[mask].mean(0)
-        return np.corrcoef(z_bar).astype(np.float32)
+        from .._configs import get_config
+        ntc_label = get_config("ntc_label")
+
+        selected = np.isin(all_perts, perts) if perts is not None else np.ones(len(all_perts), bool)
+        if remove_ntc:
+            selected &= (all_perts != ntc_label)
+
+        sel_idx   = np.where(selected)[0]
+        sel_perts = all_perts[selected]
+        P         = len(sel_idx)
+
+        if use_rho:
+            embed = self._get_rho_embed(sel_idx, z, p_indices, all_perts)
+        else:
+            d     = z.shape[1]
+            embed = np.zeros((P, d), dtype=np.float32)
+            for j, pidx in enumerate(sel_idx):
+                mask = p_indices == pidx
+                if mask.any():
+                    embed[j] = z[mask].mean(0)
+
+        if P < 2:
+            corr = np.ones((P, P), dtype=np.float32) if P == 1 else np.empty((0, 0), dtype=np.float32)
+            return corr, sel_perts, embed
+
+        X        = embed - embed.mean(axis=1, keepdims=True)
+        row_norm = np.linalg.norm(X, axis=1)
+        nz       = row_norm > 1e-12
+        corr     = np.zeros((P, P), dtype=np.float32)
+        if nz.sum() >= 2:
+            Xn     = X[nz] / row_norm[nz, None]
+            Cnz    = np.clip(Xn @ Xn.T, -1.0, 1.0).astype(np.float32)
+            nz_idx = np.where(nz)[0]
+            corr[np.ix_(nz_idx, nz_idx)] = Cnz
+        np.fill_diagonal(corr, 1.0)
+        return corr, sel_perts, embed
+
+    def _get_rho_embed(
+        self,
+        pert_indices: np.ndarray,
+        z: np.ndarray,
+        p_indices: np.ndarray,
+        all_perts: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Model-specific embedding for correlation, shape (P, d).
+
+        Called by get_corr(use_rho=True).  Subclasses must implement this
+        to use the model's learned representation (e.g. action_prior_mean,
+        A*W) instead of pseudobulk encoder z.
+
+        Parameters
+        ----------
+        pert_indices : selected global perturbation integer indices (non-NTC)
+        z            : (N, d) encoder embeddings for every cell
+        p_indices    : (N,)   integer perturbation index per cell
+        all_perts    : (n_perturbs,) perturbation name per integer index
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _get_rho_embed to use get_corr(use_rho=True)"
+        )
+
+    @staticmethod
+    def _lognorm(x: np.ndarray) -> np.ndarray:
+        """log2-CPM normalise a (B, G) count matrix."""
+        lib = x.sum(axis=1, keepdims=True)
+        return np.log2(1e4 * x / np.clip(lib, 1e-8, None) + 1.0)
+
+    # ── counterfactual hooks (override in subclasses) ─────────────────
+
+    @torch.no_grad()
+    def _abduct_ntc(self, x_ntc: torch.Tensor) -> torch.Tensor | None:
+        """
+        Encode NTC cells → background latent vectors u_i of shape (N_ntc, d).
+        Return None to opt out of counterfactual prediction.
+        """
+        return None
+
+    @torch.no_grad()
+    def _apply_shift(self, u: torch.Tensor, m_p: torch.Tensor) -> torch.Tensor:
+        """
+        Apply perturbation shift m_p to background u.
+        Default is pure addition (sVAE+ faithful).
+        Override in models that use a different fusion (e.g. PoE).
+        u : (N, d), m_p : (1, d) or (N, d) → returns (N, d)
+        """
+        return u + m_p
+
+    @torch.no_grad()
+    def _get_all_pert_shifts(self, device: torch.device) -> torch.Tensor | None:
+        """
+        Return all perturbation shift vectors of shape (P, d).
+        Computed once per predict_counterfactual_effects call.
+        Return None to opt out of counterfactual prediction.
+        """
+        return None
+
+    @torch.no_grad()
+    def _decode_to_expr(self, z: torch.Tensor, lib_size: float) -> torch.Tensor | None:
+        """
+        Decode latent z (K, d) → expected counts (K, G) at scalar *lib_size*.
+        Return None to opt out of counterfactual prediction.
+        """
+        return None
+
+    @torch.no_grad()
+    def predict_counterfactual_effects(
+        self,
+        adata,
+        n_centroids: int = 25,
+        observed_effect=None,
+        device: torch.device | None = None,
+    ) -> dict:
+        """
+        NTC-population counterfactual effects via K-means centroids.
+
+        Computes the perturbation-by-gene counterfactual effect matrix
+
+            Delta_cf[p, g] = lognorm_g(E_k[f(c_k + m_p)])
+                            - lognorm_g(E_k[f(c_k)])
+
+        where c_k are K-means centroids of abducted NTC backgrounds.
+
+        If `observed_effect` is provided, also computes Pearson correlation between
+        the predicted counterfactual effect matrix and the observed/reference effect
+        matrix over aligned perturbations and genes.
+
+        Parameters
+        ----------
+        adata : AnnData
+            Full dataset; NTC cells are extracted automatically using the
+            configured pert_key / ntc_label.
+        n_centroids : int
+            Number of K-means centroids.
+        observed_effect : AnnData-like or pd.DataFrame, optional
+            Observed treatment-effect matrix with perturbations as rows and genes
+            as columns. If AnnData-like, uses `.X`, `.obs_names`, `.var_names`.
+        return_effect_df : bool
+            If True, always return the full dict (effect_df, corr, …).
+            If False, return {pert_name: (G,) effect vector} when
+            observed_effect is None.
+        device : torch.device, optional
+            Device to run on; defaults to the device of the model's parameters.
+
+        Returns
+        -------
+        If observed_effect is None and return_effect_df=False:
+            dict {pert_name: (G,) counterfactual effect vector}
+
+        Otherwise:
+            dict with keys:
+                "effects"       : {pert_name: (G,) effect vector}
+                "effect_df"     : pd.DataFrame, predicted effects
+                "corr"          : Pearson correlation with observed_effect, or nan
+                "observed_df"   : aligned observed effects, if observed_effect given
+                "predicted_df"  : aligned predicted effects, if observed_effect given
+        """
+        from sklearn.cluster import KMeans
+        import pandas as pd
+        from scipy.stats import pearsonr
+        from ._datasets import PerturbSimpleDataset
+        from .._configs import get_config
+
+        if device is None:
+            try:
+                device = next(self.parameters()).device
+            except StopIteration:
+                device = torch.device("cpu")
+
+        self.to(device)
+
+        ntc_label = get_config("ntc_label")
+        p_key = get_config("pert_key")
+        var_names = adata.var_names
+
+        ds = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label)
+        idx2pert = ds.idx_to_pert()
+
+        ntc_mask = adata.obs[p_key] == ntc_label
+        x_ntc_raw = adata[ntc_mask].X
+        if hasattr(x_ntc_raw, "toarray"):
+            x_ntc_raw = x_ntc_raw.toarray()
+        x_ntc_t = torch.tensor(np.asarray(x_ntc_raw), dtype=torch.float32, device=device)
+
+        non_ntc_items = [(i, n) for i, n in idx2pert.items() if n != ntc_label]
+        non_ntc_idx   = [i for i, _ in non_ntc_items]
+        non_ntc_names = [n for _, n in non_ntc_items]
+
+        # abduct NTC backgrounds; compute all shifts — both done once
+        u_ntc = self._abduct_ntc(x_ntc_t)
+        if u_ntc is None:
+            return {}
+
+        all_shifts = self._get_all_pert_shifts(device)  # (P, d)
+        if all_shifts is None:
+            return {}
+
+        # K-means in latent/background space
+        n_k = min(n_centroids, u_ntc.shape[0])
+        km = KMeans(n_clusters=n_k, n_init=10, random_state=0).fit(
+            u_ntc.detach().cpu().numpy()
+        )
+
+        centroids = torch.tensor(
+            km.cluster_centers_,
+            dtype=u_ntc.dtype,
+            device=device,
+        )
+        counts = np.bincount(km.labels_, minlength=n_k)
+        weights = torch.tensor(
+            counts / counts.sum(),
+            dtype=u_ntc.dtype,
+            device=device,
+        )
+
+        lib_med = float(x_ntc_t.sum(-1).median().item())
+
+        # NTC baseline: decode centroids with no shift, assuming m_NTC = 0
+        mu_ntc_k = self._decode_to_expr(centroids, lib_med)
+        if mu_ntc_k is None:
+            return {}
+
+        mu_ntc_avg = (weights[:, None] * mu_ntc_k).sum(0, keepdim=True)
+        ntc_ln = self._lognorm(mu_ntc_avg.detach().cpu().numpy()).squeeze(0)
+
+        # per-perturbation weighted counterfactual effect in expression space
+        pred_effects = {}
+        for idx, name in zip(non_ntc_idx, non_ntc_names):
+            if idx >= all_shifts.shape[0]:
+                continue
+
+            m_p = all_shifts[[idx]]                         # (1, d)
+            z_cf_k = self._apply_shift(centroids, m_p)      # (K, d)
+            mu_cf_k = self._decode_to_expr(z_cf_k, lib_med) # (K, G)
+
+            if mu_cf_k is None:
+                continue
+
+            mu_cf_avg = (weights[:, None] * mu_cf_k).sum(0, keepdim=True)
+            cf_ln = self._lognorm(mu_cf_avg.detach().cpu().numpy()).squeeze(0)
+
+            pred_effects[name] = cf_ln - ntc_ln             # (G,)
+
+        # Build predicted effect DataFrame.
+        if len(pred_effects) == 0:
+            effect_df = pd.DataFrame()
+        else:
+            n_genes = next(iter(pred_effects.values())).shape[0]
+            if var_names is None:
+                var_names = [f"gene_{j}" for j in range(n_genes)]
+
+            effect_df = pd.DataFrame.from_dict(
+                pred_effects,
+                orient="index",
+                columns=list(var_names),
+            )
+
+        out = {
+            "effects": pred_effects,
+            "effect_df": effect_df,
+            "corr": float("nan"),
+        }
+
+        if observed_effect is None:
+            return out
+
+        # Convert observed/reference effects to DataFrame.
+        if isinstance(observed_effect, pd.DataFrame):
+            obs_df = observed_effect.copy()
+        else:
+            obs_X = observed_effect.X
+            if hasattr(obs_X, "toarray"):
+                obs_X = obs_X.toarray()
+            obs_df = pd.DataFrame(
+                np.asarray(obs_X),
+                index=observed_effect.obs_names,
+                columns=observed_effect.var_names,
+            )
+
+        common_perts = effect_df.index.intersection(obs_df.index)
+        common_genes = effect_df.columns.intersection(obs_df.columns)
+
+        pred_aligned = effect_df.loc[common_perts, common_genes]
+        obs_aligned = obs_df.loc[common_perts, common_genes]
+
+        x = pred_aligned.values.ravel()
+        y = obs_aligned.values.ravel()
+        valid = np.isfinite(x) & np.isfinite(y)
+
+        corr = pearsonr(x[valid], y[valid])[0] if valid.sum() > 2 else float("nan")
+
+        out.update(
+            {
+                "corr": float(corr),
+                "predicted_df": pred_aligned,
+                "observed_df": obs_aligned,
+            }
+        )
+
+        return out
 
     # ── inference loop (overridable) ──────────────────────────────────
 
@@ -154,7 +458,7 @@ class PerturbModelBase(ABC, nn.Module):
 
           1. _run_inference() → z, x_pred via get_z() / get_recon()
              stored in adata.obsm[obsm_key] and adata.layers["x_pred"]
-          2. get_corr()        → adata.uns[uns_key]["z_corr"]
+          2. get_corr()        → adata.uns[uns_key]["z_corr"] / "rho_corr"
           3. _eval() hook      → model-specific extras merged into uns
 
         Parameters
@@ -179,9 +483,9 @@ class PerturbModelBase(ABC, nn.Module):
         super().eval()
         self.to(device)
 
+        ntc_label = get_config("ntc_label")
         if dataset is None:
             p_key = get_config("pert_key")
-            ntc_label = get_config("ntc_label")
             dataset = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label)
 
         z_all, recon_all, p_all = self._run_inference(dataset, device, batch_size)
@@ -192,9 +496,19 @@ class PerturbModelBase(ABC, nn.Module):
         idx2pert = dataset.idx_to_pert()
         perts = np.array([idx2pert[i] for i in range(dataset.n_perturbs)])
 
+        z_corr, z_perts, _ = self.get_corr(z_all, p_all, perts, use_rho=False)
+        try:
+            rho_corr, rho_perts, rho_embed = self.get_corr(z_all, p_all, perts, use_rho=True)
+        except NotImplementedError:
+            rho_corr = rho_embed = None
+            rho_perts = z_perts
+
         uns_data: dict = {
-            "z_corr": self.get_corr(z_all, p_all, dataset.n_perturbs),
-            "perts": perts,
+            "z_corr":    z_corr,
+            "perts":     perts,
+            "rho_corr":  rho_corr,
+            "rho_perts": rho_perts,
+            "rho_embed": rho_embed,
         }
 
         uns_data.update(self._eval(adata, obsm_key=obsm_key, device=device))

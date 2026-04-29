@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import inspect
 import multiprocessing as mp
+import random
 
 import numpy as np
 import pyro
@@ -43,6 +44,7 @@ def run(
     validate_every: int = 10,
     device: torch.device = torch.device("cpu"),
     patience: int = 20,
+    seed: int | None = None,
     # ---- VAE-specific ----
     latent_dim: int = 16,
     tau_init: float = 0.67,
@@ -60,12 +62,19 @@ def run(
     latent_dim       : latent space dimensionality (VAE).
     tau_init         : initial gate temperature (VAE).
     tau_end          : final gate temperature after annealing (VAE).
+    seed             : RNG seed for reproducibility (covers weight init + training).
     **kwargs         : additional model-specific constructor arguments.
 
     Returns
     -------
     dict with 'model' (best checkpoint) and 'param_store'.
     """
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+        pyro.set_rng_seed(seed)
+
     key = model.lower()
 
     if key == "vae":
@@ -88,9 +97,9 @@ def run(
 
         vae_params     = set(inspect.signature(VAE.__init__).parameters) - {"self"}
         trainer_params = set(inspect.signature(VAETrainer.__init__).parameters) - {
-            "self", "vae", "dataloader", "treat_effect",
+            "self", "vae", "dataloader", "treat_effect", "adata",
             "lr", "num_epochs", "validate_every", "device", "patience",
-            "tau_init", "tau_end",
+            "tau_init", "tau_end", "seed",
         }
         vae_kwargs     = {k: kwargs[k] for k in kwargs if k in vae_params}
         trainer_kwargs = {k: kwargs[k] for k in kwargs if k in trainer_params}
@@ -111,6 +120,7 @@ def run(
             vae=vae,
             dataloader=dataloader,
             treat_effect=adata.uns[treat_effect_key],
+            adata=adata,
             lr=lr,
             num_epochs=num_epochs,
             validate_every=validate_every,
@@ -118,6 +128,7 @@ def run(
             patience=patience,
             tau_init=tau_init,
             tau_end=tau_end,
+            seed=seed,
             **trainer_kwargs,
         )
 
@@ -136,14 +147,12 @@ def run(
             pin_memory=(device.type == "cuda"),
         )
 
-        pyro.clear_param_store()
-
         cvae_params    = set(inspect.signature(cVAE.__init__).parameters) - {"self"}
         trainer_params = set(inspect.signature(cVAETrainer.__init__).parameters) - {"self"}
         cvae_kwargs    = {k: kwargs[k] for k in kwargs if k in cvae_params}
         trainer_kwargs = {k: kwargs[k] for k in kwargs if k in trainer_params and k not in {
-            "model", "dataloader", "treat_effect", "lr", "num_epochs",
-            "validate_every", "device", "patience",
+            "model", "dataloader", "treat_effect", "adata", "lr", "num_epochs",
+            "validate_every", "device", "patience", "seed",
         }}
         unknown = [k for k in kwargs if k not in cvae_params and k not in trainer_params]
         if unknown:
@@ -160,11 +169,13 @@ def run(
             model=model_obj,
             dataloader=dataloader,
             treat_effect=adata.uns[treat_effect_key],
+            adata=adata,
             lr=lr,
             num_epochs=num_epochs,
             validate_every=validate_every,
             device=device,
             patience=patience,
+            seed=seed,
             **trainer_kwargs,
         )
 
@@ -187,8 +198,8 @@ def run(
         trainer_params = set(inspect.signature(sVAETrainer.__init__).parameters) - {"self"}
         svae_kwargs    = {k: kwargs[k] for k in kwargs if k in svae_params}
         trainer_kwargs = {k: kwargs[k] for k in kwargs if k in trainer_params and k not in {
-            "model", "dataloader", "treat_effect", "lr", "num_epochs",
-            "validate_every", "device", "patience", "desc_name",
+            "model", "dataloader", "treat_effect", "adata", "lr", "num_epochs",
+            "validate_every", "device", "patience", "desc_name", "seed",
         }}
         unknown = [k for k in kwargs if k not in svae_params and k not in trainer_params]
         if unknown:
@@ -205,12 +216,14 @@ def run(
             model=model_obj,
             dataloader=dataloader,
             treat_effect=adata.uns[treat_effect_key],
+            adata=adata,
             lr=lr,
             num_epochs=num_epochs,
             validate_every=validate_every,
             device=device,
             patience=patience,
             desc_name="sVAE",
+            seed=seed,
             **trainer_kwargs,
         )
 

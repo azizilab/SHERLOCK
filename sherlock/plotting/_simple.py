@@ -111,7 +111,7 @@ def plot_ev(adata, uns_key='results', cond_idx=0, cmin=None, cmax=None, top_n=No
     # (C, P, G) → (P, G) for chosen condition
     ev_pg = uns["counterfactual_effect_size"][cond_idx]  # shape (P, G)
 
-    pert_names = np.array(uns["perts"])
+    pert_names = np.array(uns.get("rho_perts", uns["perts"]))
     gene_names = np.array(adata.var_names)
     P, G = ev_pg.shape
 
@@ -168,7 +168,7 @@ def _ev_results_from_uns(adata, cond_idx=0, uns_key="results", store_key="ev_res
     qvals = np.asarray(uns[store_key][cond_idx]["qvals"], dtype=float)
 
     # Perturbation names and gene names
-    perts = np.asarray(uns.get("perts", np.arange(ev.shape[0])))
+    perts = np.asarray(uns.get("rho_perts", uns.get("perts", np.arange(ev.shape[0]))))
     genes = np.asarray(adata.var_names)
 
     return ev, pvals, qvals, perts, genes

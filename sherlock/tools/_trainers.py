@@ -1,14 +1,12 @@
 import copy
 import math
 import numpy as np
-import pandas as pd
 import pyro
 import pyro.poutine as poutine
 import torch
 import torch.nn.functional as F
 from pyro.infer import SVI, Trace_ELBO
 from pyro.optim import Adam
-from scipy.stats import pearsonr
 from sklearn.metrics import r2_score
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -19,12 +17,13 @@ class VAETrainer:
         vae,
         dataloader: DataLoader,
         treat_effect,
+        adata=None,
         lr: float = 5e-4,
         num_epochs: int = 10,
         validate_every: int = 10,
         verbose: bool = True,
         device=torch.device('cpu'),
-        seed: int = 0,
+        seed: int | None = None,
         non_blocking_copy: bool = True,
         tau_init: float | None = None,
         tau_end: float = 0.10,
@@ -34,6 +33,7 @@ class VAETrainer:
         self.vae = vae
         self.dataloader = dataloader
         self.treat_effect = treat_effect
+        self.adata = adata
         self.num_epochs = int(num_epochs)
         self.validate_every = max(1, int(validate_every))
         self.verbose = verbose
@@ -46,8 +46,9 @@ class VAETrainer:
         pyro.clear_param_store()
         self.svi = SVI(self.vae.model, self.vae.guide, Adam({"lr": lr}), loss=Trace_ELBO())
 
-        torch.manual_seed(seed)
-        np.random.seed(seed)
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
         if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
 
@@ -204,56 +205,15 @@ class VAETrainer:
             if epoch % self.validate_every == 0:
                 stats = self._validate(getattr(self, "val_dataloader", self.dataloader))
 
-                # ATE
+                # ATE via counterfactual prediction
                 ate = float("nan")
-                preds_p_n, preds_ntc_n, all_P = stats["preds_p_n"], stats["preds_ntc_n"], stats["all_P"]
-                ds = self.dataloader.dataset
-                n_genes = preds_p_n.shape[1] if preds_p_n.size else 0
-
-                # index -> name (so effect_df uses string labels)
-                idx2pert = {i: name for name, i in getattr(ds, "perturbation_dict", {}).items()}
-
-                if all_P.ndim == 1:
-                    combos = all_P.astype(np.int64).reshape(-1, 1)  # (N,1)
-                else:
-                    combos = all_P.astype(np.int64).copy()          # (N,2)
-                    # canonicalize order so (a,b) == (b,a); keep (-1) as second slot
-                    a = combos[:, 0]
-                    b = combos[:, 1]
-                    swap = (b != -1) & (a > b)
-                    combos[swap, 0], combos[swap, 1] = combos[swap, 1], combos[swap, 0]
-
-                uniq_combos = np.unique(combos, axis=0)
-                n_perts = uniq_combos.shape[0]
-
-                effect = np.zeros((n_perts, n_genes))
-                for j, key in enumerate(uniq_combos):
-                    if key.shape[0] == 1:
-                        mask = (combos[:, 0] == key[0])
-                    else:
-                        mask = (combos[:, 0] == key[0]) & (combos[:, 1] == key[1])
-
-                    if not mask.any():
-                        continue
-                    effect[j] = preds_p_n[mask].mean(0) - preds_ntc_n[mask].mean(0)
-
-                # string names for combo index
-                def combo_name(k):
-                    p1 = idx2pert.get(int(k[0]), str(int(k[0])))
-                    if k.shape[0] == 1 or int(k[1]) == -1:
-                        return p1
-                    p2 = idx2pert.get(int(k[1]), str(int(k[1])))
-                    return f"{p1}+{p2}"
-
-                effect_df = pd.DataFrame(
-                    effect,
-                    index=[combo_name(k) for k in uniq_combos],
-                    columns=self.treat_effect.var_names,
-                )
-                effect_aligned = effect_df.loc[self.treat_effect.obs_names, self.treat_effect.var_names]
-                x = effect_aligned.values.ravel()
-                y = self.treat_effect.X.ravel()
-                ate = pearsonr(x, y)[0]
+                if self.adata is not None:
+                    cf = self.vae.predict_counterfactual_effects(
+                        self.adata,
+                        observed_effect=self.treat_effect,
+                        device=self.device,
+                    )
+                    ate = float(cf.get("corr", float("nan")))
 
                 self._last_valid = dict(
                     CE=stats["ce_loss"],
@@ -303,207 +263,20 @@ class VAETrainer:
 
 class cVAETrainer:
     """
-    Trains a cVAE model using Pyro SVI (Trace_ELBO).
+    Trains a cVAE model using plain PyTorch Adam with KL warmup.
+
+    Mirrors sVAETrainer: calls model.loss(x, p, kl_weight, n_obs) directly.
 
     Parameters
     ----------
-    model        : cVAE instance.
-    dataloader   : DataLoader yielding (x, p) batches.
-    treat_effect : AnnData with ground-truth ATEs used for validation.
-    lr           : Adam learning rate.
-    num_epochs   : maximum training epochs.
-    validate_every : epoch interval between validation passes.
-    patience     : early-stopping patience (epochs without ELBO improvement).
-    device       : torch device.
-    seed         : RNG seed.
-    """
-
-    def __init__(
-        self,
-        model,
-        dataloader: DataLoader,
-        treat_effect,
-        lr: float = 3e-4,
-        num_epochs: int = 200,
-        validate_every: int = 10,
-        patience: int = 30,
-        device: torch.device = torch.device("cpu"),
-        seed: int = 0,
-        non_blocking_copy: bool = True,
-        desc_name: str = "cVAE",
-    ):
-        self.model = model
-        self.dataloader = dataloader
-        self.treat_effect = treat_effect
-        self.num_epochs = int(num_epochs)
-        self.validate_every = max(1, int(validate_every))
-        self.patience = patience
-        self.non_blocking_copy = non_blocking_copy
-        self.desc_name = desc_name
-
-        self.device = device
-        self.model.to(self.device)
-
-        pyro.clear_param_store()
-        self.svi = SVI(self.model.model, self.model.guide, Adam({"lr": lr}), loss=Trace_ELBO())
-
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        if torch.cuda.is_available():
-            torch.backends.cudnn.benchmark = True
-
-        self._last_valid = dict(R2=float("nan"), ATE=float("nan"))
-        self.history: list[dict] = []
-
-    def _to_device(self, x, p):
-        nb = self.non_blocking_copy
-        return (
-            x.to(self.device, dtype=torch.float32, non_blocking=nb),
-            p.to(self.device, dtype=torch.long, non_blocking=nb),
-        )
-
-    def _validate(self, val_loader: DataLoader) -> dict:
-        self.model.eval()
-        preds_all, actuals_all, p_all = [], [], []
-
-        with torch.no_grad():
-            for x, p in val_loader:
-                x, p = self._to_device(x, p)
-                recon = self.model.get_recon(x, p)
-                preds_all.append(recon.cpu().numpy())
-                actuals_all.append(x.cpu().numpy())
-                p_all.append(p.cpu().numpy())
-
-        preds   = np.concatenate(preds_all,   axis=0)
-        actuals = np.concatenate(actuals_all, axis=0)
-        p_idx   = np.concatenate(p_all,       axis=0)
-
-        r2 = r2_score(actuals.ravel(), preds.ravel())
-
-        # ── ATE correlation ───────────────────────────────────────────
-        ate = float("nan")
-        ds = val_loader.dataset
-        idx2pert = ds.idx_to_pert()
-        ntc_idx  = ds.ntc_idx
-
-        def _lognorm(x):
-            lib = x.sum(axis=1, keepdims=True)
-            return np.log2(1e4 * x / np.clip(lib, 1e-8, None) + 1.0)
-
-        preds_ln = _lognorm(preds)
-        ntc_mask = p_idx == ntc_idx
-
-        if ntc_mask.sum() > 0:
-            ntc_mean = preds_ln[ntc_mask].mean(axis=0)
-            pred_effects: dict[str, np.ndarray] = {}
-            for pidx in np.unique(p_idx[~ntc_mask]):
-                name = idx2pert.get(int(pidx))
-                if name is None:
-                    continue
-                pred_effects[name] = preds_ln[p_idx == pidx].mean(axis=0) - ntc_mean
-
-            common_perts = [n for n in pred_effects if n in self.treat_effect.obs_names]
-            common_genes = [g for g in ds.var_names if g in self.treat_effect.var_names]
-
-            if len(common_perts) >= 2 and len(common_genes) >= 1:
-                te_df   = pd.DataFrame(
-                    self.treat_effect[common_perts, common_genes].X,
-                    index=common_perts, columns=common_genes,
-                )
-                pred_mat = np.stack(
-                    [pred_effects[n][[ds.var_names.index(g) for g in common_genes]]
-                     for n in common_perts],
-                    axis=0,
-                )
-                ate = pearsonr(pred_mat.ravel(), te_df.values.ravel())[0]
-
-        return {"r2": r2, "ate": ate}
-
-    def fit(self, val_loader: DataLoader | None = None) -> tuple:
-        """
-        Train the cVAE.
-
-        Parameters
-        ----------
-        val_loader : optional validation DataLoader; falls back to train loader.
-
-        Returns
-        -------
-        (best_model, best_param_store)
-        """
-        _val_loader = val_loader if val_loader is not None else self.dataloader
-        dataset_size = len(self.dataloader.dataset)
-
-        best_elbo = float("inf")
-        best_state = None
-        best_param_store = None
-        patience_counter = 0
-
-        epoch_bar = tqdm(range(1, self.num_epochs + 1), desc=self.desc_name, dynamic_ncols=True)
-
-        for epoch in epoch_bar:
-            self.model.train()
-            epoch_loss = 0.0
-
-            for x, p in self.dataloader:
-                x, p = self._to_device(x, p)
-                epoch_loss += self.svi.step(x, p)
-
-            avg_elbo = epoch_loss / dataset_size
-
-            if epoch % self.validate_every == 0:
-                stats = self._validate(_val_loader)
-                self._last_valid["R2"]  = stats["r2"]
-                self._last_valid["ATE"] = stats["ate"]
-
-            self.history.append(
-                {"epoch": epoch, "elbo": avg_elbo, **self._last_valid}
-            )
-
-            epoch_bar.set_postfix(
-                ELBO=f"{avg_elbo:.4f}",
-                R2=f"{self._last_valid['R2']:.4f}"
-                if not math.isnan(self._last_valid["R2"]) else "nan",
-                ATE=f"{self._last_valid['ATE']:.4f}"
-                if not math.isnan(self._last_valid["ATE"]) else "nan",
-            )
-
-            if avg_elbo < best_elbo or epoch < self.num_epochs // 4:
-                best_elbo = avg_elbo
-                best_state = copy.deepcopy(self.model)
-                best_param_store = copy.deepcopy(pyro.get_param_store().get_state())
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= self.patience:
-                    print(f"Early stopping at epoch {epoch} (best ELBO={best_elbo:.4f})")
-                    break
-
-        pyro.clear_param_store()
-        if best_param_store is not None:
-            pyro.get_param_store().set_state(best_param_store)
-        return best_state, best_param_store
-
-
-class sVAETrainer:
-    """
-    Trains an sVAE model using plain PyTorch Adam with KL warmup.
-
-    Matches the training protocol of Genentech/sVAE demo.py:
-    linear KL annealing from 0 → 1 over the first n_epochs_kl_warmup epochs,
-    then full KL weight. No Pyro — calls model.loss(x, p, kl_weight, n_obs)
-    directly.
-
-    Parameters
-    ----------
-    model              : sVAE instance.
+    model              : cVAE instance.
     dataloader         : DataLoader yielding (x, p) batches.
-    treat_effect       : AnnData with ground-truth ATEs for validation.
+    treat_effect       : AnnData with ground-truth ATEs used for validation.
     lr                 : Adam learning rate.
     num_epochs         : maximum training epochs.
     validate_every     : epoch interval between validation passes.
     patience           : early-stopping patience (epochs without loss improvement).
-    n_epochs_kl_warmup : epochs over which KL weight ramps 0 → 1 (default 50).
+    n_epochs_kl_warmup : epochs over which KL weight ramps 0 → 1.
     device             : torch device.
     seed               : RNG seed.
     """
@@ -513,19 +286,21 @@ class sVAETrainer:
         model,
         dataloader: DataLoader,
         treat_effect,
+        adata=None,
         lr: float = 3e-4,
         num_epochs: int = 200,
         validate_every: int = 10,
         patience: int = 30,
         n_epochs_kl_warmup: int = 50,
         device: torch.device = torch.device("cpu"),
-        seed: int = 0,
+        seed: int | None = None,
         non_blocking_copy: bool = True,
-        desc_name: str = "sVAE",
+        desc_name: str = "cVAE",
     ):
         self.model = model
         self.dataloader = dataloader
         self.treat_effect = treat_effect
+        self.adata = adata
         self.num_epochs = int(num_epochs)
         self.validate_every = max(1, int(validate_every))
         self.patience = patience
@@ -539,8 +314,9 @@ class sVAETrainer:
 
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-        torch.manual_seed(seed)
-        np.random.seed(seed)
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
         if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
 
@@ -576,40 +352,179 @@ class sVAETrainer:
         r2 = r2_score(actuals.ravel(), preds.ravel())
 
         ate = float("nan")
-        ds = val_loader.dataset
-        idx2pert = ds.idx_to_pert()
-        ntc_idx  = ds.ntc_idx
+        if self.adata is not None:
+            cf = self.model.predict_counterfactual_effects(
+                self.adata,
+                observed_effect=self.treat_effect,
+                device=self.device,
+            )
+            ate = float(cf.get("corr", float("nan")))
 
-        def _lognorm(x):
-            lib = x.sum(axis=1, keepdims=True)
-            return np.log2(1e4 * x / np.clip(lib, 1e-8, None) + 1.0)
+        return {"r2": r2, "ate": ate}
 
-        preds_ln = _lognorm(preds)
-        ntc_mask = p_idx == ntc_idx
+    def fit(self, val_loader: DataLoader | None = None) -> tuple:
+        """
+        Train the cVAE.
 
-        if ntc_mask.sum() > 0:
-            ntc_mean = preds_ln[ntc_mask].mean(axis=0)
-            pred_effects: dict[str, np.ndarray] = {}
-            for pidx in np.unique(p_idx[~ntc_mask]):
-                name = idx2pert.get(int(pidx))
-                if name is None:
-                    continue
-                pred_effects[name] = preds_ln[p_idx == pidx].mean(axis=0) - ntc_mean
+        Returns
+        -------
+        (best_model, None)  — None in place of Pyro param store.
+        """
+        _val_loader = val_loader if val_loader is not None else self.dataloader
 
-            common_perts = [n for n in pred_effects if n in self.treat_effect.obs_names]
-            common_genes = [g for g in ds.var_names if g in self.treat_effect.var_names]
+        best_loss = float("inf")
+        best_state = None
+        patience_counter = 0
 
-            if len(common_perts) >= 2 and len(common_genes) >= 1:
-                te_df = pd.DataFrame(
-                    self.treat_effect[common_perts, common_genes].X,
-                    index=common_perts, columns=common_genes,
-                )
-                pred_mat = np.stack(
-                    [pred_effects[n][[ds.var_names.index(g) for g in common_genes]]
-                     for n in common_perts],
-                    axis=0,
-                )
-                ate = pearsonr(pred_mat.ravel(), te_df.values.ravel())[0]
+        epoch_bar = tqdm(range(1, self.num_epochs + 1), desc=self.desc_name, dynamic_ncols=True)
+
+        for epoch in epoch_bar:
+            self.model.train()
+            kl_weight = self._kl_weight(epoch)
+            epoch_loss = 0.0
+
+            for x, p in self.dataloader:
+                x, p = self._to_device(x, p)
+                self.optimizer.zero_grad()
+                loss = self.model.loss(x, p, kl_weight=kl_weight, n_obs=self.n_obs)
+                loss.backward()
+                self.optimizer.step()
+                epoch_loss += loss.item()
+
+            avg_loss = epoch_loss / len(self.dataloader)
+
+            if epoch % self.validate_every == 0:
+                stats = self._validate(_val_loader)
+                self._last_valid["R2"]  = stats["r2"]
+                self._last_valid["ATE"] = stats["ate"]
+
+            self.history.append(
+                {"epoch": epoch, "loss": avg_loss, **self._last_valid}
+            )
+
+            epoch_bar.set_postfix(
+                loss=f"{avg_loss:.4f}",
+                KLw=f"{kl_weight:.2f}",
+                R2=f"{self._last_valid['R2']:.4f}"
+                if not math.isnan(self._last_valid["R2"]) else "nan",
+                ATE=f"{self._last_valid['ATE']:.4f}"
+                if not math.isnan(self._last_valid["ATE"]) else "nan",
+            )
+
+            if avg_loss < best_loss or epoch < self.num_epochs // 4:
+                best_loss = avg_loss
+                best_state = copy.deepcopy(self.model)
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    print(f"Early stopping at epoch {epoch} (best loss={best_loss:.4f})")
+                    break
+
+        return best_state, None
+
+
+class sVAETrainer:
+    """
+    Trains an sVAE model using plain PyTorch Adam with KL warmup.
+
+    Matches the training protocol of Genentech/sVAE demo.py:
+    linear KL annealing from 0 → 1 over the first n_epochs_kl_warmup epochs,
+    then full KL weight. No Pyro — calls model.loss(x, p, kl_weight, n_obs)
+    directly.
+
+    Parameters
+    ----------
+    model              : sVAE instance.
+    dataloader         : DataLoader yielding (x, p) batches.
+    treat_effect       : AnnData with ground-truth ATEs for validation.
+    lr                 : Adam learning rate.
+    num_epochs         : maximum training epochs.
+    validate_every     : epoch interval between validation passes.
+    patience           : early-stopping patience (epochs without loss improvement).
+    n_epochs_kl_warmup : epochs over which KL weight ramps 0 → 1 (default 50).
+    device             : torch device.
+    seed               : RNG seed.
+    """
+
+    def __init__(
+        self,
+        model,
+        dataloader: DataLoader,
+        treat_effect,
+        adata=None,
+        lr: float = 3e-4,
+        num_epochs: int = 200,
+        validate_every: int = 10,
+        patience: int = 30,
+        n_epochs_kl_warmup: int = 50,
+        device: torch.device = torch.device("cpu"),
+        seed: int | None = None,
+        non_blocking_copy: bool = True,
+        desc_name: str = "sVAE",
+    ):
+        self.model = model
+        self.dataloader = dataloader
+        self.treat_effect = treat_effect
+        self.adata = adata
+        self.num_epochs = int(num_epochs)
+        self.validate_every = max(1, int(validate_every))
+        self.patience = patience
+        self.n_epochs_kl_warmup = max(1, int(n_epochs_kl_warmup))
+        self.n_obs = len(dataloader.dataset)
+        self.non_blocking_copy = non_blocking_copy
+        self.desc_name = desc_name
+
+        self.device = device
+        self.model.to(self.device)
+
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+
+        self._last_valid = dict(R2=float("nan"), ATE=float("nan"))
+        self.history: list[dict] = []
+
+    def _kl_weight(self, epoch: int) -> float:
+        return min(1.0, epoch / self.n_epochs_kl_warmup)
+
+    def _to_device(self, x, p):
+        nb = self.non_blocking_copy
+        return (
+            x.to(self.device, dtype=torch.float32, non_blocking=nb),
+            p.to(self.device, dtype=torch.long, non_blocking=nb),
+        )
+
+    def _validate(self, val_loader: DataLoader) -> dict:
+        self.model.eval()
+        preds_all, actuals_all, p_all = [], [], []
+
+        with torch.no_grad():
+            for x, p in val_loader:
+                x, p = self._to_device(x, p)
+                recon = self.model.get_recon(x, p)
+                preds_all.append(recon.cpu().numpy())
+                actuals_all.append(x.cpu().numpy())
+                p_all.append(p.cpu().numpy())
+
+        preds   = np.concatenate(preds_all,   axis=0)
+        actuals = np.concatenate(actuals_all, axis=0)
+        p_idx   = np.concatenate(p_all,       axis=0)
+
+        r2 = r2_score(actuals.ravel(), preds.ravel())
+
+        ate = float("nan")
+        if self.adata is not None:
+            cf = self.model.predict_counterfactual_effects(
+                self.adata,
+                observed_effect=self.treat_effect,
+                device=self.device,
+            )
+            ate = float(cf.get("corr", float("nan")))
 
         return {"r2": r2, "ate": ate}
 

@@ -1,60 +1,83 @@
 import torch
-import pyro
 from pathlib import Path
 
-def save_results(results, path: str) -> None:
-    """
-    Save everything needed to reconstruct and load a VAE from just `path`.
-    Stores:
-      - constructor args (input_dim, latent_dim, perturbs, conds, tau, reg weights, etc.)
-      - model state_dict
-    """
-    
-    model = results['model']
+_CLASS_REGISTRY = {}
 
-    ctor = {
-        "input_dim":  model.input_dim,
-        "latent_dim": model.latent_dim,
-        "perturbs":   model.perturbs,
-        "conds":      model.conds,
-        "use_conditions": bool(model.use_conditions),
-        "rank":       model.rank,
-        "shift":     model.shift,
-    }
+
+def _register(cls):
+    _CLASS_REGISTRY[cls.__name__] = cls
+    return cls
+
+
+def _get_class(name: str):
+    if name not in _CLASS_REGISTRY:
+        if name == "VAE":
+            from ._models import VAE
+            _CLASS_REGISTRY["VAE"] = VAE
+        elif name == "sVAE":
+            from ._svae import sVAE
+            _CLASS_REGISTRY["sVAE"] = sVAE
+        elif name == "cVAE":
+            from ._cvae import cVAE
+            _CLASS_REGISTRY["cVAE"] = cVAE
+        else:
+            raise ValueError(f"Unknown model class: {name!r}")
+    return _CLASS_REGISTRY[name]
+
+
+def save_results(results, path: str, model=None, param_store=None) -> None:
+    """
+    Save a trained model checkpoint to *path*.
+
+    Works for any PerturbModelBase subclass that implements checkpoint_ctor_args().
+    For Pyro-based models (VAE), pass param_store in the results dict or as a kwarg.
+    For plain-PyTorch models (sVAE), param_store is not required.
+    """
+    if results is None:
+        if model is None:
+            raise ValueError("If 'results' is not provided, 'model' must be given.")
+        results = {"model": model}
+        if param_store is not None:
+            results["param_store"] = param_store
+
+    model = results["model"]
 
     payload = {
-        "class": "VAE",
-        "ctor": ctor,
+        "class":      type(model).__name__,
+        "ctor":       model.checkpoint_ctor_args(),
         "state_dict": model.state_dict(),
-        "meta": {"torch": torch.__version__},
-        "pyro_param_store": results['param_store'],
+        "meta":       {"torch": torch.__version__},
     }
 
-    payload["pyro_param_store"] = results['param_store']
+    if results.get("param_store") is not None:
+        payload["pyro_param_store"] = results["param_store"]
 
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-
     torch.save(payload, path)
 
 
 def load_results(path: str):
     """
-    Load a VAE from a checkpoint saved with `save_results`, returning the constructed model.
+    Load a model checkpoint saved with save_results, returning the constructed model.
     """
     ckpt = torch.load(path, weights_only=False)
 
     if "ctor" not in ckpt or "state_dict" not in ckpt:
         raise ValueError("Checkpoint is missing required fields ('ctor', 'state_dict').")
 
-    try:
-        from ._models import VAE  
-    except Exception:
-        assert False, "Could not import VAE model class from ._models."
+    class_name = ckpt.get("class", "VAE")
+    cls = _get_class(class_name)
 
-    model = VAE(**ckpt["ctor"], tau=0.5)  # tau is dummy if not used
+    extra_kwargs = {}
+    if class_name == "VAE":
+        extra_kwargs["tau"] = 0.5  # dummy; not stored but required by ctor
+
+    model = cls(**ckpt["ctor"], **extra_kwargs)
     model.load_state_dict(ckpt["state_dict"])
 
-    pyro.get_param_store().set_state(ckpt["pyro_param_store"])
+    if "pyro_param_store" in ckpt:
+        import pyro
+        pyro.get_param_store().set_state(ckpt["pyro_param_store"])
 
     return model

@@ -207,7 +207,7 @@ class VAE(PerturbModelBase):
     @torch.no_grad()
     def _get_cov(self):
         L = self.qr().detach()
-        sigma_P = pyro.param("sigma_fac").detach()
+        sigma_P = pyro.param("sigma_fac").detach().to(L.device)
         P_ = L.size(0)
         eyeP = torch.eye(P_, dtype=L.dtype, device=L.device)
         Sigma_P = L @ L.T + (sigma_P**2) * eyeP
@@ -312,7 +312,7 @@ class VAE(PerturbModelBase):
             )
 
             # gated perturbation shift (no condition branch)
-            z0_loc_mod = z0_loc #* (1.0 - W[p])
+            z0_loc_mod = z0_loc * (1.0 - W[p])
             
             lin_shift = A[p] * W[p]
             if len(lin_shift.shape) != 2: #p == -1 is no perturbation.
@@ -441,40 +441,21 @@ class VAE(PerturbModelBase):
         mu_from = self.c_emb_mu(c_from)
         mu_to = self.c_emb_mu(c_to)
         return z0 + (mu_to - mu_from)
-    
-    @torch.no_grad()
-    def latent_counterfactual(self, x_ntc, x_p, p, c_from=None, c_to=None):
-        """
-        q(z | z0_cf, p)
-        """
-        device = x_p.device
-        z0_hat = self._abduct_z0(x_ntc)
-        z0_cf = self._do_shift_z0(z0_hat, c_from=c_from, c_to=c_to)
-
-        self.eval()
-        L = self.qr()
-        sigma = pyro.param("sigma_fac").detach().to(x_ntc.device)
-        row_cov = L @ L.T + sigma.pow(2) * torch.eye(self.perturbs, device=device)
-        chol_P = torch.linalg.cholesky(row_cov)
-        q_rho_mean = self.rho_enc(self.p_emb.weight).detach()
-        A = chol_P @ q_rho_mean
-
-        W = self.gate(deterministic=True)
-        pert_shift = A[p] * W[p]
-        z0_cf_masked = z0_cf * (1. - W[p])
-
-        if self.shift == 'poe':
-            z_loc_cf, _ = self.__poe(z0_cf_masked, torch.ones_like(z0_cf_masked), pert_shift)
-        elif self.shift == 'linear':
-            z_loc_cf = z0_cf_masked + pert_shift
-        else:
-            raise ValueError("Invalid shift type")
-
-        return z_loc_cf
 
     # ------------------------------ PerturbModelBase interface ----------------------------- #
 
     @torch.no_grad()
+    def checkpoint_ctor_args(self) -> dict:
+        return {
+            "input_dim":      self.input_dim,
+            "latent_dim":     self.latent_dim,
+            "perturbs":       self.perturbs,
+            "conds":          self.conds,
+            "use_conditions": bool(self.use_conditions),
+            "rank":           self.rank,
+            "shift":          self.shift,
+        }
+
     def get_z(self, x: torch.Tensor, p: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
         """
         Mean of q(z | x_p).
@@ -497,6 +478,63 @@ class VAE(PerturbModelBase):
         mu_prob = F.softmax(logits_gene, dim=-1)
         library = x.sum(dim=-1, keepdim=True)
         return library * mu_prob
+
+    def _get_rho_embed(
+        self,
+        pert_indices: np.ndarray,
+        z: np.ndarray,
+        p_indices: np.ndarray,
+        all_perts: np.ndarray,
+    ) -> np.ndarray:
+        """
+        A*W action embeddings for the selected perturbations.
+
+        PerturbSimpleDataset sorts non-NTC perts alphabetically, matching
+        VAE's internal row order (0..P-1).  We recover VAE rows by ranking
+        pert_indices among all non-NTC global indices.
+        """
+        from .._configs import get_config
+        ntc_label    = get_config("ntc_label")
+        all_non_ntc  = np.where(all_perts != ntc_label)[0]
+        vae_rows     = np.searchsorted(all_non_ntc, pert_indices)
+
+        Sigma_P = self._get_cov().cpu()
+        q_rho   = self.rho_enc(self.p_emb.weight).detach().cpu()   # (P_vae, d)
+        chol_P  = torch.linalg.cholesky(Sigma_P.to(q_rho.dtype))
+        A       = (chol_P @ q_rho).detach().numpy()                 # (P_vae, d)
+        W       = self.gate(deterministic=True).detach().cpu().numpy()
+        return (A * W)[vae_rows].astype(np.float32)
+
+    # ── counterfactual hooks (PerturbModelBase interface) ─────────────────────
+
+    @torch.no_grad()
+    def _abduct_ntc(self, x_ntc: torch.Tensor) -> torch.Tensor:
+        return self._abduct_z0(x_ntc)
+
+    @torch.no_grad()
+    def _get_all_pert_shifts(self, device: torch.device) -> torch.Tensor:
+        """Cholesky + gate computed once; returns A*W of shape (P, d)."""
+        L      = self.qr().detach().to(device)
+        sigma  = pyro.param("sigma_fac").detach().to(device)
+        chol_P = torch.linalg.cholesky(L @ L.T + sigma ** 2 * torch.eye(self.perturbs, device=device))
+        A = chol_P @ self.rho_enc(self.p_emb.weight).detach()
+        W = self.gate(deterministic=True).detach()
+        return A * W
+
+    @torch.no_grad()
+    def _apply_shift(self, u: torch.Tensor, m_p: torch.Tensor) -> torch.Tensor:
+        """Apply perturbation shift via PoE or linear, matching the training objective."""
+        if self.shift == "poe":
+            # z0_loc_mod = z0_loc * (1-W); for use_conditions=False z0_loc=0 so prior is N(0,1)
+            z0_prior = u if self.use_conditions else torch.zeros_like(u)
+            z, _ = self.__poe(z0_prior, torch.ones_like(u), m_p)
+            return z
+
+        return (u if self.use_conditions else torch.zeros_like(u)) + m_p
+
+    @torch.no_grad()
+    def _decode_to_expr(self, z: torch.Tensor, lib_size: float) -> torch.Tensor:
+        return lib_size * torch.softmax(self.z_decoder(z), dim=-1)
 
     # ------------------------------ PerturbModelBase overrides ---------------------------- #
 
@@ -556,45 +594,24 @@ class VAE(PerturbModelBase):
         if n_cells < 2:
             return np.zeros((num_p, G), dtype=np.float32)
 
-        # --- work on log-normalized scale for the denominator ---
         lib = x_ntc.sum(dim=1, keepdim=True) + 1e-8
-        x_ntc_norm = torch.log1p(x_ntc / lib * 1e4)  # e.g. CPM then log1p
-        var_total = x_ntc_norm.var(dim=0, unbiased=True)  # (G,)
+        var_total = torch.log1p(x_ntc / lib * 1e4).var(dim=0, unbiased=True)  # (G,)
 
-        # abduct z0
-        z0_hat = self._abduct_z0(x_ntc)  # (n_cells, d)
-        lib_ntc = x_ntc.sum(dim=1, keepdim=True)  # (n_cells, 1)
+        # abduct backgrounds and shifts once — no repeated Cholesky or re-encoding
+        u_ntc  = self._abduct_ntc(x_ntc)            # (n_cells, d)
+        shifts = self._get_all_pert_shifts(device)   # (P, d)
 
-        logits0 = self.z_decoder(z0_hat)
-        mu_prob0 = F.softmax(logits0, dim=-1)
-        mu0 = lib_ntc * mu_prob0                 # (n_cells, G)
+        probs0   = self._decode_to_expr(u_ntc, 1.0)    # (n_cells, G) — proportions
+        mu0_norm = torch.log1p(probs0 * 1e4)
 
         ev_pg = torch.zeros(num_p, G, device=device, dtype=torch.float32)
-        cond_idx_long = torch.tensor(int(cond_idx), dtype=torch.long, device=device)
-
         for p_idx in range(num_p):
-            p_vec = torch.full((n_cells,), p_idx, dtype=torch.long, device=device)
-
-            z_cf = self.latent_counterfactual(
-                x_ntc=x_ntc,
-                x_p=x_ntc,
-                p=p_vec,
-                c_from=cond_idx_long,
-                c_to=cond_idx_long,
-            )
-
-            logits1 = self.z_decoder(z_cf)
-            mu_prob1 = F.softmax(logits1, dim=-1)
-            mu1 = lib_ntc * mu_prob1
-
-            # log-normalize the predicted means to match denominator scale
-            mu0_norm = torch.log1p(mu0 / lib_ntc * 1e4)
-            mu1_norm = torch.log1p(mu1 / lib_ntc * 1e4)
-
-            delta = mu1_norm - mu0_norm               # (n_cells, G)
-
-            mean_shift = delta.mean(dim=0)
+            z_cf     = self._apply_shift(u_ntc, shifts[[p_idx]])    # (n_cells, d)
+            probs1   = self._decode_to_expr(z_cf, 1.0)              # (n_cells, G)
+            mu1_norm = torch.log1p(probs1 * 1e4)
+            mean_shift = (mu1_norm - mu0_norm).mean(dim=0)
             ev_pg[p_idx] = mean_shift.pow(2) / (var_total + 1e-8)
+
         return ev_pg.cpu().numpy().astype(np.float32)
     
     @staticmethod
@@ -685,12 +702,18 @@ class VAE(PerturbModelBase):
         y_true   = torch.as_tensor(true_idx, dtype=torch.long, device=device)
         result["acc"] = (self.cls_head(z).argmax(dim=-1) == y_true).float().mean().item()
 
-        # ── rho_corr from learned covariance ─────────────────────────
+        # ── rho_corr from learned covariance + A*W embed ─────────────
         L        = self.qr().cpu()
         sigma_P  = pyro.param("sigma_fac").cpu().detach()
         Sigma_P  = L @ L.T + sigma_P ** 2 * torch.eye(L.size(0))
         rho_corr = self._corr(Sigma_P).numpy()
         result["rho_corr"] = rho_corr
+
+        q_rho  = self.rho_enc(self.p_emb.weight).detach().cpu()
+        chol_P = torch.linalg.cholesky(Sigma_P.to(q_rho.dtype))
+        A      = (chol_P @ q_rho).detach().numpy()
+        W_np   = self.gate(deterministic=True).detach().cpu().numpy()
+        result["rho_embed"] = (A * W_np).astype(np.float32)
 
         # ── pseudobulk z_corr for non-NTC cells (matches rho_corr dims) ─
         num_p      = self.perturbs

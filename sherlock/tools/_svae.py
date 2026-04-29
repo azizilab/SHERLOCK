@@ -124,17 +124,21 @@ class sVAE(PerturbModelBase):
         beta: float = 1.0,
     ):
         super().__init__()
+        self.input_dim = input_dim
         self.n_latent = latent_dim
         self.n_perturbs = n_perturbs
+        self.n_hidden = n_hidden
+        self.n_layers = n_layers
+        self.dropout_rate = dropout_rate
         self.sparse_mask_penalty = sparse_mask_penalty
         self.beta = beta
         self.warmup = True
         self.use_global_kl = True
-        self.use_chem_prior = True
 
         self.px_r = nn.Parameter(torch.randn(input_dim))
 
-        # z encoder: n_input → n_latent (no batch/covariate conditioning)
+        # u encoder: q(U | x). The perturbation mechanism is applied after
+        # abduction through z = U + m_A, where m_A = gamma_A * mu_A.
         self.z_encoder = Encoder(
             input_dim,
             latent_dim,
@@ -173,30 +177,79 @@ class sVAE(PerturbModelBase):
         # q_a — GumbelSigmoid binary mask
         self.gumbel_action = GumbelSigmoid(num_action=n_perturbs, num_latent=latent_dim)
 
+    def get_prior_shift(self, p: torch.Tensor, hard: bool = False) -> torch.Tensor:
+        """
+        Return sparse mechanism shift m_A = gamma_A * mu_A.
+
+        p >= 0 indexes real perturbations.
+        p < 0 is treated as NTC/control and receives zero shift.
+
+        Parameters
+        ----------
+        p    : (B,) integer perturbation indices
+        hard : if True, use thresholded mask; otherwise use sampled relaxed/hard
+            straight-through GumbelSigmoid during training.
+
+        Returns
+        -------
+        shift : (B, d)
+        """
+        shift = torch.zeros(
+            p.shape[0],
+            self.n_latent,
+            dtype=self.action_prior_mean.dtype,
+            device=p.device,
+        )
+
+        valid = p >= 0
+        if valid.any():
+            p_valid = p[valid]
+            mean = self.action_prior_mean[p_valid]
+
+            if hard:
+                proba = self.gumbel_action.get_proba().to(p.device)
+                mask = (proba[p_valid] > 0.5).to(mean.dtype)
+            else:
+                mask = self.gumbel_action(p_valid)
+
+            shift[valid] = mean * mask
+
+        return shift
+
     # ── forward methods (matching SpikeSlabVAEModule) ─────────────────────────
 
-    def inference(self, x: torch.Tensor) -> dict:
-        """Encoder — matches SpikeSlabVAEModule.inference()."""
-        library = torch.log(x.sum(1)).unsqueeze(1)
-        x_ = torch.log(1 + x)
-        qz, z = self.z_encoder(x_)
-        return dict(z=z, qz=qz, library=library)
+    def inference(self, x: torch.Tensor, p: torch.Tensor) -> dict:
+        """
+        Minimal counterfactual extension of sVAE+.
 
-    def generative(self, z: torch.Tensor, library: torch.Tensor, p: torch.Tensor) -> dict:
-        """Generative model — matches SpikeSlabVAEModule.generative()."""
+        Encoder infers q(U | x). The perturbation-affected latent is then
+            z = U + m_A,
+        where m_A = gamma_A * mu_A is the sparse mechanism shift.
+        """
+        library = torch.log(x.sum(1).clamp_min(1e-8)).unsqueeze(1)
+        x_ = torch.log1p(x)
+
+        qu, u = self.z_encoder(x_)          # q(U | x)
+        shift = self.get_prior_shift(p)     # m_A
+        z = u + shift                       # endogenous latent state
+
+        return dict(
+            u=u,
+            qu=qu,
+            z=z,
+            shift=shift,
+            library=library,
+        )
+
+    def generative(self, z: torch.Tensor, library: torch.Tensor) -> dict:
+        """
+        Decode perturbation-affected latent z = U + m_A.
+        """
         px_scale, _, px_rate, _ = self.decoder("gene", z, library)
         px_r = torch.exp(self.px_r)
         px = NegativeBinomial(mu=px_rate, theta=px_r, scale=px_scale)
 
-        # Priors
-        mask = self.gumbel_action(p)
-        mean_z = torch.index_select(self.action_prior_mean, 0, p)
-        if self.use_chem_prior:
-            pz = Normal(mean_z * mask, torch.ones_like(z))
-        else:
-            pz = Normal(torch.zeros_like(z), torch.ones_like(z))
-
-        return dict(px=px, pz=pz)
+        return dict(px=px)
 
     def loss(
         self,
@@ -215,20 +268,21 @@ class sVAE(PerturbModelBase):
         kl_weight : KL annealing weight (1.0 = fully on)
         n_obs     : total dataset size for loss scaling (scVI convention)
         """
-        inf = self.inference(x)
-        gen = self.generative(inf["z"], inf["library"], p)
+        inf = self.inference(x, p)
+        gen = self.generative(inf["z"], inf["library"])
 
-        kl_divergence_z = kl(inf["qz"], gen["pz"]).sum(dim=1)
+        pu = Normal(torch.zeros_like(inf["u"]), torch.ones_like(inf["u"]))
+        kl_divergence_u = kl(inf["qu"], pu).sum(dim=1)
         kl_divergence_l = 0.0
 
         reconst_loss = -gen["px"].log_prob(x).sum(-1)
 
         if self.warmup:
             weighted_kl_local = (
-                self.beta * kl_weight * kl_divergence_z + kl_divergence_l
+                self.beta * kl_weight * kl_divergence_u + kl_divergence_l
             )
         else:
-            weighted_kl_local = kl_divergence_z + kl_divergence_l
+            weighted_kl_local = kl_divergence_u + kl_divergence_l
 
         q_discrete = self.gumbel_action.get_proba()
         prior_w = torch.ones_like(self.action_prior_logit_weight)
@@ -275,71 +329,98 @@ class sVAE(PerturbModelBase):
             self.gumbel_action.log_alpha[loc] = 5
         self.gumbel_action.threshold()
 
+    def checkpoint_ctor_args(self) -> dict:
+        return {
+            "input_dim":           self.input_dim,
+            "n_perturbs":          self.n_perturbs,
+            "latent_dim":          self.n_latent,
+            "n_hidden":            self.n_hidden,
+            "n_layers":            self.n_layers,
+            "dropout_rate":        self.dropout_rate,
+            "sparse_mask_penalty": self.sparse_mask_penalty,
+            "beta":                self.beta,
+        }
+
     # ── PerturbModelBase interface ────────────────────────────────────────────
+
+    def _get_rho_embed(
+        self,
+        pert_indices: "np.ndarray",
+        z: "np.ndarray",
+        p_indices: "np.ndarray",
+        all_perts: "np.ndarray",
+    ) -> "np.ndarray":
+        """action_prior_mean * binarized_mask for the selected perturbations."""
+        proba     = self.gumbel_action.get_proba().detach().cpu()
+        hard_mask = (proba > 0.5).to(proba.dtype)
+        means     = self.action_prior_mean.detach().cpu()
+        eff       = (means * hard_mask).numpy()          # (P_all, d)
+        return eff[pert_indices].astype(np.float32)
 
     @torch.no_grad()
     def get_z(self, x: torch.Tensor, p: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
-        """Posterior mean μ_z from the encoder (perturbation-agnostic)."""
-        x_ = torch.log(1 + x)
-        qz, _ = self.z_encoder(x_)
-        return qz.loc
+        """
+        If p is None, return inferred background U = E[q(U | x)].
+
+        If p is given, return perturbation-affected latent z = U + m_p.
+        """
+        x_ = torch.log1p(x)
+        qu, _ = self.z_encoder(x_)
+        u = qu.loc
+
+        if p is None:
+            return u
+
+        shift = self.get_prior_shift(p, hard=True)
+        return u + shift
 
     @torch.no_grad()
     def get_recon(self, x: torch.Tensor, p: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
         """Decode posterior mean z → expected NB counts."""
-        x_ = torch.log(1 + x)
-        library = torch.log(x.sum(1)).unsqueeze(1)
-        qz, _ = self.z_encoder(x_)
-        _, _, px_rate, _ = self.decoder("gene", qz.loc, library)
+        library = torch.log(x.sum(1).clamp_min(1e-8)).unsqueeze(1)
+        z = self.get_z(x, p)
+        _, _, px_rate, _ = self.decoder("gene", z, library)
         return px_rate
+    
+    # ── counterfactual hooks (PerturbModelBase interface) ─────────────────────
+    @torch.no_grad()
+    def _abduct_ntc(self, x_ntc: torch.Tensor) -> torch.Tensor:
+        """
+        Abduct NTC backgrounds U_i = E[q(U | x_i^NTC)].
+        """
+        return self.get_z(x_ntc, p=None)
+
 
     @torch.no_grad()
-    def _eval(self, adata, obsm_key: str, device: torch.device) -> dict:
-        from ._datasets import PerturbSimpleDataset
-        from .._configs import get_config
+    def _get_all_pert_shifts(self, device: torch.device) -> torch.Tensor:
+        """
+        Return deterministic sparse mechanism shifts m_p = gamma_p * mu_p
+        for all non-NTC perturbations.
 
-        p_key     = get_config("pert_key")
-        ntc_label = get_config("ntc_label")
+        Shape: (n_perturbs, d)
 
-        dataset      = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label)
-        idx_to_pert  = dataset.idx_to_pert()
-        ntc_idx      = dataset.ntc_idx
+        NTC/control is represented by p < 0 and has zero shift, so it is not
+        included as a separate row here.
+        """
+        means = self.action_prior_mean.detach().to(device)
+        proba = self.gumbel_action.get_proba().detach().to(device)
 
-        # Strict hard-mask evaluation to avoid soft-gating inflation.ß.
-        proba = self.gumbel_action.get_proba().detach().cpu()              # (P_all, d)
-        hard_mask = (proba > 0.45).to(proba.dtype)                          # (P_all, d)
-        means = self.action_prior_mean.detach().cpu()                      # (P_all, d)
-        eff = means * hard_mask                                            # (P_all, d)
+        hard_mask = (proba > 0.5).to(means.dtype)
+        shifts = means * hard_mask
 
-        # keep only non-NTC rows, in dataset index order
-        non_ntc_items = sorted((i, n) for i, n in idx_to_pert.items() if i != ntc_idx)
-        non_ntc_idx   = [i for i, _ in non_ntc_items]
-        non_ntc_names = [n for _, n in non_ntc_items]
+        return shifts
 
-        eff_non_ntc = eff[non_ntc_idx].numpy()                             # (P, d)
-        P = eff_non_ntc.shape[0]
 
-        if P >= 2:
-            X = eff_non_ntc - eff_non_ntc.mean(axis=1, keepdims=True)
-            row_norm = np.linalg.norm(X, axis=1)
-            nz = row_norm > 1e-12
-
-            rho_corr = np.zeros((P, P), dtype=np.float32)
-            if int(nz.sum()) >= 2:
-                Xn = X[nz] / row_norm[nz][:, None]
-                Cnz = np.clip(Xn @ Xn.T, -1.0, 1.0).astype(np.float32)
-                nz_idx = np.where(nz)[0]
-                rho_corr[np.ix_(nz_idx, nz_idx)] = Cnz
-            np.fill_diagonal(rho_corr, 1.0)
-            rho_perts = np.array(non_ntc_names)
-        else:
-            rho_corr = np.empty((0, 0), dtype=np.float32)
-            rho_perts = np.array([], dtype=object)
-
-        return {
-            "rho_corr":  rho_corr,
-            "rho_perts": rho_perts,
-        }
+    @torch.no_grad()
+    def _decode_to_expr(self, z: torch.Tensor, lib_size: float) -> torch.Tensor:
+        lib_log = torch.full(
+            (z.shape[0], 1),
+            float(np.log(lib_size + 1e-8)),
+            dtype=z.dtype,
+            device=z.device,
+        )
+        _, _, px_rate, _ = self.decoder("gene", z, lib_log)
+        return px_rate
 
     @torch.no_grad()
     def get_mask(self, deterministic: bool = False) -> torch.Tensor:
@@ -350,7 +431,7 @@ class sVAE(PerturbModelBase):
         ----------
         deterministic : if True, return (proba > 0.5).float()
         """
-        proba = self.gumbel_action.get_proba()
+        proba = self.gumbel_action.get_proba().cpu()
         if deterministic:
             return (proba > 0.5).float()
         return proba
