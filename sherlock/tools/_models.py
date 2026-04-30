@@ -311,14 +311,16 @@ class VAE(PerturbModelBase):
                 infer={"scale": self.ntc_lambda},
             )
 
-            # gated perturbation shift (no condition branch)
-            z0_loc_mod = z0_loc * (1.0 - W[p])
-            
-            lin_shift = A[p] * W[p]
-            if len(lin_shift.shape) != 2: #p == -1 is no perturbation.
-                comb_mask = (p != -1).float().unsqueeze(-1)
+            # linear shift: z_loc = z0 + A[p] * W[p]; for combos, A[p] and W[p] are summed over the pert indices in the combo
+            if p.ndim != 1: #combinatorial
+                comb_mask = (p != -1).float().unsqueeze(-1) #TODO why is it not indexing W, was this processed earlier? BUG
+
+                z0_mod = z0 * (1.0 - comb_mask)
                 lin_shift = lin_shift * comb_mask
                 lin_shift = lin_shift.sum(dim=1)
+            else:
+                z0_mod = z0 * (1.0 - W[p])
+                lin_shift = A[p] * W[p]
 
             # synergy: always 0 for single perturbations; pair embedding for combos
             if self.use_synergy:
@@ -332,11 +334,12 @@ class VAE(PerturbModelBase):
                     syn_shift = syn[syn_idx.clamp(min=0)] * valid
 
             if self.shift == 'poe':
+                raise Exception("poe shift is currently disabled pending further tuning; use shift='linear' instead")
                 z_loc, z_var = self.__poe(z0_loc_mod, z0_scale, lin_shift)
                 z_loc = z_loc + syn_shift if self.use_synergy else z_loc
                 z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1))
             elif self.shift == 'linear':
-                z_loc = z0_loc_mod + lin_shift
+                z_loc = z0_mod + lin_shift
                 z_loc = z_loc + syn_shift if self.use_synergy else z_loc
                 z_std = pyro.param("z_var_scale", torch.ones_like(z_loc[0]), constraint=constraints.positive)
                 z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_std)).to_event(1))
@@ -432,15 +435,6 @@ class VAE(PerturbModelBase):
         x_ntc_n = torch.log1p(x_ntc / lib_ntc * med_ntc)
         z0_mu, _ = self.z0_encoder(x_ntc_n).chunk(2, dim=-1)
         return z0_mu
-    
-    @torch.no_grad()
-    def _do_shift_z0(self, z0, c_from=None, c_to=None):
-        """
-        p(z0_cf|z0_hat, do(c=c_to), c_from)
-        """
-        mu_from = self.c_emb_mu(c_from)
-        mu_to = self.c_emb_mu(c_to)
-        return z0 + (mu_to - mu_from)
 
     # ------------------------------ PerturbModelBase interface ----------------------------- #
 
@@ -519,18 +513,28 @@ class VAE(PerturbModelBase):
         chol_P = torch.linalg.cholesky(L @ L.T + sigma ** 2 * torch.eye(self.perturbs, device=device))
         A = chol_P @ self.rho_enc(self.p_emb.weight).detach()
         W = self.gate(deterministic=True).detach()
-        return A * W
+        return torch.stack([A * W, W], dim=1)  # (P, 2, d) for unpacking in _apply_shift
 
     @torch.no_grad()
     def _apply_shift(self, u: torch.Tensor, m_p: torch.Tensor) -> torch.Tensor:
+        """NOTE: m_p here is stacked (A*W, W) from _get_all_pert_shifts, not just A*W."""
         """Apply perturbation shift via PoE or linear, matching the training objective."""
+
+        #TODO fix poe, use combinatorial, incorporate synergy
+
+        m_p, w_p = m_p[:, 0, :], m_p[:, 1, :]  # unpack shift components
+
         if self.shift == "poe":
+            raise Exception("poe shift is currently disabled pending further tuning; use shift='linear' instead")
             # z0_loc_mod = z0_loc * (1-W); for use_conditions=False z0_loc=0 so prior is N(0,1)
             z0_prior = u if self.use_conditions else torch.zeros_like(u)
             z, _ = self.__poe(z0_prior, torch.ones_like(u), m_p)
             return z
-
-        return (u if self.use_conditions else torch.zeros_like(u)) + m_p
+        elif self.shift == "linear":
+            u_mod = u * (1.0 - w_p)
+            return u_mod + m_p
+            
+        raise ValueError("Invalid shift type")
 
     @torch.no_grad()
     def _decode_to_expr(self, z: torch.Tensor, lib_size: float) -> torch.Tensor:
@@ -544,6 +548,10 @@ class VAE(PerturbModelBase):
         Global-mednorm encoding — matches old eval_single behaviour where the
         median library size is computed over the entire dataset in one shot
         rather than per batch.
+
+        NTC cells are encoded via z0_encoder (as during training); perturbed
+        cells via z_encoder.  Both are stored together in the returned z array
+        so adata.obsm['z'] holds the correct encoder output per cell type.
         """
         from torch.utils.data import DataLoader
 
@@ -561,19 +569,26 @@ class VAE(PerturbModelBase):
         med = torch.median(lib_all).item()
         x_norm_all = torch.log1p(x_all / lib_all * med)
 
-        z_parts, recon_parts = [], []
-        for i in range(0, x_all.size(0), batch_size):
-            xb_norm = x_norm_all[i : i + batch_size]
-            lib_b   = lib_all[i : i + batch_size]
-            z_mu, _ = self.z_encoder(xb_norm).chunk(2, dim=-1)
-            logits   = self.z_decoder(z_mu)
-            mu_prob  = F.softmax(logits, dim=-1)
-            z_parts.append(z_mu.cpu().numpy())
-            recon_parts.append((lib_b * mu_prob).cpu().numpy())
+        N, G = x_all.shape
+        ntc_mask = (p_all == dataset.ntc_idx)  # True for NTC cells
+
+        z_out    = torch.empty(N, self.latent_dim)
+        recon_out = torch.empty(N, G)
+
+        for encoder, mask in [(self.z0_encoder, ntc_mask), (self.z_encoder, ~ntc_mask)]:
+            indices = mask.nonzero(as_tuple=True)[0]
+            for i in range(0, len(indices), batch_size):
+                idx_b  = indices[i : i + batch_size]
+                xb     = x_norm_all[idx_b]
+                lib_b  = lib_all[idx_b]
+                z_mu, _ = encoder(xb).chunk(2, dim=-1)
+                logits   = self.z_decoder(z_mu)
+                z_out[idx_b]    = z_mu.detach().cpu()
+                recon_out[idx_b] = (lib_b * F.softmax(logits, dim=-1)).detach().cpu()
 
         return (
-            np.concatenate(z_parts,     axis=0).astype(np.float32),
-            np.concatenate(recon_parts, axis=0).astype(np.float32),
+            z_out.numpy().astype(np.float32),
+            recon_out.numpy().astype(np.float32),
             p_all.numpy(),
         )
 
