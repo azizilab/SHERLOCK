@@ -229,9 +229,87 @@ def run(
 
         best_model, param_store = trainer.fit()
 
+    elif key == "contrastivevi":
+        from scvi.external import ContrastiveVI as _ScviContrastiveVI
+        from ._contrastivevi import ContrastiveVI as _SherlockContrastiveVI
+        from ._datasets import PerturbSimpleDataset
+
+        p_key     = get_config("pert_key")
+        ntc_label = get_config("ntc_label")
+
+        n_background_latent = kwargs.pop("n_background_latent", 10)
+        n_salient_latent    = kwargs.pop("n_salient_latent", 10)
+        n_hidden            = kwargs.pop("n_hidden", 128)
+        n_layers            = kwargs.pop("n_layers", 1)
+        dropout_rate        = kwargs.pop("dropout_rate", 0.1)
+        wasserstein_penalty = kwargs.pop("wasserstein_penalty", 0.0)
+        early_stopping      = kwargs.pop("early_stopping", True)
+        if kwargs:
+            raise TypeError(f"Unknown keyword(s) for ContrastiveVI run: {list(kwargs)}")
+
+        # Build PerturbSimpleDataset so pert indices align with PerturbModelBase eval.
+        # Store them as a float continuous covariate so scvi passes them through to
+        # loss() unmodified (categorical fields re-encode alphabetically, breaking
+        # alignment with PerturbSimpleDataset which assigns NTC=0 then alpha order).
+        ds = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label)
+        adata.obs["_sherlock_pert_idx"] = ds.P_indices.astype(np.float32)
+
+        _ScviContrastiveVI.setup_anndata(
+            adata, continuous_covariate_keys=["_sherlock_pert_idx"]
+        )
+        background_indices = np.where(adata.obs[p_key] == ntc_label)[0].tolist()
+        target_indices     = np.where(adata.obs[p_key] != ntc_label)[0].tolist()
+
+        # Create the scvi training wrapper to get n_batch / n_input from registration,
+        # then replace its standard ContrastiveVAE module with our combined class.
+        scvi_model = _ScviContrastiveVI(
+            adata,
+            n_hidden=n_hidden,
+            n_background_latent=n_background_latent,
+            n_salient_latent=n_salient_latent,
+            n_layers=n_layers,
+            dropout_rate=dropout_rate,
+            wasserstein_penalty=wasserstein_penalty,
+            use_observed_lib_size=True,
+        )
+        old = scvi_model.module
+        pert_module_kwargs = dict(
+            n_input=old.n_input,
+            n_batch=old.n_batch,
+            n_hidden=n_hidden,
+            n_background_latent=n_background_latent,
+            n_salient_latent=n_salient_latent,
+            n_layers=n_layers,
+            dropout_rate=dropout_rate,
+            use_observed_lib_size=True,
+            wasserstein_penalty=wasserstein_penalty,
+        )
+        if not old.use_observed_lib_size:
+            pert_module_kwargs["library_log_means"] = old.library_log_means.cpu().numpy()
+            pert_module_kwargs["library_log_vars"]  = old.library_log_vars.cpu().numpy()
+        best_model = _SherlockContrastiveVI(
+            n_perturbs=ds.n_perturbs, **pert_module_kwargs
+        )
+        scvi_model.module = best_model   # scvi trains this object in-place
+
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*Trying to infer the `batch_size`.*")
+            warnings.filterwarnings("ignore", message=".*does not have many workers.*")
+            scvi_model.train(
+                background_indices=background_indices,
+                target_indices=target_indices,
+                max_epochs=num_epochs,
+                batch_size=batch_size,
+                early_stopping=early_stopping,
+            )
+
+        # best_model IS scvi_model.module — the trained ContrastiveVI instance
+        param_store = None
+
     else:
         raise ValueError(
-            f"Unknown model '{model}'. Choose from ['vae', 'cvae', 'svae']."
+            f"Unknown model '{model}'. Choose from ['vae', 'cvae', 'svae', 'contrastivevi']."
         )
 
     return {"model": best_model, "param_store": param_store}

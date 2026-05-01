@@ -7,6 +7,6 @@ from ._datasets import PerturbMatchingDataset, PerturbSimpleDataset
 from ._models import VAE
 from ._cvae import cVAE
 from ._svae import sVAE
-from ._contrastivevi import ContrastiveVIWrapper
+from ._contrastivevi import ContrastiveVI as ContrastiveVIModel
 from ._trainers import VAETrainer, cVAETrainer, sVAETrainer
 from ._analysis import ev_sig, compute_cf_ate_metrics, compute_clustering_metrics, evaluate_model

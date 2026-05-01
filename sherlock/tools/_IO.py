@@ -4,11 +4,6 @@ from pathlib import Path
 _CLASS_REGISTRY = {}
 
 
-def _register(cls):
-    _CLASS_REGISTRY[cls.__name__] = cls
-    return cls
-
-
 def _get_class(name: str):
     if name not in _CLASS_REGISTRY:
         if name == "VAE":
@@ -67,8 +62,34 @@ def load_results(path: str):
         raise ValueError("Checkpoint is missing required fields ('ctor', 'state_dict').")
 
     class_name = ckpt.get("class", "VAE")
-    cls = _get_class(class_name)
 
+    # ── ContrastiveVI (current) and ContrastiveVIWrapper (legacy) ─────────────
+    if class_name in ("ContrastiveVI", "ContrastiveVIWrapper"):
+        from ._contrastivevi import ContrastiveVI
+
+        ctor = dict(ckpt["ctor"])
+        if "n_perturbs" not in ctor:
+            import warnings
+            warnings.warn(
+                "Loading a legacy ContrastiveVIWrapper checkpoint; "
+                "pert_mu / pert_log_var will not be available.",
+                UserWarning,
+                stacklevel=2,
+            )
+            sd = ckpt["state_dict"]
+            ctor["n_perturbs"] = sd["pert_mu"].shape[0] if "pert_mu" in sd else 1
+
+        model = ContrastiveVI(**ctor)
+        model.load_state_dict(ckpt["state_dict"])
+
+        if "pyro_param_store" in ckpt:
+            import pyro
+            pyro.get_param_store().set_state(ckpt["pyro_param_store"])
+
+        return model
+
+    # ── VAE / cVAE / sVAE ─────────────────────────────────────────────────────
+    cls = _get_class(class_name)
     extra_kwargs = {}
     if class_name == "VAE":
         extra_kwargs["tau"] = 0.5  # dummy; not stored but required by ctor
