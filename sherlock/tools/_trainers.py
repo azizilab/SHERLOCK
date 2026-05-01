@@ -29,6 +29,7 @@ class VAETrainer:
         tau_end: float = 0.10,
         tau_anneal_steps: int | None = None,
         patience: int = 20,
+        n_epochs_kl_warmup: int = 50,
     ):
         self.vae = vae
         self.dataloader = dataloader
@@ -60,6 +61,9 @@ class VAETrainer:
         self.global_step = 0
         self.vae.gate.set_temperature(self.tau_init)
 
+        # KL warmup schedule
+        self.n_epochs_kl_warmup = max(1, int(n_epochs_kl_warmup))
+
         # last validated metrics (persist between evals)
         self._last_valid = dict(
             CE=np.nan, acc=np.nan, R2_p=np.nan, R2_ntc=np.nan, ATE=np.nan, pi25=np.nan, pi99=np.nan
@@ -70,19 +74,23 @@ class VAETrainer:
     def _to_numpy(t: torch.Tensor) -> np.ndarray:
         return t.detach().cpu().numpy()
 
+    def _kl_weight(self, epoch: int) -> float:
+        return min(1.0, epoch / self.n_epochs_kl_warmup)
+
     def _current_tau(self, step) -> float:
         if self.tau_anneal_steps <= 0 or self.tau_init <= self.tau_end:
             return self.tau_end
         k = math.log(self.tau_init / self.tau_end) / self.tau_anneal_steps
         return max(self.tau_end, self.tau_init * math.exp(-k * step))
 
-    def _move_to_device(self, X_p, X_ntc, P, C):
+    def _move_to_device(self, X_p, X_ntc, P, C, C_ntc):
         nb = self.non_blocking_copy
         return (
             X_p.to(self.device, dtype=torch.float32, non_blocking=nb),
             X_ntc.to(self.device, dtype=torch.float32, non_blocking=nb),
             P.to(self.device, dtype=torch.long, non_blocking=nb),
             C.to(self.device, dtype=torch.long, non_blocking=nb),
+            C_ntc.to(self.device, dtype=torch.long, non_blocking=nb),
         )
 
     def _validate(self, val_loader):
@@ -93,16 +101,18 @@ class VAETrainer:
         pi25 = pi99 = np.nan  # percentiles of gate probability π
 
         with torch.no_grad():
-            for X_p, X_ntc, P, C in val_loader:
-                X_p, X_ntc, P, C = self._move_to_device(X_p, X_ntc, P, C)
+            for X_p, X_ntc, P, C, C_ntc in val_loader:
+                X_p, X_ntc, P, C, C_ntc = self._move_to_device(X_p, X_ntc, P, C, C_ntc)
                 all_P.append(P.detach().cpu().numpy())
+                n_ntc = X_ntc.size(0)
 
-                guide_tr = poutine.trace(self.vae.guide).get_trace(X_p, X_ntc, P, C)
-                z = guide_tr.nodes["z"]["value"]
-                z0 = guide_tr.nodes["z0"]["value"]
+                guide_tr = poutine.trace(self.vae.guide).get_trace(X_p, X_ntc, P, C, C_ntc)
+                z     = guide_tr.nodes["z"]["value"]   # (n_ntc + n, d)
+                z_ntc = z[:n_ntc]
+                z_p   = z[n_ntc:]
 
-                # CE / acc
-                cls_logits = self.vae.cls_head(z)
+                # CE / acc (perturbed cells only)
+                cls_logits = self.vae.cls_head(z_p)
                 if P.ndim == 1:
                     val_ce_sum += F.cross_entropy(cls_logits, P.long(), reduction="sum").item()
                     val_correct += (cls_logits.argmax(dim=-1) == P).sum().item()
@@ -111,25 +121,23 @@ class VAETrainer:
                 else:
                     B, Pn = cls_logits.shape
                     mask = (P != -1)
-                    k = mask.sum(dim=1).max().item()  # typically 2
+                    k = mask.sum(dim=1).max().item()
 
-                    # multi-hot targets for BCE
                     tgt = torch.zeros((B, Pn), device=cls_logits.device, dtype=cls_logits.dtype)
                     tgt.scatter_(1, P.clamp(min=0).long(), mask.float())
 
                     val_ce_sum += F.binary_cross_entropy_with_logits(cls_logits, tgt, reduction="sum").item()
 
-                    # "set" accuracy: both true labels must be in top-k predictions
-                    topk = cls_logits.topk(k=k, dim=1).indices  # (B,k)
+                    topk = cls_logits.topk(k=k, dim=1).indices
                     hit = (topk.unsqueeze(2) == P.clamp(min=0).long().unsqueeze(1)) & mask.unsqueeze(1)
                     val_correct += (hit.any(dim=1).sum(dim=1) == mask.sum(dim=1)).sum().item()
                     val_n += B
 
-                # decode means for R²/ATE
+                # decode means for R²
                 total_ntc = X_ntc.sum(-1, keepdim=True)
-                mu_ntc = total_ntc * torch.softmax(self.vae.z_decoder(z0), dim=-1)
+                mu_ntc = total_ntc * torch.softmax(self.vae.z_decoder(z_ntc), dim=-1)
                 total_p = X_p.sum(-1, keepdim=True)
-                mu_p = total_p * torch.softmax(self.vae.z_decoder(z), dim=-1)
+                mu_p = total_p * torch.softmax(self.vae.z_decoder(z_p), dim=-1)
 
                 preds_p.append(mu_p.detach().cpu())
                 actuals_p.append(X_p.detach().cpu())
@@ -188,15 +196,18 @@ class VAETrainer:
             self.vae.train()
             epoch_loss = 0.0
 
-            for X_p, X_ntc, P, C in self.dataloader:  # no inner tqdm
-                X_p, X_ntc, P, C = self._move_to_device(X_p, X_ntc, P, C)
+            kl_weight = self._kl_weight(epoch)
+            self.vae.kl_weight = kl_weight
+
+            for X_p, X_ntc, P, C, C_ntc in self.dataloader:  # no inner tqdm
+                X_p, X_ntc, P, C, C_ntc = self._move_to_device(X_p, X_ntc, P, C, C_ntc)
 
                 # anneal gate temperature (gating is always on)
                 tau_curr = self._current_tau(self.global_step)
                 self.vae.gate.set_temperature(tau_curr)
                 self._last_tau = tau_curr
 
-                epoch_loss += self.svi.step(X_p, X_ntc, P, C)
+                epoch_loss += self.svi.step(X_p, X_ntc, P, C, C_ntc)
                 self.global_step += 1
 
             avg_elbo = epoch_loss / dataset_size
@@ -229,6 +240,7 @@ class VAETrainer:
             # persistent tqdm display (no NA flicker)
             epoch_bar.set_postfix(
                 ELBO=f"{avg_elbo:.4f}",
+                KLw=f"{kl_weight:.2f}",
                 CE=f"{self._last_valid['CE']:.4f}" if not math.isnan(self._last_valid["CE"]) else "nan",
                 acc=f"{self._last_valid['acc']:.3f}" if not math.isnan(self._last_valid["acc"]) else "nan",
                 R2_p=f"{self._last_valid['R2_p']:.4f}" if not math.isnan(self._last_valid['R2_p']) else "nan",

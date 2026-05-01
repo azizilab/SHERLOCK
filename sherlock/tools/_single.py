@@ -84,6 +84,7 @@ def run(
         dataset = PerturbMatchingDataset(adata, combinatorial=combinatorial)
         dataloader = DataLoader(
             dataset,
+            collate_fn=dataset.get_collate_fn(),
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,

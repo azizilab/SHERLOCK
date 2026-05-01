@@ -1,9 +1,8 @@
 import torch
-from torch.utils.data import Dataset, Sampler, DataLoader
+from torch.utils.data import Dataset, Sampler
 import numpy as np
 import pandas as pd
 import random
-import itertools
 from collections import defaultdict
 from .._configs import get_config
 
@@ -122,17 +121,18 @@ class MultiClassBatchSampler(Sampler[list[int]]):
 
 class PerturbMatchingDataset(Dataset):
     """
-    Dataset of (perturbed-cell, NTC-cell) pairs.
+    Dataset of perturbed cells paired with a batch of NTC cells.
 
-    • X_p      – all *non-NTC* cells           (n_p × d)
-    • X_ntc    – one representative NTC cell *per condition*
-                 (n_cond x d)  — kept mainly for inspection.
-                 A fresh, random NTC cell of the matching
-                 condition is drawn on-the-fly in __getitem__.
+    • X_p       – all non-NTC cells   (n_p × G)
+    • X_ntc     – NTC cells per condition, kept for eval/_counterfactual_effect_size
+    • X_ntc_flat – all NTC cells concatenated, sampled by get_collate_fn()
 
+    Use get_collate_fn() to build the DataLoader collate function, which adds
+    n_ntc randomly-sampled (without replacement) NTC cells to each batch.
+    The returned batch is (x_p, x_ntc, p, c) with x_ntc.shape[0] == n_ntc.
     """
 
-    def __init__(self, anndata, seed: int | None = None, combinatorial: bool = False):
+    def __init__(self, anndata, seed: int | None = None, combinatorial: bool = False, n_ntc: int = 20):
         rng = np.random.default_rng(seed)
 
         p_key = get_config('pert_key')
@@ -209,34 +209,61 @@ class PerturbMatchingDataset(Dataset):
             self.P_indices = P2
 
 
+        self.n_ntc = int(n_ntc)
+        # Flat pool of all NTC cells for collate-time sampling
+        self.X_ntc_flat = np.concatenate(self.X_ntc, axis=0).astype(np.float32)
         self.rng = rng
 
     # ── Dataset API ─────────────────────────────────────────────────────
     def __len__(self) -> int:
-        # one entry per perturbed cell
         return self.X_pert.shape[0]
 
     def __getitem__(self, idx: int):
-        '''
-        returns
-        (x_p, x_ntc, p_idx, c_idx)
+        """Returns (x_p, p_idx, c_idx). Use get_collate_fn() with your DataLoader."""
+        return self.X_pert[idx], self.P_indices[idx], self.C_indices[idx]
 
-        x_p        : expression vector of the i-th perturbed cell
-        x_ntc : expression vector of a random NTC cell
-                     with the same condition as x_p
-        p_idx      : integer perturbation label (0 … n_perturb-1)
-        c_idx      : integer condition label    (0 … n_cond-1)
-        '''
-        # perturbed cell
-        x_p   = self.X_pert[idx]
-        c_idx = self.C_indices[idx]
-        p_idx = self.P_indices[idx]
+    def get_collate_fn(self):
+        """
+        Returns a collate_fn that samples n_ntc NTC cells *per condition* present
+        in the batch (without replacement within each condition pool).
 
-        # random NTC cell with same condition
-        ntc_idx = self.rng.integers(0, len(self.X_ntc[c_idx]), size=1)[0]
-        x_ntc   = self.X_ntc[c_idx][ntc_idx]
+        Batch output: (x_p, x_ntc, p, c, c_ntc)
+          x_p   : (n,                  G) float32
+          x_ntc : (n_conds * n_ntc,    G) float32  — condition-grouped NTC cells
+          p     : (n,) or (n, 2)          long
+          c     : (n,)                    long      — condition of each perturbed cell
+          c_ntc : (n_conds * n_ntc,)      long      — condition of each NTC cell
+        """
+        n_ntc = self.n_ntc
+        X_ntc = self.X_ntc   # list[ndarray] indexed by condition int
+        rng   = np.random.default_rng()
 
-        return x_p, x_ntc, p_idx, c_idx
+        def collate_fn(batch):
+            x_p_list, p_list, c_list = zip(*batch)
+            x_p = torch.from_numpy(np.stack(x_p_list).astype(np.float32))
+            c   = torch.tensor(list(c_list), dtype=torch.long)
+
+            if isinstance(p_list[0], np.ndarray):
+                p = torch.from_numpy(np.stack(p_list))
+            else:
+                p = torch.tensor(list(p_list), dtype=torch.long)
+
+            # sample n_ntc NTC cells for each condition present in this batch
+            unique_conds = np.unique(list(c_list))
+            ntc_chunks, c_ntc_chunks = [], []
+            for cond_i in unique_conds:
+                pool = X_ntc[int(cond_i)]            # (N_cond, G)
+                n    = min(n_ntc, len(pool))
+                idx  = rng.choice(len(pool), size=n, replace=False)
+                ntc_chunks.append(pool[idx].astype(np.float32))
+                c_ntc_chunks.extend([int(cond_i)] * n)
+
+            x_ntc = torch.from_numpy(np.concatenate(ntc_chunks, axis=0))
+            c_ntc = torch.tensor(c_ntc_chunks, dtype=torch.long)
+
+            return x_p, x_ntc, p, c, c_ntc
+
+        return collate_fn
 
 
 class PerturbSimpleDataset(Dataset):

@@ -173,6 +173,10 @@ class VAE(PerturbModelBase):
         # low-rank covariance (params live on module device)
         self.qr = QRCov(self.perturbs, self.rank)
 
+        # KL warmup weight — set externally by VAETrainer each epoch
+        self.kl_weight = 1.0
+        self.warmup_done = False
+
         # synergy: one latent vector per unique unordered pair (p1, p2), p1 < p2
         # Single-perturbation synergy is 0 by definition (not in this set).
         self.use_synergy = use_synergy
@@ -213,19 +217,12 @@ class VAE(PerturbModelBase):
         Sigma_P = L @ L.T + (sigma_P**2) * eyeP
         return Sigma_P
     
-    def __poe(self, z0_loc, z0_scale, lin_shift):
-        device = z0_loc.device
-        z0_var = z0_scale.pow(2)
-        W_scale = pyro.param(
-            "W_scale",
-            0.1 * torch.ones(self.latent_dim, device=device),
-            constraint=constraints.positive,
-        ).to(z0_loc.device)
-        W_var = W_scale.pow(2)
-        precision = 1.0 / z0_var + 1.0 / W_var
-        z_var = 1.0 / precision
-        z_loc = z_var * (z0_loc / z0_var + (z0_loc + lin_shift) / W_var)
-        return z_loc, z_var
+    def __poe(self, z0_loc, lin_shift, W_var):
+        # PoE mean: z0_loc + alpha * lin_shift, alpha = 1/(1+W_var)
+        # z_var is controlled separately via z_var_scale in the model
+        alpha = 1.0 / (1.0 + W_var)
+        z_loc = z0_loc + alpha * lin_shift
+        return z_loc
 
     def __decode(self, x, z, weight, theta, d_key):
         logits_gene = weight(z)
@@ -237,7 +234,7 @@ class VAE(PerturbModelBase):
         return logits_nb
 
     # --- model/guide ---
-    def model(self, x_p, x_ntc, p, c):
+    def model(self, x_p, x_ntc, p, c, c_ntc):
         pyro.module("VAE", self)
         device = x_p.device
 
@@ -256,6 +253,7 @@ class VAE(PerturbModelBase):
             rho_single = pyro.sample(
                 "rho",
                 dist.Normal(torch.zeros_like(self.p_emb.weight), torch.ones_like(self.p_emb.weight)).to_event(1),
+                infer={"scale": self.kl_weight},
             )
         chol_P = torch.linalg.cholesky(row_cov)
         A = chol_P @ rho_single  # (P, d)
@@ -266,9 +264,9 @@ class VAE(PerturbModelBase):
         pi = self.gate.expected_L0()
         expected_l0 = pi.sum()
         expected_l2 = self.gate.expected_L2(A)
-        pyro.factor("l0_penalty", - self.l0_lambda * expected_l0)
-        pyro.factor("l1_penalty", - self.l1_lambda * self.gate.l1_logit())
-        pyro.factor("l2_penalty", - self.l2_lambda * expected_l2)
+        pyro.factor("l0_penalty", - self.kl_weight * self.l0_lambda * expected_l0)
+        pyro.factor("l1_penalty", - self.kl_weight * self.l1_lambda * self.gate.l1_logit())
+        pyro.factor("l2_penalty", - self.kl_weight * self.l2_lambda * expected_l2)
 
         # column entropy encouragement
         col_usage = pi.sum(dim=0)
@@ -283,153 +281,149 @@ class VAE(PerturbModelBase):
             repulsion = (off_diag ** 2).mean()
             pyro.factor("gate_row_repulsion", - self.gate_row_repulsion_lambda * repulsion)
 
-        # synergy: HalfCauchy shrinkage prior on per-combo latent vectors
         if self.use_synergy:
             with pyro.plate("combos", self.n_combos):
                 syn = pyro.sample(
                     "syn",
                     dist.HalfCauchy(torch.ones(self.latent_dim, device=device)).to_event(1),
+                    infer={"scale": self.kl_weight},
                 )
 
-        with pyro.plate("cells", x_p.size(0)):
-            if self.use_conditions:
-                z0_loc = self.c_emb_mu(c)
-                z0_scale = (0.5 * self.c_emb_logvar(c)).exp()
-                pyro.factor("do_prior_ridge_mu", -1e-4 * (z0_loc ** 2).mean())
-                pyro.factor("do_prior_ridge_logvar", -1e-4 * (self.c_emb_logvar.weight ** 2).mean())
+        # ── per-perturbed-cell shift ─────────────────────────────────────
+        n_ntc = x_ntc.size(0)
+        n     = x_p.size(0)
+        n_all = n_ntc + n
+
+        lin_shift_p = A[p] * W[p]
+        if p.ndim > 1:  # combinatorial
+            comb_mask   = (p != -1).float().unsqueeze(-1)              # (n, K, 1)
+            lin_shift_p = (lin_shift_p * comb_mask).sum(dim=1)         # (n, d)
+            W_p_eff     = (W[p.clamp(min=0)] * comb_mask).sum(dim=1).clamp(0, 1)  # (n, d)
+        else:
+            W_p_eff = W[p]  # (n, d)
+
+        if self.use_synergy:
+            if p.ndim == 1:
+                syn_shift_p = torch.zeros(n, self.latent_dim, device=device)
             else:
-                z0_loc = torch.zeros(x_p.size(0), self.latent_dim, device=device)
-                z0_scale = torch.ones(x_p.size(0), self.latent_dim, device=device)
+                p0 = p[:, 0].clamp(min=0)
+                p1 = p[:, 1].clamp(min=0)
+                syn_idx     = self.pair_idx[p0, p1]
+                valid       = (syn_idx >= 0).float().unsqueeze(-1)
+                syn_shift_p = syn[syn_idx.clamp(min=0)] * valid
+            lin_shift_p = lin_shift_p + syn_shift_p
 
-            z0 = pyro.sample("z0", dist.Normal(z0_loc, z0_scale).to_event(1))
+        # ── n_all tensors: NTC cells first (W=0), perturbed cells second ─
+        zeros_ntc     = torch.zeros(n_ntc, self.latent_dim, device=device)
+        W_all         = torch.cat([zeros_ntc, W_p_eff],    dim=0)  # (n_all, d)
+        lin_shift_all = torch.cat([zeros_ntc, lin_shift_p], dim=0)  # (n_all, d)
 
-            logits_ntc = self.__decode(x_ntc, z0, self.z_decoder, theta, "x_ntc")
-            pyro.sample(
-                "X_ntc",
-                dist.NegativeBinomial(total_count=theta, logits=logits_ntc).to_event(1),
-                obs=x_ntc.float(),
-                infer={"scale": self.ntc_lambda},
-            )
+        if self.use_conditions:
+            z0_loc_p   = self.c_emb_mu(c)
+            z0_scale_p = (0.5 * self.c_emb_logvar(c)).exp()
+            pyro.factor("do_prior_ridge_mu",     -1e-4 * (z0_loc_p ** 2).mean())
+            pyro.factor("do_prior_ridge_logvar", -1e-4 * (self.c_emb_logvar.weight ** 2).mean())
+            z0_loc_all   = torch.cat([zeros_ntc,                                          z0_loc_p],   dim=0)
+            z0_scale_all = torch.cat([torch.ones(n_ntc, self.latent_dim, device=device), z0_scale_p], dim=0)
+        else:
+            z0_loc_all   = torch.zeros(n_all, self.latent_dim, device=device)
+            z0_scale_all = torch.ones( n_all, self.latent_dim, device=device)
 
-            # linear shift: z_loc = z0 + A[p] * W[p]; for combos, A[p] and W[p] are summed over the pert indices in the combo
-            if p.ndim != 1: #combinatorial
-                comb_mask = (p != -1).float().unsqueeze(-1) #TODO why is it not indexing W, was this processed earlier? BUG
+        z_var = pyro.param("z_var_scale", torch.ones(self.latent_dim, device=device), constraint=constraints.positive)
 
-                z0_mod = z0 * (1.0 - comb_mask)
-                lin_shift = lin_shift * comb_mask
-                lin_shift = lin_shift.sum(dim=1)
-            else:
-                z0_mod = z0 * (1.0 - W[p])
-                lin_shift = A[p] * W[p]
+        if self.shift == 'poe':
+            W_scale = pyro.param("W_scale", 0.1 * torch.ones(self.latent_dim, device=device), constraint=constraints.positive)
+            pyro.factor("W_scale_prior", -0.5 * (W_scale / 0.1).pow(2).sum())
 
-            # synergy: always 0 for single perturbations; pair embedding for combos
-            if self.use_synergy:
-                if p.ndim == 1:
-                    syn_shift = torch.zeros_like(lin_shift)
-                else:
-                    p0 = p[:, 0].clamp(min=0)
-                    p1 = p[:, 1].clamp(min=0)
-                    syn_idx = self.pair_idx[p0, p1]           # (B,)
-                    valid = (syn_idx >= 0).float().unsqueeze(-1)
-                    syn_shift = syn[syn_idx.clamp(min=0)] * valid
+        # ── cells plate: one z per cell (NTC: W=0 ⟹ z≈z0; perturbed: z=shift(z0)) ─
+        with pyro.plate("cells", n_all):
+            z0     = pyro.sample("z0", dist.Normal(z0_loc_all, z0_scale_all).to_event(1), infer={"scale": self.kl_weight})
+            z0_mod = z0 * (1.0 - W_all)
 
             if self.shift == 'poe':
-                raise Exception("poe shift is currently disabled pending further tuning; use shift='linear' instead")
-                z_loc, z_var = self.__poe(z0_loc_mod, z0_scale, lin_shift)
-                z_loc = z_loc + syn_shift if self.use_synergy else z_loc
-                z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1))
+                z_loc = self.__poe(z0_mod, lin_shift_all, W_scale.pow(2))
             elif self.shift == 'linear':
-                z_loc = z0_mod + lin_shift
-                z_loc = z_loc + syn_shift if self.use_synergy else z_loc
-                z_std = pyro.param("z_var_scale", torch.ones_like(z_loc[0]), constraint=constraints.positive)
-                z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_std)).to_event(1))
+                z_loc = z0_mod + lin_shift_all
             else:
                 raise ValueError("Invalid shift type")
 
-            cls_logits = self.cls_head(z)
-            pyro.deterministic("cls_logits", cls_logits)
+            z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1), infer={"scale": self.kl_weight})
 
-            if p.ndim == 1:
-                # ----- single-class classification -----
-                CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
+        # ── observations and CE loss (outside plate) ─────────────────────
+        z_ntc_z = z[:n_ntc]
+        z_p_z   = z[n_ntc:]
 
-            else:
-                # ----- multi-label classification (predict K perturbations) -----
-                B, P = cls_logits.shape
-                target = torch.zeros((B, P), device=cls_logits.device, dtype=cls_logits.dtype)
+        cls_logits = self.cls_head(z_p_z)
+        pyro.deterministic("cls_logits", cls_logits)
 
-                mask = (p != -1)                      # (B, K)  only for valid perturbations
-                p_safe = p.clamp(min=0)               # replace -1 with 0 for safe scatter
+        if p.ndim == 1:
+            CE_loss = F.cross_entropy(cls_logits, p, reduction="sum")
+        else:
+            B_ce, Pdim = cls_logits.shape
+            target = torch.zeros((B_ce, Pdim), device=device, dtype=cls_logits.dtype)
+            mask   = (p != -1)
+            target.scatter_(1, p.clamp(min=0), mask.to(target.dtype))
+            CE_loss = F.binary_cross_entropy_with_logits(cls_logits, target, reduction="sum")
+        pyro.factor("CE_loss", -self.ce_lambda * CE_loss)
 
-                # Put 1s at the valid perturbation indices
-                target.scatter_(1, p_safe, mask.to(target.dtype))
+        logits_ntc  = self.__decode(x_ntc, z_ntc_z, self.z_decoder, theta, "x_ntc")
+        ntc_logprob = dist.NegativeBinomial(total_count=theta, logits=logits_ntc).log_prob(x_ntc.float()).sum()
+        pyro.factor("X_ntc_logprob", self.ntc_lambda * ntc_logprob)
 
-                # BCE over classes (multi-label)
-                CE_loss = F.binary_cross_entropy_with_logits(cls_logits, target, reduction="sum")
+        logits_p  = self.__decode(x_p, z_p_z, self.z_decoder, theta, "x_p")
+        p_logprob = dist.NegativeBinomial(total_count=theta, logits=logits_p).log_prob(x_p.float()).sum()
+        pyro.factor("X_p_logprob", self.pert_lambda * p_logprob)
 
-            pyro.factor("CE_loss", -self.ce_lambda*CE_loss)
-
-            logits_p = self.__decode(x_p, z, self.z_decoder, theta, "x_p")
-            pyro.sample(
-                "X",
-                dist.NegativeBinomial(total_count=theta, logits=logits_p).to_event(1),
-                obs=x_p.float(),
-                infer={"scale": self.pert_lambda},
-            )
-
-            # optional DE alignment loss against provided targets
-            if self.use_de_align_loss and self.treat_effect_map is not None:
-                # reuse decoded logits to avoid extra passes
-                mu_p = theta * logits_p.exp()          # batch x genes
-                mu_ntc = theta * logits_ntc.exp()
-                P_max = self.perturbs
-
-                # per-pert sums via scatter for speed
-                sum_p = torch.zeros(P_max, self.input_dim, device=device)
-                sum_ntc = torch.zeros_like(sum_p)
-                cnt = torch.zeros(P_max, device=device)
-
-                expand_idx = p.unsqueeze(1).expand(-1, self.input_dim)
-                sum_p.scatter_add_(0, expand_idx, mu_p)
-                sum_ntc.scatter_add_(0, expand_idx, mu_ntc)
-                cnt.scatter_add_(0, p, torch.ones_like(p, dtype=sum_p.dtype))
-
-                mask = cnt > 0
-                if mask.any():
-                    mean_p = sum_p[mask] / (cnt[mask].unsqueeze(1) + 1e-8)
-                    mean_ntc = sum_ntc[mask] / (cnt[mask].unsqueeze(1) + 1e-8)
-                    pred_eff = mean_p - mean_ntc
-                    target = self.treat_effect_map.to(pred_eff.device)[:P_max][mask]
-                    loss = F.mse_loss(pred_eff, target)
-                    pyro.factor("de_align_loss", - self.de_align_lambda * loss)
-
-    def guide(self, x_p, x_ntc, p, c):
+    def guide(self, x_p, x_ntc, p, c, c_ntc):
         pyro.module("VAE", self)
 
-        x_p = self._mednorm(x_p)
+        x_p   = self._mednorm(x_p)
         x_ntc = self._mednorm(x_ntc)
+
+        n_ntc = x_ntc.size(0)
+        n     = x_p.size(0)
+        n_all = n_ntc + n
 
         q_loc = self.rho_enc(self.p_emb.weight)
         with pyro.plate("perturbations", self.perturbs):
-            pyro.sample("rho", dist.Normal(q_loc, torch.ones_like(q_loc)).to_event(1))
+            pyro.sample("rho", dist.Normal(q_loc, torch.ones_like(q_loc)).to_event(1), infer={"scale": self.kl_weight})
 
         if self.use_synergy:
-            syn_scale = F.softplus(self.syn_emb.weight)   # (n_combos, d), positive
+            syn_scale = F.softplus(self.syn_emb.weight)
             with pyro.plate("combos", self.n_combos):
-                pyro.sample("syn", dist.HalfNormal(syn_scale).to_event(1))
+                pyro.sample("syn", dist.HalfNormal(syn_scale).to_event(1), infer={"scale": self.kl_weight})
 
-        with pyro.plate("cells", x_p.size(0)):
-            z0_mu, z0_logvar = self.z0_encoder(x_ntc).chunk(2, dim=-1)
-            z0_std = (0.5 * z0_logvar).exp()
-            pyro.sample("z0", dist.Normal(z0_mu, z0_std).to_event(1))
+        # z0: encode all NTC cells; assign each perturbed cell the mean z0 of its condition
+        z0_mu_ntc, z0_logvar_ntc = self.z0_encoder(x_ntc).chunk(2, dim=-1)
+        z0_std_ntc = (0.5 * z0_logvar_ntc).exp()
 
-            z_mu, z_logvar = self.z_encoder(x_p).chunk(2, dim=-1)
-            z_std = (0.5 * z_logvar).exp()
-            pyro.sample("z", dist.Normal(z_mu, z_std).to_event(1))
+        z0_mu_p  = torch.zeros(n, self.latent_dim, device=x_p.device)
+        z0_std_p = torch.ones( n, self.latent_dim, device=x_p.device)
+        for cond_i in c.unique():
+            ntc_mask  = (c_ntc == cond_i)
+            pert_mask = (c    == cond_i)
+            if ntc_mask.any():
+                z0_mu_p[pert_mask]  = z0_mu_ntc[ntc_mask].mean(0)
+                z0_std_p[pert_mask] = z0_std_ntc[ntc_mask].mean(0)
+
+        z0_mu_all  = torch.cat([z0_mu_ntc, z0_mu_p],  dim=0)
+        z0_std_all = torch.cat([z0_std_ntc, z0_std_p], dim=0)
+
+        # z: encode NTC and perturbed cells through the same z_encoder
+        z_mu_ntc, z_logvar_ntc = self.z_encoder(x_ntc).chunk(2, dim=-1)
+        z_std_ntc = (0.5 * z_logvar_ntc).exp()
+        z_mu_p,   z_logvar_p   = self.z_encoder(x_p).chunk(2, dim=-1)
+        z_std_p   = (0.5 * z_logvar_p).exp()
+
+        z_mu_all  = torch.cat([z_mu_ntc, z_mu_p],  dim=0)
+        z_std_all = torch.cat([z_std_ntc, z_std_p], dim=0)
+
+        with pyro.plate("cells", n_all):
+            pyro.sample("z0", dist.Normal(z0_mu_all, z0_std_all).to_event(1), infer={"scale": self.kl_weight})
+            pyro.sample("z",  dist.Normal(z_mu_all,  z_std_all).to_event(1),  infer={"scale": self.kl_weight})
 
     @torch.no_grad()
     def _abduct_z0(self, x_ntc):
-        self.eval()
         lib_ntc = x_ntc.sum(dim=1, keepdim=True)
         med_ntc = torch.median(lib_ntc).item()
         x_ntc_n = torch.log1p(x_ntc / lib_ntc * med_ntc)
@@ -524,15 +518,12 @@ class VAE(PerturbModelBase):
         #TODO fix poe, use combinatorial, incorporate synergy
 
         m_p, w_p = m_p[:, 0, :], m_p[:, 1, :]  # unpack shift components
+        u_mod = u * (1.0 - w_p)
 
         if self.shift == "poe":
-            raise Exception("poe shift is currently disabled pending further tuning; use shift='linear' instead")
-            # z0_loc_mod = z0_loc * (1-W); for use_conditions=False z0_loc=0 so prior is N(0,1)
-            z0_prior = u if self.use_conditions else torch.zeros_like(u)
-            z, _ = self.__poe(z0_prior, torch.ones_like(u), m_p)
-            return z
+            W_scale = pyro.param("W_scale", 0.1 * torch.ones(self.latent_dim), constraint=constraints.positive).to(u.device)
+            return self.__poe(u_mod, m_p, W_scale.pow(2))
         elif self.shift == "linear":
-            u_mod = u * (1.0 - w_p)
             return u_mod + m_p
             
         raise ValueError("Invalid shift type")
@@ -576,7 +567,7 @@ class VAE(PerturbModelBase):
         z_out    = torch.empty(N, self.latent_dim)
         recon_out = torch.empty(N, G)
 
-        for encoder, mask in [(self.z0_encoder, ntc_mask), (self.z_encoder, ~ntc_mask)]:
+        for encoder, mask in [(self.z_encoder, ntc_mask), (self.z_encoder, ~ntc_mask)]:
             indices = mask.nonzero(as_tuple=True)[0]
             for i in range(0, len(indices), batch_size):
                 idx_b  = indices[i : i + batch_size]
