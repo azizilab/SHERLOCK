@@ -513,7 +513,8 @@ class VAE(PerturbModelBase):
         chol_P = torch.linalg.cholesky(L @ L.T + sigma ** 2 * torch.eye(self.perturbs, device=device))
         A = chol_P @ self.rho_enc(self.p_emb.weight).detach()
         W = self.gate(deterministic=True).detach()
-        return torch.stack([A * W, W], dim=1)  # (P, 2, d) for unpacking in _apply_shift
+        out = torch.stack([A * W, W], dim=1)  # (P, 2, d) for unpacking in _apply_shift
+        return torch.cat([out.new_zeros((1, 2, self.latent_dim)), out], dim=0) #0 is NTC for this function
 
     @torch.no_grad()
     def _apply_shift(self, u: torch.Tensor, m_p: torch.Tensor) -> torch.Tensor:
@@ -614,7 +615,7 @@ class VAE(PerturbModelBase):
 
         # abduct backgrounds and shifts once — no repeated Cholesky or re-encoding
         u_ntc  = self._abduct_ntc(x_ntc)            # (n_cells, d)
-        shifts = self._get_all_pert_shifts(device)   # (P, d)
+        shifts = self._get_all_pert_shifts(device)[1:]   # (P, d)
 
         probs0   = self._decode_to_expr(u_ntc, 1.0)    # (n_cells, G) — proportions
         mu0_norm = torch.log1p(probs0 * 1e4)
