@@ -87,11 +87,11 @@ class VAE(PerturbModelBase):
         perturbs,
         conds,
         tau,
-        l0_lambda=10.0,
+        l0_lambda=1.0,
         l1_lambda=1e-3,
         l2_lambda=1e-3,
         H_lambda=1e-3,
-        ce_lambda=1.0,
+        ce_lambda=10,
         ntc_lambda=1e-5,
         pert_lambda=1.0,
         cov_lambda=1e-4,
@@ -99,7 +99,7 @@ class VAE(PerturbModelBase):
         gate_init_p=0.5,
         rank=6,
         use_conditions=False,
-        shift='poe',
+        shift='linear',
         use_synergy=False,
         use_de_align_loss=False,
         de_align_lambda=1e-3,
@@ -176,6 +176,9 @@ class VAE(PerturbModelBase):
         # KL warmup weight — set externally by VAETrainer each epoch
         self.kl_weight = 1.0
         self.warmup_done = False
+        # L0/gate sparsity weight — set externally by VAETrainer via delayed schedule
+        # (ramps 0→1 only after KL warmup ends to prevent gate collapse on warmup exit)
+        self.l0_weight = 0.0
 
         # synergy: one latent vector per unique unordered pair (p1, p2), p1 < p2
         # Single-perturbation synergy is 0 by definition (not in this set).
@@ -264,9 +267,9 @@ class VAE(PerturbModelBase):
         pi = self.gate.expected_L0()
         expected_l0 = pi.sum()
         expected_l2 = self.gate.expected_L2(A)
-        pyro.factor("l0_penalty", - self.kl_weight * self.l0_lambda * expected_l0)
-        pyro.factor("l1_penalty", - self.kl_weight * self.l1_lambda * self.gate.l1_logit())
-        pyro.factor("l2_penalty", - self.kl_weight * self.l2_lambda * expected_l2)
+        pyro.factor("l0_penalty", - self.l0_weight * self.l0_lambda * expected_l0)
+        pyro.factor("l1_penalty", - self.l0_weight * self.l1_lambda * self.gate.l1_logit())
+        pyro.factor("l2_penalty", - self.l0_weight * self.l2_lambda * expected_l2)
 
         # column entropy encouragement
         col_usage = pi.sum(dim=0)
@@ -332,11 +335,16 @@ class VAE(PerturbModelBase):
         z_var = pyro.param("z_var_scale", torch.ones(self.latent_dim, device=device), constraint=constraints.positive)
 
         if self.shift == 'poe':
+            #Here to not be in cell plate
             W_scale = pyro.param("W_scale", 0.1 * torch.ones(self.latent_dim, device=device), constraint=constraints.positive)
             pyro.factor("W_scale_prior", -0.5 * (W_scale / 0.1).pow(2).sum())
 
         # ── cells plate: one z per cell (NTC: W=0 ⟹ z≈z0; perturbed: z=shift(z0)) ─
         with pyro.plate("cells", n_all):
+            #TODO this is not proper POE for what we need. should be using z0_mu and z0_std
+            #but gradient won't flow this way since its not from pyro.sample. Temp fix using
+            #sampled z0 but its not ideal since it won't have the same mean/var as the guide's z0 distribution.
+            #A better fix would be to implement the POE logic manually in the guide and model instead of relying on pyro.sample for z0
             z0     = pyro.sample("z0", dist.Normal(z0_loc_all, z0_scale_all).to_event(1), infer={"scale": self.kl_weight})
             z0_mod = z0 * (1.0 - W_all)
 
@@ -537,13 +545,9 @@ class VAE(PerturbModelBase):
     @torch.no_grad()
     def _run_inference(self, dataset, device, batch_size=1024):
         """
-        Global-mednorm encoding — matches old eval_single behaviour where the
-        median library size is computed over the entire dataset in one shot
-        rather than per batch.
-
-        NTC cells are encoded via z0_encoder (as during training); perturbed
-        cells via z_encoder.  Both are stored together in the returned z array
-        so adata.obsm['z'] holds the correct encoder output per cell type.
+        NTC cells are encoded via z0_encoder and z_encoder for pre and post shift; perturbed
+        cells only via z_encoder. z for NTC should reflect an unshifted state. Both are stored together in
+        so adata.obsm['z'].
         """
         from torch.utils.data import DataLoader
 

@@ -177,6 +177,69 @@ def compute_cf_ate_metrics(
     return {"cf_ate_pearson_r": pearson_r}
 
 
+def compute_embedding_metrics(
+    embed_arr,
+    labels,
+    knn_k: int = 5,
+    linear_probe_cv: int = 5,
+) -> dict:
+    """
+    Compute silhouette (macro), kNN purity, and linear probe accuracy.
+
+    Silhouette is macro-averaged: mean per-label first, then mean across labels,
+    so large clusters do not dominate.
+
+    Parameters
+    ----------
+    embed_arr       : (N, d) array of embeddings
+    labels          : (N,) array of string or int class labels
+    knn_k           : neighbours for kNN purity
+    linear_probe_cv : StratifiedKFold splits for logistic regression probe
+
+    Returns
+    -------
+    dict with keys: silhouette, knn_purity, linear_probe (float, NaN on failure)
+    """
+    sil = knn_pur = lin_probe = np.nan
+    embed_arr = np.asarray(embed_arr)
+    labels    = np.asarray(labels)
+    uniq      = np.unique(labels)
+
+    if len(uniq) < 2 or len(uniq) >= len(labels):
+        return {"silhouette": sil, "knn_purity": knn_pur, "linear_probe": lin_probe}
+
+    try:
+        s   = silhouette_samples(embed_arr, labels, metric="euclidean")
+        sil = float(np.mean([s[labels == lab].mean() for lab in uniq]))
+    except Exception:
+        pass
+
+    try:
+        k = min(knn_k, len(embed_arr) - 1)
+        if k >= 1:
+            nbrs = NearestNeighbors(n_neighbors=k + 1).fit(embed_arr)
+            _, indices = nbrs.kneighbors(embed_arr)
+            knn_pur = float(np.mean([
+                (labels[idx[1:]] == labels[i]).mean()
+                for i, idx in enumerate(indices)
+            ]))
+    except Exception:
+        pass
+
+    try:
+        _, counts = np.unique(labels, return_counts=True)
+        n_splits  = min(linear_probe_cv, int(counts.min()))
+        if n_splits >= 2:
+            cv        = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+            lr        = LogisticRegression(max_iter=1000, random_state=42)
+            X_s       = StandardScaler().fit_transform(embed_arr)
+            lin_probe = float(cross_val_score(lr, X_s, labels, cv=cv, scoring="accuracy").mean())
+    except Exception:
+        pass
+
+    return {"silhouette": sil, "knn_purity": knn_pur, "linear_probe": lin_probe}
+
+
 def compute_clustering_metrics(
     adata,
     pathway_df_indexed: pd.DataFrame,
@@ -337,35 +400,13 @@ def compute_clustering_metrics(
 
     if rho_embed is not None:
         try:
-            embed_arr = np.asarray(rho_embed)[[pert_to_idx[g] for g in df["gene"].values]]
-
-            # Balanced silhouette over true pathway labels:
-            # mean within each pathway first, then mean across pathways
-            labels = np.asarray(y_true)
-            uniq = np.unique(labels)
-
-            if len(uniq) >= 2 and len(uniq) < len(labels):
-                s = silhouette_samples(embed_arr, labels, metric="euclidean")
-                sil = float(np.mean([s[labels == lab].mean() for lab in uniq]))
-
-            # kNN purity
-            k = min(knn_k, len(embed_arr) - 1)
-            if k >= 1:
-                nbrs = NearestNeighbors(n_neighbors=k + 1).fit(embed_arr)
-                _, indices = nbrs.kneighbors(embed_arr)
-                knn_pur = float(np.mean([
-                    (y_true[idx[1:]] == y_true[i]).mean()
-                    for i, idx in enumerate(indices)
-                ]))
-
-            # Linear probe (StratifiedKFold logistic regression)
-            classes, counts = np.unique(y_true, return_counts=True)
-            n_splits = min(linear_probe_cv, int(counts.min()))
-            if n_splits >= 2:
-                cv  = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-                lr  = LogisticRegression(max_iter=1000, random_state=42)
-                X_s = StandardScaler().fit_transform(embed_arr)
-                lin_probe = float(cross_val_score(lr, X_s, y_true, cv=cv, scoring="accuracy").mean())
+            embed_arr   = np.asarray(rho_embed)[[pert_to_idx[g] for g in df["gene"].values]]
+            emb_metrics = compute_embedding_metrics(
+                embed_arr, y_true, knn_k=knn_k, linear_probe_cv=linear_probe_cv
+            )
+            sil       = emb_metrics["silhouette"]
+            knn_pur   = emb_metrics["knn_purity"]
+            lin_probe = emb_metrics["linear_probe"]
         except Exception:
             pass
 

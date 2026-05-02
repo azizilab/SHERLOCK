@@ -15,6 +15,9 @@ def _get_class(name: str):
         elif name == "cVAE":
             from ._cvae import cVAE
             _CLASS_REGISTRY["cVAE"] = cVAE
+        elif name == "SCGENModel":
+            from ._scgen import SCGENModel
+            _CLASS_REGISTRY["SCGENModel"] = SCGENModel
         else:
             raise ValueError(f"Unknown model class: {name!r}")
     return _CLASS_REGISTRY[name]

@@ -26,7 +26,8 @@ from ._datasets import PerturbMatchingDataset, PerturbSimpleDataset
 from ._models import VAE
 from ._cvae import cVAE
 from ._svae import sVAE
-from ._trainers import VAETrainer, cVAETrainer, sVAETrainer
+from ._scgen import SCGENModel
+from ._trainers import VAETrainer, cVAETrainer, sVAETrainer, SCGENTrainer
 from .._configs import get_config
 
 
@@ -38,7 +39,7 @@ def run(
     batch_size: int = 4096,
     shuffle: bool = True,
     num_workers: int = 0,
-    lr: float = 1e-3,
+    lr: float = 2e-3,
     num_epochs: int = 200,
     treat_effect_key: str = "treat_effect",
     validate_every: int = 10,
@@ -48,7 +49,8 @@ def run(
     # ---- VAE-specific ----
     latent_dim: int = 16,
     tau_init: float = 0.67,
-    tau_end: float = 0.10,
+    tau_end: float = 0.3,
+    debug: bool = False,
     **kwargs,
 ) -> dict:
     """
@@ -134,6 +136,35 @@ def run(
         )
 
         best_model, param_store = trainer.fit()
+
+        if debug and trainer.history:
+            import matplotlib.pyplot as plt
+            import pandas as pd
+            hist_df = pd.DataFrame(trainer.history)
+            epochs = hist_df["epoch"]
+
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 5), sharex=True)
+
+            ax1.plot(epochs, hist_df["ATE"], "b-o", markersize=4, label="ATE")
+            ax1.set_ylabel("ATE (Pearson r)")
+            kl_end = trainer.n_epochs_kl_warmup
+            ax1.axvline(kl_end, color="gray", linestyle="--", alpha=0.6, label="KL warmup end")
+            ax1.axvline(2 * kl_end, color="orange", linestyle="--", alpha=0.6, label="L0 warmup end")
+            ax1.legend(fontsize=8)
+            ax1.grid(True, alpha=0.3)
+
+            ax2.plot(epochs, hist_df["pi25"], "g-", label="π p25 (gate activity)")
+            ax2.plot(epochs, hist_df["pi99"], "r-", label="π p99 (gate activity)")
+            ax2.axvline(kl_end, color="gray", linestyle="--", alpha=0.6)
+            ax2.axvline(2 * kl_end, color="orange", linestyle="--", alpha=0.6)
+            ax2.set_ylabel("Gate prob. π")
+            ax2.set_xlabel("Epoch")
+            ax2.legend(fontsize=8)
+            ax2.grid(True, alpha=0.3)
+
+            fig.suptitle("Training trajectory", fontsize=12)
+            plt.tight_layout()
+            plt.show()
 
     elif key == "cvae":
         p_key     = get_config("pert_key")
@@ -233,7 +264,6 @@ def run(
     elif key == "contrastivevi":
         from scvi.external import ContrastiveVI as _ScviContrastiveVI
         from ._contrastivevi import ContrastiveVI as _SherlockContrastiveVI
-        from ._datasets import PerturbSimpleDataset
 
         p_key     = get_config("pert_key")
         ntc_label = get_config("ntc_label")
@@ -308,9 +338,56 @@ def run(
         # best_model IS scvi_model.module — the trained ContrastiveVI instance
         param_store = None
 
+    elif key == "scgen":
+        p_key     = get_config("pert_key")
+        ntc_label = get_config("ntc_label")
+
+        scgen_params  = set(inspect.signature(SCGENModel.__init__).parameters) - {"self"}
+        trainer_params = set(inspect.signature(SCGENTrainer.__init__).parameters) - {
+            "self", "model", "dataloader", "treat_effect", "adata",
+            "lr", "num_epochs", "validate_every", "device", "patience", "seed",
+        }
+        scgen_kwargs   = {k: kwargs[k] for k in kwargs if k in scgen_params}
+        trainer_kwargs = {k: kwargs[k] for k in kwargs if k in trainer_params}
+        unknown = [k for k in kwargs if k not in scgen_params and k not in trainer_params]
+        if unknown:
+            raise TypeError(f"Unknown keyword(s) for scGEN run: {unknown}")
+
+        dataset = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+
+        model_obj = SCGENModel(
+            input_dim  = dataset.input_dim,
+            n_perturbs = dataset.n_perturbs,
+            latent_dim = latent_dim,
+            **scgen_kwargs,
+        ).to(device)
+
+        trainer = SCGENTrainer(
+            model          = model_obj,
+            dataloader     = dataloader,
+            treat_effect   = adata.uns[treat_effect_key],
+            adata          = adata,
+            lr             = lr,
+            num_epochs     = num_epochs,
+            validate_every = validate_every,
+            device         = device,
+            patience       = patience,
+            seed           = seed,
+            **trainer_kwargs,
+        )
+
+        best_model, param_store = trainer.fit()
+
     else:
         raise ValueError(
-            f"Unknown model '{model}'. Choose from ['vae', 'cvae', 'svae', 'contrastivevi']."
+            f"Unknown model '{model}'. Choose from ['vae', 'cvae', 'svae', 'contrastivevi', 'scgen']."
         )
 
     return {"model": best_model, "param_store": param_store}

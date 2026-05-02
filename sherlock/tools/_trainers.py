@@ -26,7 +26,7 @@ class VAETrainer:
         seed: int | None = None,
         non_blocking_copy: bool = True,
         tau_init: float | None = None,
-        tau_end: float = 0.10,
+        tau_end: float = 0.3,
         tau_anneal_steps: int | None = None,
         patience: int = 20,
         n_epochs_kl_warmup: int = 50,
@@ -70,12 +70,24 @@ class VAETrainer:
         )
         self._last_tau = self.tau_init
 
+        # per-validation history for ATE trajectory plotting
+        self.history: list[dict] = []
+
     @staticmethod
     def _to_numpy(t: torch.Tensor) -> np.ndarray:
         return t.detach().cpu().numpy()
 
     def _kl_weight(self, epoch: int) -> float:
         return min(1.0, epoch / self.n_epochs_kl_warmup)
+
+    def _l0_weight(self, epoch: int) -> float:
+        """Gate sparsity weight: ramps 0→1 over the epoch window
+        [n_epochs_kl_warmup, 2*n_epochs_kl_warmup].  Delaying L0 until after
+        KL warmup prevents gates from collapsing the moment KL weight reaches 1."""
+        delay = self.n_epochs_kl_warmup
+        if epoch <= delay:
+            return 0.0
+        return min(1.0, (epoch - delay) / self.n_epochs_kl_warmup)
 
     def _current_tau(self, step) -> float:
         if self.tau_anneal_steps <= 0 or self.tau_init <= self.tau_end:
@@ -197,7 +209,9 @@ class VAETrainer:
             epoch_loss = 0.0
 
             kl_weight = self._kl_weight(epoch)
+            l0_weight = self._l0_weight(epoch)
             self.vae.kl_weight = kl_weight
+            self.vae.l0_weight = l0_weight
 
             for X_p, X_ntc, P, C, C_ntc in self.dataloader:  # no inner tqdm
                 X_p, X_ntc, P, C, C_ntc = self._move_to_device(X_p, X_ntc, P, C, C_ntc)
@@ -236,6 +250,7 @@ class VAETrainer:
                     pi99=stats["pi99"],
                 )
 
+                self.history.append({"epoch": epoch, "ATE": ate, "pi25": stats["pi25"], "pi99": stats["pi99"]})
 
             # persistent tqdm display (no NA flicker)
             epoch_bar.set_postfix(
@@ -598,5 +613,149 @@ class sVAETrainer:
                 if patience_counter >= self.patience:
                     print(f"Early stopping at epoch {epoch} (best loss={best_loss:.4f})")
                     break
+
+        return best_state, None
+
+
+class SCGENTrainer:
+    """
+    Trains SCGENModel: unconditional VAE + post-training delta fitting.
+
+    The VAE is trained without perturbation labels (p is ignored each batch).
+    After finding the best checkpoint, fit_deltas(adata) is called once to
+    compute and store the per-perturbation delta vectors.
+
+    Parameters
+    ----------
+    model          : SCGENModel instance.
+    dataloader     : DataLoader yielding (x, p) batches (p ignored during training).
+    treat_effect   : AnnData with ground-truth ATEs used for ATE validation.
+    adata          : full AnnData; used for fit_deltas and ATE computation.
+    lr             : Adam learning rate.
+    num_epochs     : maximum training epochs.
+    validate_every : epoch interval between validation passes.
+    patience       : early-stopping patience.
+    device         : torch device.
+    seed           : RNG seed.
+    """
+
+    def __init__(
+        self,
+        model,
+        dataloader,
+        treat_effect,
+        adata=None,
+        lr: float = 1e-4,
+        num_epochs: int = 200,
+        validate_every: int = 10,
+        patience: int = 30,
+        device: torch.device = torch.device("cpu"),
+        seed: int | None = None,
+        non_blocking_copy: bool = True,
+    ):
+        self.model             = model
+        self.dataloader        = dataloader
+        self.treat_effect      = treat_effect
+        self.adata             = adata
+        self.num_epochs        = int(num_epochs)
+        self.validate_every    = max(1, int(validate_every))
+        self.patience          = patience
+        self.non_blocking_copy = non_blocking_copy
+
+        self.device = device
+        self.model.to(self.device)
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+
+        self._last_valid = dict(R2=float("nan"), ATE=float("nan"))
+        self.history: list[dict] = []
+
+    def _to_device(self, x, p):
+        nb = self.non_blocking_copy
+        return (
+            x.to(self.device, dtype=torch.float32, non_blocking=nb),
+            p.to(self.device, dtype=torch.long,    non_blocking=nb),
+        )
+
+    def _validate(self, val_loader) -> dict:
+        from sklearn.metrics import r2_score
+
+        self.model.eval()
+        preds_all, actuals_all = [], []
+        with torch.no_grad():
+            for x, p in val_loader:
+                x, _ = self._to_device(x, p)
+                preds_all.append(self.model.get_recon(x).cpu().numpy())
+                actuals_all.append(x.cpu().numpy())
+
+        r2 = r2_score(
+            np.concatenate(actuals_all).ravel(),
+            np.concatenate(preds_all).ravel(),
+        )
+
+        ate = float("nan")
+        if self.adata is not None and self.treat_effect is not None:
+            self.model.fit_deltas(self.adata, self.device)
+            cf  = self.model.predict_counterfactual_effects(
+                self.adata,
+                observed_effect=self.treat_effect,
+                device=self.device,
+            )
+            ate = float(cf.get("corr", float("nan")))
+
+        return {"r2": r2, "ate": ate}
+
+    def fit(self, val_loader=None) -> tuple:
+        _val_loader = val_loader if val_loader is not None else self.dataloader
+
+        best_loss        = float("inf")
+        best_state       = None
+        patience_counter = 0
+
+        epoch_bar = tqdm(range(1, self.num_epochs + 1), desc="scGEN", dynamic_ncols=True)
+
+        for epoch in epoch_bar:
+            self.model.train()
+            epoch_loss = 0.0
+            for x, p in self.dataloader:
+                x, _ = self._to_device(x, p)   # p unused during training
+                self.optimizer.zero_grad()
+                loss = self.model.loss(x)
+                loss.backward()
+                self.optimizer.step()
+                epoch_loss += loss.item()
+
+            avg_loss = epoch_loss / len(self.dataloader)
+
+            if epoch % self.validate_every == 0:
+                stats = self._validate(_val_loader)
+                self._last_valid["R2"]  = stats["r2"]
+                self._last_valid["ATE"] = stats["ate"]
+
+            self.history.append({"epoch": epoch, "loss": avg_loss, **self._last_valid})
+            epoch_bar.set_postfix(
+                loss=f"{avg_loss:.4f}",
+                R2 =f"{self._last_valid['R2']:.4f}"  if not math.isnan(self._last_valid["R2"])  else "nan",
+                ATE=f"{self._last_valid['ATE']:.4f}" if not math.isnan(self._last_valid["ATE"]) else "nan",
+            )
+
+            if avg_loss < best_loss or epoch < self.num_epochs // 4:
+                best_loss = avg_loss
+                best_state = copy.deepcopy(self.model)
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    print(f"Early stopping at epoch {epoch} (best loss={best_loss:.4f})")
+                    break
+
+        # Store deltas on best checkpoint before returning
+        if best_state is not None and self.adata is not None:
+            best_state.fit_deltas(self.adata, self.device)
 
         return best_state, None

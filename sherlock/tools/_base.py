@@ -280,69 +280,98 @@ class PerturbModelBase(ABC, nn.Module):
         idx2pert = ds.idx_to_pert()
 
         ntc_mask = adata.obs[p_key] == ntc_label
-        x_ntc_raw = adata[ntc_mask].X
-        if hasattr(x_ntc_raw, "toarray"):
-            x_ntc_raw = x_ntc_raw.toarray()
-        x_ntc_t = torch.tensor(np.asarray(x_ntc_raw), dtype=torch.float32, device=device)
+        ntc_adata = adata[ntc_mask]
+
+        # Stratify NTC cells by condition so that per-condition baselines are
+        # computed separately.  In the single-condition case this is a no-op.
+        try:
+            treatment_key = get_config("treatment_key")
+            cond_labels = ntc_adata.obs[treatment_key].values
+            unique_conds = np.unique(cond_labels)
+        except Exception:
+            cond_labels = np.zeros(ntc_mask.sum(), dtype=int)
+            unique_conds = np.array([0])
 
         non_ntc_items = [(i, n) for i, n in idx2pert.items() if n != ntc_label]
         non_ntc_idx   = [i for i, _ in non_ntc_items]
         non_ntc_names = [n for _, n in non_ntc_items]
 
-        # abduct NTC backgrounds; compute all shifts — both done once
-        u_ntc = self._abduct_ntc(x_ntc_t)
-        if u_ntc is None:
-            return {}
-
-        all_shifts = self._get_all_pert_shifts(device)  # (P, d)
+        # Compute all perturbation shifts once (shared across conditions).
+        all_shifts = self._get_all_pert_shifts(device)  # (P+1, ...) with index 0 = NTC
         if all_shifts is None:
             return {}
 
-        # K-means in latent/background space
-        n_k = min(n_centroids, u_ntc.shape[0])
-        km = KMeans(n_clusters=n_k, n_init=10, random_state=0).fit(
-            u_ntc.detach().cpu().numpy()
-        )
+        # Per-condition: abduct NTC backgrounds, K-means centroids, effects.
+        # Effects are then averaged across conditions weighted by NTC cell count.
+        cond_effects_all: dict[str, dict[str, np.ndarray]] = {}
+        cond_sizes: dict[str, int] = {}
 
-        centroids = torch.tensor(
-            km.cluster_centers_,
-            dtype=u_ntc.dtype,
-            device=device,
-        )
-        counts = np.bincount(km.labels_, minlength=n_k)
-        weights = torch.tensor(
-            counts / counts.sum(),
-            dtype=u_ntc.dtype,
-            device=device,
-        )
+        for cond in unique_conds:
+            cond_key = str(cond)
+            cond_ntc_mask = cond_labels == cond
+            x_ntc_cond_raw = ntc_adata[cond_ntc_mask].X
+            if hasattr(x_ntc_cond_raw, "toarray"):
+                x_ntc_cond_raw = x_ntc_cond_raw.toarray()
+            x_ntc_cond_t = torch.tensor(
+                np.asarray(x_ntc_cond_raw), dtype=torch.float32, device=device
+            )
 
-        lib_med = float(x_ntc_t.sum(-1).median().item())
+            u_ntc = self._abduct_ntc(x_ntc_cond_t)
+            if u_ntc is None:
+                return {}
 
-        # NTC baseline: decode centroids with no shift, assuming m_NTC = 0
-        mu_ntc_k = self._decode_to_expr(centroids, lib_med)
-        if mu_ntc_k is None:
-            return {}
+            # K-means in latent/background space for this condition
+            n_k = min(n_centroids, u_ntc.shape[0])
+            km = KMeans(n_clusters=n_k, n_init=10, random_state=0).fit(
+                u_ntc.detach().cpu().numpy()
+            )
+            centroids = torch.tensor(km.cluster_centers_, dtype=u_ntc.dtype, device=device)
+            counts = np.bincount(km.labels_, minlength=n_k)
+            weights = torch.tensor(counts / counts.sum(), dtype=u_ntc.dtype, device=device)
 
-        mu_ntc_avg = (weights[:, None] * mu_ntc_k).sum(0, keepdim=True)
-        ntc_ln = self._lognorm(mu_ntc_avg.detach().cpu().numpy()).squeeze(0)
+            lib_med = float(x_ntc_cond_t.sum(-1).median().item())
 
-        # per-perturbation weighted counterfactual effect in expression space
-        pred_effects = {}
-        for idx, name in zip(non_ntc_idx, non_ntc_names):
-            if idx >= all_shifts.shape[0]:
-                continue
+            # NTC baseline: decode centroids with no shift, assuming m_NTC = 0
+            mu_ntc_k = self._decode_to_expr(centroids, lib_med)
+            if mu_ntc_k is None:
+                return {}
 
-            m_p = all_shifts[[idx]]                         # (1, d)
-            z_cf_k = self._apply_shift(centroids, m_p)      # (K, d)
-            mu_cf_k = self._decode_to_expr(z_cf_k, lib_med) # (K, G)
+            # Normalize each centroid before averaging to match treat_effect's
+            # E[log2-CPM(x)] operation order (Jensen's: f(E[x]) != E[f(x)])
+            ntc_ln_k = self._lognorm(mu_ntc_k.detach().cpu().numpy())   # (K, G)
+            ntc_ln   = (weights.cpu().numpy()[:, None] * ntc_ln_k).sum(0)  # (G,)
 
-            if mu_cf_k is None:
-                continue
+            # per-perturbation counterfactual effect for this condition
+            cond_effects: dict[str, np.ndarray] = {}
+            for idx, name in zip(non_ntc_idx, non_ntc_names):
+                if idx >= all_shifts.shape[0]:
+                    continue
+                m_p    = all_shifts[[idx]]                          # (1, ...)
+                z_cf_k = self._apply_shift(centroids, m_p)          # (K, d)
+                mu_cf_k = self._decode_to_expr(z_cf_k, lib_med)     # (K, G)
+                if mu_cf_k is None:
+                    continue
+                cf_ln_k = self._lognorm(mu_cf_k.detach().cpu().numpy())   # (K, G)
+                cf_ln   = (weights.cpu().numpy()[:, None] * cf_ln_k).sum(0)  # (G,)
+                cond_effects[name] = cf_ln - ntc_ln                 # (G,)
 
-            mu_cf_avg = (weights[:, None] * mu_cf_k).sum(0, keepdim=True)
-            cf_ln = self._lognorm(mu_cf_avg.detach().cpu().numpy()).squeeze(0)
+            cond_effects_all[cond_key] = cond_effects
+            cond_sizes[cond_key] = int(cond_ntc_mask.sum())
 
-            pred_effects[name] = cf_ln - ntc_ln             # (G,)
+        # Weighted average of per-condition effects (weight = NTC cell count).
+        all_pert_names = {nm for ce in cond_effects_all.values() for nm in ce}
+        pred_effects: dict[str, np.ndarray] = {}
+        for name in all_pert_names:
+            weighted: np.ndarray | None = None
+            weight_sum = 0
+            for cond_key, cond_effects in cond_effects_all.items():
+                if name not in cond_effects:
+                    continue
+                w = cond_sizes[cond_key]
+                weighted = cond_effects[name] * w if weighted is None else weighted + cond_effects[name] * w
+                weight_sum += w
+            if weighted is not None and weight_sum > 0:
+                pred_effects[name] = weighted / weight_sum
 
         # Build predicted effect DataFrame.
         if len(pred_effects) == 0:
@@ -505,6 +534,7 @@ class PerturbModelBase(ABC, nn.Module):
 
         uns_data: dict = {
             "z_corr":    z_corr,
+            "z_perts":   z_perts,
             "perts":     perts,
             "rho_corr":  rho_corr,
             "rho_perts": rho_perts,
