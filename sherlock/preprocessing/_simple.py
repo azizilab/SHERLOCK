@@ -6,13 +6,20 @@ import numpy as np
 from tqdm import tqdm
 import pandas as pd
 
-def slk_prepare_data(data: AnnData, pert_key: str, ntc_label: str, treatment_key: str = None, untreated_label: str = None, inplace: bool = True) -> AnnData:
+def slk_prepare_data(data: AnnData, pert_key: str, ntc_label: str, treatment_key: str = None, untreated_label: str = None, inplace: bool = True, force: bool = False) -> AnnData:
 
     if not inplace:
         data = data.copy()
 
     model_treatment_key = get_config('treatment_key')
     model_untreated_label = get_config('untreated_label')
+    model_pert_key = get_config('pert_key')
+
+    if not force:
+        if model_treatment_key in data.obs.columns and model_treatment_key != treatment_key:
+            raise ValueError(f"Column '{model_treatment_key}' already exists in data.obs. Rename the existing column or use force=True to overwrite.")
+        if model_pert_key in data.obs.columns and model_pert_key != pert_key:
+            raise ValueError(f"Column '{model_pert_key}' already exists in data.obs. Rename the existing column or use force=True to overwrite.")
 
     if treatment_key is None:
         data.obs[model_treatment_key] = model_untreated_label
@@ -23,7 +30,6 @@ def slk_prepare_data(data: AnnData, pert_key: str, ntc_label: str, treatment_key
         assert sum(untreated_idx) > 0, f"No cells with {treatment_key} == {untreated_label} found."
         data.obs.loc[untreated_idx, model_treatment_key] = model_untreated_label
 
-    model_pert_key = get_config('pert_key')
     model_ntc_label = get_config('ntc_label')
 
     data.obs[model_pert_key] = data.obs[pert_key].astype(str)
