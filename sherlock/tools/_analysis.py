@@ -248,14 +248,15 @@ def compute_clustering_metrics(
     uns_key: str = "results",
     knn_k: int = 5,
     linear_probe_cv: int = 5,
+    use_rho: bool = True,
 ) -> dict:
     """
     Cluster perturbations by latent similarity and score against pathway annotations.
 
-    Hierarchically clusters on the pathway-gene subset of rho_corr, then
-    evaluates the full suite of clustering metrics vs ground-truth pathway labels.
-    Embedding-based metrics (silhouette, kNN purity, linear probe) use rho_embed
-    stored by eval().
+    Hierarchically clusters on the pathway-gene subset of rho_corr (use_rho=True)
+    or z_corr (use_rho=False), then evaluates the full suite of clustering metrics
+    vs ground-truth pathway labels. Embedding-based metrics (silhouette, kNN purity,
+    linear probe) use rho_embed or z_embed stored by eval().
 
     Parameters
     ----------
@@ -266,6 +267,7 @@ def compute_clustering_metrics(
     uns_key            : key in adata.uns to read results from
     knn_k              : number of nearest neighbours for knn_purity
     linear_probe_cv    : number of StratifiedKFold splits for linear probe
+    use_rho            : if True use rho_corr/rho_embed; if False use z_corr/z_embed
 
     Returns
     -------
@@ -286,13 +288,19 @@ def compute_clustering_metrics(
     nan_dict = {k: np.nan for k in _nan_keys}
 
     results = adata.uns.get(uns_key, {})
-    if "rho_corr" not in results or "rho_perts" not in results:
-        print("Warning: Missing 'rho_corr' or 'rho_perts' in adata.uns[uns_key]. Cannot compute clustering metrics.")
+
+    if use_rho:
+        corr_key, perts_key, embed_key = "rho_corr", "rho_perts", "rho_embed"
+    else:
+        corr_key, perts_key, embed_key = "z_corr", "z_perts", "z_embed"
+
+    if corr_key not in results or perts_key not in results:
+        print(f"Warning: Missing '{corr_key}' or '{perts_key}' in adata.uns[uns_key]. Cannot compute clustering metrics.")
         return nan_dict
 
-    C          = np.asarray(results["rho_corr"], dtype=float)
-    perts      = np.asarray(results["rho_perts"])
-    rho_embed  = results.get("rho_embed")
+    C          = np.asarray(results[corr_key], dtype=float)
+    perts      = np.asarray(results[perts_key])
+    rho_embed  = results.get(embed_key)
 
     if C.ndim != 2 or C.shape[0] != C.shape[1] or C.shape[0] < 4:
         return nan_dict
@@ -437,6 +445,7 @@ def evaluate_model(
     device=None,
     batch_size: int = 1024,
     uns_key: str = "results",
+    use_rho: bool = True,
 ) -> dict:
     """
     Run inference on adata, then compute all benchmark metrics.
@@ -473,7 +482,7 @@ def evaluate_model(
 
     metrics: dict = {}
     metrics.update(compute_cf_ate_metrics(model, adata, treat_effect_adata))
-    metrics.update(compute_clustering_metrics(adata, pathway_df_indexed, all_genes_filtered, n_clusters=n_clusters, uns_key=uns_key))
+    metrics.update(compute_clustering_metrics(adata, pathway_df_indexed, all_genes_filtered, n_clusters=n_clusters, uns_key=uns_key, use_rho=use_rho))
 
     # Pearson r between upper-triangle of rho_corr and z_corr
     results_uns = adata.uns.get(uns_key, {})

@@ -48,7 +48,12 @@ def save_results(results, path: str, model=None, param_store=None) -> None:
     }
 
     if results.get("param_store") is not None:
-        payload["pyro_param_store"] = results["param_store"]
+        param_store = results["param_store"]
+        # pyro.param() access after get_state() re-adds weakrefs to unconstrained
+        # params; strip them before pickling (mirrors what get_state() does).
+        for p in param_store.get("params", {}).values():
+            p.__dict__.pop("unconstrained", None)
+        payload["pyro_param_store"] = param_store
 
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)

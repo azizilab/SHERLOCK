@@ -119,6 +119,42 @@ class MultiClassBatchSampler(Sampler[list[int]]):
 
             yield batch_idxs
 
+class _PerturbCollateFn:
+    """Picklable collate callable for PerturbMatchingDataset (required for num_workers > 0)."""
+
+    def __init__(self, n_ntc, X_ntc):
+        self.n_ntc = n_ntc
+        self.X_ntc = X_ntc
+
+    def __call__(self, batch):
+        n_ntc = self.n_ntc
+        X_ntc = self.X_ntc
+        rng   = np.random.default_rng()
+
+        x_p_list, p_list, c_list = zip(*batch)
+        x_p = torch.from_numpy(np.stack(x_p_list).astype(np.float32))
+        c   = torch.tensor(list(c_list), dtype=torch.long)
+
+        if isinstance(p_list[0], np.ndarray):
+            p = torch.from_numpy(np.stack(p_list))
+        else:
+            p = torch.tensor(list(p_list), dtype=torch.long)
+
+        unique_conds = np.unique(list(c_list))
+        ntc_chunks, c_ntc_chunks = [], []
+        for cond_i in unique_conds:
+            pool = X_ntc[int(cond_i)]
+            n    = min(n_ntc, len(pool))
+            idx  = rng.choice(len(pool), size=n, replace=False)
+            ntc_chunks.append(pool[idx].astype(np.float32))
+            c_ntc_chunks.extend([int(cond_i)] * n)
+
+        x_ntc = torch.from_numpy(np.concatenate(ntc_chunks, axis=0))
+        c_ntc = torch.tensor(c_ntc_chunks, dtype=torch.long)
+
+        return x_p, x_ntc, p, c, c_ntc
+
+
 class PerturbMatchingDataset(Dataset):
     """
     Dataset of perturbed cells paired with a batch of NTC cells.
@@ -234,36 +270,7 @@ class PerturbMatchingDataset(Dataset):
           c     : (n,)                    long      — condition of each perturbed cell
           c_ntc : (n_conds * n_ntc,)      long      — condition of each NTC cell
         """
-        n_ntc = self.n_ntc
-        X_ntc = self.X_ntc   # list[ndarray] indexed by condition int
-        rng   = np.random.default_rng()
-
-        def collate_fn(batch):
-            x_p_list, p_list, c_list = zip(*batch)
-            x_p = torch.from_numpy(np.stack(x_p_list).astype(np.float32))
-            c   = torch.tensor(list(c_list), dtype=torch.long)
-
-            if isinstance(p_list[0], np.ndarray):
-                p = torch.from_numpy(np.stack(p_list))
-            else:
-                p = torch.tensor(list(p_list), dtype=torch.long)
-
-            # sample n_ntc NTC cells for each condition present in this batch
-            unique_conds = np.unique(list(c_list))
-            ntc_chunks, c_ntc_chunks = [], []
-            for cond_i in unique_conds:
-                pool = X_ntc[int(cond_i)]            # (N_cond, G)
-                n    = min(n_ntc, len(pool))
-                idx  = rng.choice(len(pool), size=n, replace=False)
-                ntc_chunks.append(pool[idx].astype(np.float32))
-                c_ntc_chunks.extend([int(cond_i)] * n)
-
-            x_ntc = torch.from_numpy(np.concatenate(ntc_chunks, axis=0))
-            c_ntc = torch.tensor(c_ntc_chunks, dtype=torch.long)
-
-            return x_p, x_ntc, p, c, c_ntc
-
-        return collate_fn
+        return _PerturbCollateFn(self.n_ntc, self.X_ntc)
 
 
 class PerturbSimpleDataset(Dataset):
@@ -274,16 +281,22 @@ class PerturbSimpleDataset(Dataset):
     included.  NTC is assigned index 0; non-NTC perturbations follow in
     sorted order.  No on-the-fly NTC pairing is performed.
 
-    This is the dataset used by cVAE (and by the universal eval loop in
-    PerturbModelBase.eval()) because all models can accept a plain
-    (x, p_idx) batch.
+    This is the dataset used by cVAE/sVAE (and by the universal eval loop in
+    PerturbModelBase.eval()) because all models can accept a plain (x, p_idx)
+    batch.
 
     Parameters
     ----------
-    anndata    : AnnData with obs[pert_key] containing perturbation labels.
-    pert_key   : column in anndata.obs with perturbation labels.
-    ntc_label  : label for non-targeting control cells.
-    subset_obs : optional boolean mask or integer indices to select a subset.
+    anndata       : AnnData with obs[pert_key] containing perturbation labels.
+    pert_key      : column in anndata.obs with perturbation labels.
+    ntc_label     : label for non-targeting control cells.
+    subset_obs    : optional boolean mask or integer indices to select a subset.
+    combinatorial : if True, split labels on "+" and index individual genes.
+                    NTC stays at 0; individual genes fill 1..P alphabetically.
+                    P_indices becomes (N, 2) — NTC→[0,-1], single→[idx,-1],
+                    combo→[idx1,idx2]. cVAE/sVAE models sum component shifts
+                    for combinatorial cells. scGen leaves this False and treats
+                    each combined label as a new atomic index.
     """
 
     def __init__(
@@ -292,12 +305,14 @@ class PerturbSimpleDataset(Dataset):
         pert_key: str = "pert",
         ntc_label: str = "NTC",
         subset_obs=None,
+        combinatorial: bool = False,
     ):
         if subset_obs is not None:
             anndata = anndata[subset_obs]
 
         self.pert_key = pert_key
         self.ntc_label = ntc_label
+        self.combinatorial = combinatorial
 
         X = anndata.X
         self.X = (X.toarray() if hasattr(X, "toarray") else np.asarray(X)).astype(np.float32)
@@ -306,31 +321,66 @@ class PerturbSimpleDataset(Dataset):
         if pd.isna(raw_labels).any():
             raise ValueError(f"obs['{pert_key}'] contains NaN values.")
 
-        unique_perts = np.unique(raw_labels)
-        if ntc_label not in unique_perts:
-            raise ValueError(
-                f"ntc_label '{ntc_label}' not found in obs['{pert_key}']. "
-                f"Available: {unique_perts[:10].tolist()} …"
+        if not combinatorial:
+            unique_perts = np.unique(raw_labels)
+            if ntc_label not in unique_perts:
+                raise ValueError(
+                    f"ntc_label '{ntc_label}' not found in obs['{pert_key}']. "
+                    f"Available: {unique_perts[:10].tolist()} …"
+                )
+            # NTC → 0, everything else alphabetically
+            non_ntc = sorted(p for p in unique_perts if p != ntc_label)
+            self.perturbation_dict: dict[str, int] = {
+                p: i for i, p in enumerate([ntc_label] + non_ntc)
+            }
+            self.P_indices = np.array(
+                [self.perturbation_dict[p] for p in raw_labels], dtype=np.int64
             )
+        else:
+            # NTC stays at 0; individual gene components fill 1..P alphabetically.
+            # This keeps the same NTC=0 convention as the non-combinatorial path so
+            # model embedding tables (pert_emb padding_idx=0, action_prior_mean[0])
+            # align without any index remapping.
+            gene_set: set[str] = set()
+            for lbl in raw_labels:
+                s = str(lbl)
+                if s == ntc_label:
+                    continue
+                if "+" in s:
+                    gene_set.update(x.strip() for x in s.split("+") if x.strip())
+                else:
+                    gene_set.add(s.strip())
+            gene_unique = sorted(gene_set)
+            self.perturbation_dict = {ntc_label: 0}
+            for i, g in enumerate(gene_unique, 1):
+                self.perturbation_dict[g] = i
 
-        # NTC → 0, everything else alphabetically
-        non_ntc = sorted(p for p in unique_perts if p != ntc_label)
-        self.perturbation_dict: dict[str, int] = {
-            p: i for i, p in enumerate([ntc_label] + non_ntc)
-        }
-        self.P_indices = np.array(
-            [self.perturbation_dict[p] for p in raw_labels], dtype=np.int64
-        )
+            # (N, 2): NTC→[0,-1], single gene→[idx,-1], combo→[idx1,idx2]
+            P2 = np.full((len(raw_labels), 2), -1, dtype=np.int64)
+            for i, lbl in enumerate(raw_labels):
+                s = str(lbl)
+                if s == ntc_label:
+                    P2[i, 0] = 0
+                elif "+" in s:
+                    toks = [x.strip() for x in s.split("+") if x.strip()]
+                    if len(toks) >= 1:
+                        P2[i, 0] = self.perturbation_dict[toks[0]]
+                    if len(toks) >= 2:
+                        P2[i, 1] = self.perturbation_dict[toks[1]]
+                else:
+                    P2[i, 0] = self.perturbation_dict[s.strip()]
+            self.P_indices = P2
+
         self.var_names: list[str] = anndata.var_names.tolist()
 
     def __len__(self) -> int:
         return self.X.shape[0]
 
     def __getitem__(self, idx: int):
-        return (
-            torch.from_numpy(self.X[idx]),
-            torch.tensor(self.P_indices[idx], dtype=torch.long),
-        )
+        x = torch.from_numpy(self.X[idx])
+        if self.combinatorial:
+            return x, torch.from_numpy(self.P_indices[idx])
+        return x, torch.tensor(self.P_indices[idx], dtype=torch.long)
 
     @property
     def ntc_idx(self) -> int:

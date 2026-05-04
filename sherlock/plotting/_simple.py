@@ -7,7 +7,6 @@ import numpy as np
 import seaborn as sns
 from scipy.cluster.hierarchy import linkage, leaves_list
 from matplotlib import gridspec
-import torch
 import pandas as pd
 
 from .._configs import get_config
@@ -22,14 +21,18 @@ def plot_r2(adata):
     
     prediction = adata[adata.obs[p_key] != NTC].layers['x_pred']
 
-    r2 = r2_score(X_p.flatten(), prediction.flatten())
+    import scipy.sparse as sp
+    X_p_dense = X_p.toarray() if sp.issparse(X_p) else np.asarray(X_p)
+    pred_dense = prediction.toarray() if sp.issparse(prediction) else np.asarray(prediction)
 
-    idx = np.arange(0, X_p.shape[0])
+    r2 = r2_score(X_p_dense.flatten(), pred_dense.flatten())
+
+    idx = np.arange(0, X_p_dense.shape[0])
     np.random.shuffle(idx)
     idx = idx[:1000]
 
-    true_vals = X_p[idx].flatten()
-    pred_vals = prediction[idx].flatten()
+    true_vals = X_p_dense[idx].flatten()
+    pred_vals = pred_dense[idx].flatten()
 
     # Scatterplot
     plt.figure(figsize=(8, 6))
@@ -55,6 +58,133 @@ def plot_r2(adata):
 def plot_corr(adata, uns_key='results'):
     corr = adata.uns[uns_key]['rho_corr']
     sns.clustermap(corr, cmap="coolwarm", annot=False)
+
+def plot_synergy(
+    adata,
+    uns_key='results',
+    n_post=500,
+    n_null=200,
+    seed=0,
+    show=True
+):
+    """
+    Plot the (P, P) synergy matrix and return synergy pairs sorted high→low.
+
+    Significance: one-sided paired t-test on (post_norm - background_mean),
+    where background_mean is the mean posterior synergy norm over n_null random
+    pairs per posterior draw.  Because observed and background pairs use the
+    same posterior sample, prior scale cancels out — the test is invariant to
+    the global scale of U/V and asks purely whether this pair stands out above
+    the background level of synergy in the learned model.
+
+    effect_size = post_mean / background_mean  (>1 = above background).
+    """
+    from scipy.stats import ttest_1samp
+    uns = adata.uns[uns_key]
+    syn = uns.get('synergy_matrix')
+    if syn is None:
+        print("No synergy_matrix in results. Train with use_synergy=True and re-run eval().")
+        return None
+
+    pert_names = uns.get('rho_perts', np.arange(syn.shape[0]))
+
+    # Build pair table (upper triangle of observed non-zero entries)
+    rows, pair_idx = [], []
+    for i in range(syn.shape[0]):
+        for j in range(i + 1, syn.shape[1]):
+            if syn[i, j] != 0:
+                rows.append({"pert_i": pert_names[i], "pert_j": pert_names[j], "synergy": syn[i, j]})
+                pair_idx.append((i, j))
+
+    synergy_pairs_df = pd.DataFrame(rows)
+    if len(synergy_pairs_df) == 0:
+        return synergy_pairs_df
+
+    synergy_params = uns.get('synergy_params')
+    if synergy_params is None:
+        print("No synergy_params in results. Re-run eval() to enable p-value computation.")
+        return synergy_pairs_df.sort_values("synergy", ascending=False).reset_index(drop=True)
+
+    A       = synergy_params['A']      # (P, d)
+    U_loc   = synergy_params['U_loc']  # (d, d, r)
+    U_scale = synergy_params['U_scale']
+    V_loc   = synergy_params['V_loc']
+    V_scale = synergy_params['V_scale']
+
+    P_total = A.shape[0]
+    rng = np.random.default_rng(seed)
+
+    # Random background pairs (diagonal excluded; may overlap with observed —
+    # we want the background level of synergy in the model, not a holdout test)
+    null_i = rng.integers(0, P_total, size=n_null)
+    null_j = rng.integers(0, P_total, size=n_null)
+    null_j[null_i == null_j] = (null_j[null_i == null_j] + 1) % P_total
+
+    # Pre-sample posterior draws once, reuse for both observed and background
+    U_samp = rng.normal(U_loc, U_scale, size=(n_post,) + U_loc.shape)  # (S, d, d, r)
+    V_samp = rng.normal(V_loc, V_scale, size=(n_post,) + V_loc.shape)
+
+    post_norms = np.zeros((n_post, len(pair_idx)), dtype=float)
+    null_mean  = np.zeros(n_post, dtype=float)   # mean background norm per draw
+
+    for s in range(n_post):
+        Us, Vs = U_samp[s], V_samp[s]
+
+        for k, (i, j) in enumerate(pair_idx):
+            Ux = np.einsum("dir,i->dr", Us, A[i])
+            Vy = np.einsum("dir,i->dr", Vs, A[j])
+            post_norms[s, k] = np.linalg.norm((Ux * Vy).sum(-1))
+
+        bg = 0.0
+        for m in range(n_null):
+            Ux = np.einsum("dir,i->dr", Us, A[null_i[m]])
+            Vy = np.einsum("dir,i->dr", Vs, A[null_j[m]])
+            bg += np.linalg.norm((Ux * Vy).sum(-1))
+        null_mean[s] = bg / n_null
+
+    bg_global = null_mean.mean()
+    synergy_pairs_df["post_mean"]   = post_norms.mean(axis=0)
+    synergy_pairs_df["null_mean"]   = bg_global
+    synergy_pairs_df["effect_size"] = synergy_pairs_df["post_mean"] / max(bg_global, 1e-12)
+
+    # Paired one-sided t-test: H1: (post_norm - background_mean) > 0 per posterior draw
+    pvals = []
+    for k in range(len(pair_idx)):
+        diffs = post_norms[:, k] - null_mean   # paired: same U/V draw
+        res = ttest_1samp(diffs, 0.0, alternative='greater')
+        pvals.append(float(res.pvalue))
+
+    synergy_pairs_df["pval"] = np.asarray(pvals)
+
+    # Benjamini-Hochberg FDR
+    pv    = synergy_pairs_df["pval"].to_numpy()
+    order = np.argsort(pv)
+    q     = pv[order] * len(pv) / np.arange(1, len(pv) + 1)
+    q     = np.minimum.accumulate(q[::-1])[::-1]
+    qvals = np.empty_like(q)
+    qvals[order] = np.minimum(q, 1.0)
+    synergy_pairs_df["qval"] = qvals
+
+    # Heatmap colored by -log10(q-value); unobserved pairs stay at 0
+    P = syn.shape[0]
+    neg_log_q = np.zeros((P, P), dtype=float)
+    for k, (i, j) in enumerate(pair_idx):
+        v = -np.log10(np.clip(qvals[k], 1e-300, 1.0))
+        neg_log_q[i, j] = v
+        neg_log_q[j, i] = v
+        
+    if show:
+        heat_df = pd.DataFrame(neg_log_q, index=pert_names, columns=pert_names)
+        fig_h = max(6, P * 0.25 + 2)
+        plt.figure(figsize=(fig_h, fig_h))
+        ax = sns.heatmap(heat_df, cmap="viridis", annot=False, vmin=0)
+        ax.set_title(r"Pairwise synergy  $-\log_{10}(q)$")
+        ax.set_xlabel("Perturbation j")
+        ax.set_ylabel("Perturbation i")
+        plt.tight_layout()
+        plt.show()
+
+    return synergy_pairs_df.sort_values("synergy", ascending=False).reset_index(drop=True)
 
 def plot_zcorr(adata, uns_key='results'):
     

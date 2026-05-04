@@ -90,20 +90,22 @@ class VAE(PerturbModelBase):
         l0_lambda=1.0,
         l1_lambda=1e-3,
         l2_lambda=1e-3,
-        H_lambda=1e-3,
+        H_lambda=1e-1,
         ce_lambda=10,
         ntc_lambda=1e-5,
         pert_lambda=1.0,
-        cov_lambda=1e-4,
-        gate_row_repulsion_lambda=1e-3,
+        cov_lambda=1e-5,
+        gate_row_repulsion_lambda=1e-2,
         gate_init_p=0.5,
         rank=6,
         use_conditions=False,
         shift='linear',
         use_synergy=False,
+        synergy_rank=4,
         use_de_align_loss=False,
         de_align_lambda=1e-3,
         treat_effect_map=None,
+        combinatorial=False,
     ):
         super().__init__()
         assert shift in ['poe', 'linear'], "shift must be 'poe' or 'linear'"
@@ -116,6 +118,8 @@ class VAE(PerturbModelBase):
         self.rank = rank
         self.shift = shift
         self.use_synergy = use_synergy
+        self.synergy_rank = synergy_rank
+        self.combinatorial = combinatorial
 
         # reg weights
         self.l0_lambda = float(l0_lambda)
@@ -180,24 +184,7 @@ class VAE(PerturbModelBase):
         # (ramps 0→1 only after KL warmup ends to prevent gate collapse on warmup exit)
         self.l0_weight = 0.0
 
-        # synergy: one latent vector per unique unordered pair (p1, p2), p1 < p2
-        # Single-perturbation synergy is 0 by definition (not in this set).
-        self.use_synergy = use_synergy
-        if use_synergy:
-            n_combos = perturbs * (perturbs - 1) // 2
-            self.n_combos = n_combos
-            self.syn_emb = nn.Embedding(n_combos, latent_dim)
-            nn.init.zeros_(self.syn_emb.weight)
 
-            # (P, P) lookup: pair_idx[i, j] = combo index for pair (i,j), -1 on diagonal
-            pair_idx = torch.full((perturbs, perturbs), -1, dtype=torch.long)
-            k = 0
-            for i in range(perturbs):
-                for j in range(i + 1, perturbs):
-                    pair_idx[i, j] = k
-                    pair_idx[j, i] = k
-                    k += 1
-            self.register_buffer("pair_idx", pair_idx)
 
     # --- helpers ---
     @torch.no_grad()
@@ -285,36 +272,59 @@ class VAE(PerturbModelBase):
             pyro.factor("gate_row_repulsion", - self.gate_row_repulsion_lambda * repulsion)
 
         if self.use_synergy:
-            with pyro.plate("combos", self.n_combos):
-                syn = pyro.sample(
-                    "syn",
-                    dist.HalfCauchy(torch.ones(self.latent_dim, device=device)).to_event(1),
-                    infer={"scale": self.kl_weight},
-                )
+            syn_scale = pyro.sample(
+                "syn_scale",
+                dist.HalfNormal(torch.tensor(1.0, device=device)),
+                infer={"scale": self.kl_weight},
+            )
+            U_syn = pyro.sample(
+                "U_syn",
+                dist.Normal(
+                    torch.zeros(self.latent_dim, self.latent_dim, self.synergy_rank, device=device),
+                    syn_scale,
+                ).to_event(3),
+                infer={"scale": self.kl_weight},
+            )
+            V_syn = pyro.sample(
+                "V_syn",
+                dist.Normal(
+                    torch.zeros(self.latent_dim, self.latent_dim, self.synergy_rank, device=device),
+                    syn_scale,
+                ).to_event(3),
+                infer={"scale": self.kl_weight},
+            )
 
         # ── per-perturbed-cell shift ─────────────────────────────────────
         n_ntc = x_ntc.size(0)
         n     = x_p.size(0)
         n_all = n_ntc + n
 
-        lin_shift_p = A[p] * W[p]
         if p.ndim > 1:  # combinatorial
+            p_safe      = p.clamp(min=0)
             comb_mask   = (p != -1).float().unsqueeze(-1)              # (n, K, 1)
-            lin_shift_p = (lin_shift_p * comb_mask).sum(dim=1)         # (n, d)
-            W_p_eff     = (W[p.clamp(min=0)] * comb_mask).sum(dim=1).clamp(0, 1)  # (n, d)
+            lin_shift_p = (A[p_safe] * W[p_safe] * comb_mask).sum(dim=1)  # (n, d)
+            W_p_eff     = (W[p_safe] * comb_mask).sum(dim=1).clamp(0, 1)  # (n, d)
         else:
-            W_p_eff = W[p]  # (n, d)
+            lin_shift_p = A[p] * W[p]                                  # (n, d)
+            W_p_eff     = W[p]                                         # (n, d)
 
+        # ── synergy shift: bilinear pooling on unmasked rho embeddings ───
         if self.use_synergy:
             if p.ndim == 1:
                 syn_shift_p = torch.zeros(n, self.latent_dim, device=device)
             else:
                 p0 = p[:, 0].clamp(min=0)
                 p1 = p[:, 1].clamp(min=0)
-                syn_idx     = self.pair_idx[p0, p1]
-                valid       = (syn_idx >= 0).float().unsqueeze(-1)
-                syn_shift_p = syn[syn_idx.clamp(min=0)] * valid
-            lin_shift_p = lin_shift_p + syn_shift_p
+                x_syn = A[p0]  # (n, d)
+                y_syn = A[p1]  # (n, d)
+                Ux = torch.einsum('dir,ni->ndr', U_syn, x_syn)   # (n, d, r)
+                Vy = torch.einsum('dir,ni->ndr', V_syn, y_syn)   # (n, d, r)
+                syn_shift_p = (Ux * Vy).sum(-1)                  # (n, d)
+                valid_mask = (p[:, 1] != -1).float().unsqueeze(-1)
+                syn_shift_p = syn_shift_p * valid_mask
+            syn_all = torch.cat(
+                [torch.zeros(n_ntc, self.latent_dim, device=device), syn_shift_p], dim=0
+            )
 
         # ── n_all tensors: NTC cells first (W=0), perturbed cells second ─
         zeros_ntc     = torch.zeros(n_ntc, self.latent_dim, device=device)
@@ -354,6 +364,9 @@ class VAE(PerturbModelBase):
                 z_loc = z0_mod + lin_shift_all
             else:
                 raise ValueError("Invalid shift type")
+
+            if self.use_synergy:
+                z_loc = z_loc + syn_all
 
             z = pyro.sample("z", dist.Normal(z_loc, torch.sqrt(z_var)).to_event(1), infer={"scale": self.kl_weight})
 
@@ -397,9 +410,34 @@ class VAE(PerturbModelBase):
             pyro.sample("rho", dist.Normal(q_loc, torch.ones_like(q_loc)).to_event(1), infer={"scale": self.kl_weight})
 
         if self.use_synergy:
-            syn_scale = F.softplus(self.syn_emb.weight)
-            with pyro.plate("combos", self.n_combos):
-                pyro.sample("syn", dist.HalfNormal(syn_scale).to_event(1), infer={"scale": self.kl_weight})
+            device = x_p.device
+            syn_scale_val = pyro.param(
+                "syn_scale_val",
+                torch.tensor(0.5, device=device),
+                constraint=constraints.positive,
+            )
+            pyro.sample("syn_scale", dist.Delta(syn_scale_val))
+
+            U_syn_loc = pyro.param(
+                "U_syn_loc",
+                0.01 * torch.randn(self.latent_dim, self.latent_dim, self.synergy_rank, device=device),
+            )
+            U_syn_scale = pyro.param(
+                "U_syn_scale",
+                0.05 * torch.ones(self.latent_dim, self.latent_dim, self.synergy_rank, device=device),
+                constraint=constraints.positive,
+            )
+            V_syn_loc = pyro.param(
+                "V_syn_loc",
+                0.01 * torch.randn(self.latent_dim, self.latent_dim, self.synergy_rank, device=device),
+            )
+            V_syn_scale = pyro.param(
+                "V_syn_scale",
+                0.05 * torch.ones(self.latent_dim, self.latent_dim, self.synergy_rank, device=device),
+                constraint=constraints.positive,
+            )
+            pyro.sample("U_syn", dist.Normal(U_syn_loc, U_syn_scale).to_event(3), infer={"scale": self.kl_weight})
+            pyro.sample("V_syn", dist.Normal(V_syn_loc, V_syn_scale).to_event(3), infer={"scale": self.kl_weight})
 
         # z0: encode all NTC cells; assign each perturbed cell the mean z0 of its condition
         z0_mu_ntc, z0_logvar_ntc = self.z0_encoder(x_ntc).chunk(2, dim=-1)
@@ -450,6 +488,9 @@ class VAE(PerturbModelBase):
             "use_conditions": bool(self.use_conditions),
             "rank":           self.rank,
             "shift":          self.shift,
+            "use_synergy":    bool(self.use_synergy),
+            "synergy_rank":   self.synergy_rank,
+            "combinatorial":  self.combinatorial,
         }
 
     def get_z(self, x: torch.Tensor, p: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
@@ -515,26 +556,63 @@ class VAE(PerturbModelBase):
         chol_P = torch.linalg.cholesky(L @ L.T + sigma ** 2 * torch.eye(self.perturbs, device=device))
         A = chol_P @ self.rho_enc(self.p_emb.weight).detach()
         W = self.gate(deterministic=True).detach()
-        out = torch.stack([A * W, W], dim=1)  # (P, 2, d) for unpacking in _apply_shift
-        return torch.cat([out.new_zeros((1, 2, self.latent_dim)), out], dim=0) #0 is NTC for this function
+
+        syn = torch.zeros_like(A)
+
+        out = torch.stack([A * W, W, A, syn], dim=1)  # (P, 4, d) for unpacking in _apply_shift
+        return torch.cat([out.new_zeros((1, 4, self.latent_dim)), out], dim=0) #0 is NTC for this function
 
     @torch.no_grad()
     def _apply_shift(self, u: torch.Tensor, m_p: torch.Tensor) -> torch.Tensor:
-        """NOTE: m_p here is stacked (A*W, W) from _get_all_pert_shifts, not just A*W."""
-        """Apply perturbation shift via PoE or linear, matching the training objective."""
+        """Apply perturbation shift via PoE or linear."""
 
-        #TODO fix poe, use combinatorial, incorporate synergy
+        m_p, w_p, a_p, s_p = (
+            m_p[:, 0, :],
+            m_p[:, 1, :],
+            m_p[:, 2, :],
+            m_p[:, 3, :],
+        )
 
-        m_p, w_p = m_p[:, 0, :], m_p[:, 1, :]  # unpack shift components
         u_mod = u * (1.0 - w_p)
 
         if self.shift == "poe":
-            W_scale = pyro.param("W_scale", 0.1 * torch.ones(self.latent_dim), constraint=constraints.positive).to(u.device)
-            return self.__poe(u_mod, m_p, W_scale.pow(2))
+            W_scale = pyro.param(
+                "W_scale",
+                0.1 * torch.ones(self.latent_dim),
+                constraint=constraints.positive,
+            ).to(u.device)
+            return self.__poe(u_mod, m_p, W_scale.pow(2)) + s_p
+
         elif self.shift == "linear":
-            return u_mod + m_p
-            
+            return u_mod + m_p + s_p
+
         raise ValueError("Invalid shift type")
+
+    @torch.no_grad()
+    def _combine_pert_shifts(self, m1: torch.Tensor, m2: torch.Tensor) -> torch.Tensor:
+        """Union-merge stacked (A*W, W, A, syn) shift tensors for combinatorial perturbations."""
+
+        shift = m1[:, 0, :] + m2[:, 0, :]
+        gate  = (m1[:, 1, :] + m2[:, 1, :]).clamp(0.0, 1.0)
+
+        a_i = m1[:, 2, :]
+        a_j = m2[:, 2, :]
+
+        if self.use_synergy:
+            U_syn = pyro.param("U_syn_loc").to(m1.device)
+            V_syn = pyro.param("V_syn_loc").to(m1.device)
+
+            Ux = torch.einsum("dir,bi->bdr", U_syn, a_i)
+            Vy = torch.einsum("dir,bi->bdr", V_syn, a_j)
+            syn = (Ux * Vy).sum(-1)
+        else:
+            syn = torch.zeros_like(shift)
+
+        # keep raw A slot zero after combining because we only need it before computing syn
+        return torch.stack(
+            [shift, gate, torch.zeros_like(shift), syn],
+            dim=1,
+        )
 
     @torch.no_grad()
     def _decode_to_expr(self, z: torch.Tensor, lib_size: float) -> torch.Tensor:
@@ -566,7 +644,10 @@ class VAE(PerturbModelBase):
         x_norm_all = torch.log1p(x_all / lib_all * med)
 
         N, G = x_all.shape
-        ntc_mask = (p_all == dataset.ntc_idx)  # True for NTC cells
+        if p_all.ndim == 2:
+            ntc_mask = (p_all[:, 0] == dataset.ntc_idx) & (p_all[:, 1] == -1)
+        else:
+            ntc_mask = p_all == dataset.ntc_idx
 
         z_out    = torch.empty(N, self.latent_dim)
         recon_out = torch.empty(N, G)
@@ -691,6 +772,43 @@ class VAE(PerturbModelBase):
         return score.astype(np.float32)
 
     @torch.no_grad()
+    def get_synergy_matrix(self, observed_pairs=None) -> np.ndarray:
+        """
+        Returns a (P, P) matrix where entry (i, j) = L2 norm of the synergy vector
+        for the pair (A[i], A[j]) under the learned low-rank bilinear form.
+
+        Parameters
+        ----------
+        observed_pairs : set of (int, int) or None
+            If provided, only fill entries for observed combinatorial pairs; others are 0.
+            If None, fill all off-diagonal entries.
+        """
+        if not self.use_synergy:
+            return np.zeros((self.perturbs, self.perturbs), dtype=np.float32)
+
+        device = next(self.parameters()).device
+        L = self.qr().detach().to(device)
+        sigma = pyro.param("sigma_fac").detach().to(device)
+        chol_P = torch.linalg.cholesky(L @ L.T + sigma ** 2 * torch.eye(self.perturbs, device=device))
+        A = (chol_P @ self.rho_enc(self.p_emb.weight).detach())  # (P, d)
+
+        P = self.perturbs
+        syn_matrix = np.zeros((P, P), dtype=np.float32)
+
+        for i in range(P):
+            for j in range(P):
+                if i == j:
+                    continue
+                if observed_pairs is not None and (i, j) not in observed_pairs:
+                    continue
+                Ux = torch.einsum('dir,i->dr', pyro.param("U_syn_loc"), A[i])   # (d, r)
+                Vy = torch.einsum('dir,i->dr', pyro.param("V_syn_loc"), A[j])   # (d, r)
+                syn_vec = (Ux * Vy).sum(-1)                         # (d,)
+                syn_matrix[i, j] = float(syn_vec.norm().item())
+
+        return syn_matrix
+
+    @torch.no_grad()
     def _eval(self, adata, obsm_key: str, device: torch.device) -> dict:
         from scipy.stats import spearmanr, pearsonr
         from ._datasets import PerturbMatchingDataset
@@ -700,18 +818,28 @@ class VAE(PerturbModelBase):
         treatment_key = get_config("treatment_key")
 
         self.to(device)
-        ds = PerturbMatchingDataset(adata)
+        ds = PerturbMatchingDataset(adata, combinatorial=self.combinatorial)
         result = {}
 
         # ── classifier accuracy ───────────────────────────────────────
-        P_sub    = adata[adata.obs[p_key].values != ntc_label]
-        z_np     = P_sub.obsm[obsm_key]
-        z        = torch.as_tensor(z_np, dtype=torch.float32, device=device)
-        true_idx = np.array(
-            [ds.perturbation_dict[n] for n in P_sub.obs[p_key].values], dtype=np.int64
-        )
-        y_true   = torch.as_tensor(true_idx, dtype=torch.long, device=device)
-        result["acc"] = (self.cls_head(z).argmax(dim=-1) == y_true).float().mean().item()
+        P_sub = adata[adata.obs[p_key].values != ntc_label]
+        z_np  = P_sub.obsm[obsm_key]
+        z     = torch.as_tensor(z_np, dtype=torch.float32, device=device)
+        logits = self.cls_head(z)
+
+        if self.combinatorial:
+            p_idx_2d = torch.from_numpy(ds.P_indices).to(device)   # (N, 2)
+            target = torch.zeros(z.size(0), self.perturbs, device=device)
+            comp_mask = p_idx_2d != -1
+            target.scatter_(1, p_idx_2d.clamp(min=0), comp_mask.to(target.dtype))
+            pred = (logits.sigmoid() > 0.5).to(target.dtype)
+            result["acc"] = (pred == target).all(dim=1).float().mean().item()
+        else:
+            true_idx = np.array(
+                [ds.perturbation_dict[n] for n in P_sub.obs[p_key].values], dtype=np.int64
+            )
+            y_true = torch.as_tensor(true_idx, dtype=torch.long, device=device)
+            result["acc"] = (logits.argmax(dim=-1) == y_true).float().mean().item()
 
         # ── rho_corr from learned covariance + A*W embed ─────────────
         L        = self.qr().cpu()
@@ -731,12 +859,29 @@ class VAE(PerturbModelBase):
         P_idx      = torch.from_numpy(ds.P_indices)
         z_all_pert = torch.as_tensor(z_np, dtype=torch.float32)
         z_bar      = torch.zeros(num_p, self.latent_dim)
-        for pidx in range(num_p):
-            mask = P_idx == pidx
-            if mask.any():
-                z_bar[pidx] = z_all_pert[mask].mean(0)
-        z_corr = torch.corrcoef(z_bar)
-        result["z_corr"] = z_corr.numpy()
+
+        if self.combinatorial:
+            single_mask = P_idx[:, 1] == -1
+            P_idx_1d    = P_idx[single_mask, 0]
+            z_single    = z_all_pert[single_mask]
+            for pidx in range(num_p):
+                mask = P_idx_1d == pidx
+                if mask.any():
+                    z_bar[pidx] = z_single[mask].mean(0)
+        else:
+            for pidx in range(num_p):
+                mask = P_idx == pidx
+                if mask.any():
+                    z_bar[pidx] = z_all_pert[mask].mean(0)
+
+        nz = z_bar.norm(dim=1) > 1e-12
+        z_corr_mat = torch.full((num_p, num_p), float("nan"))
+        if nz.sum() >= 2:
+            sub_corr = torch.corrcoef(z_bar[nz])
+            nz_idx = torch.where(nz)[0]
+            z_corr_mat[nz_idx.unsqueeze(1), nz_idx.unsqueeze(0)] = sub_corr
+        torch.diagonal(z_corr_mat).fill_(1.0)
+        result["z_corr"] = z_corr_mat.numpy()
 
         # ── z_corr vs rho_corr ────────────────────────────────────────
         def _flat_triu(M):
@@ -744,8 +889,8 @@ class VAE(PerturbModelBase):
             idx = torch.triu_indices(M.size(0), M.size(1), offset=1)
             return M[idx[0], idx[1]]
 
-        r_s, p_s = spearmanr(_flat_triu(rho_corr), _flat_triu(z_corr))
-        r_p, p_p = pearsonr( _flat_triu(rho_corr), _flat_triu(z_corr))
+        r_s, p_s = spearmanr(_flat_triu(rho_corr), _flat_triu(z_corr_mat))
+        r_p, p_p = pearsonr( _flat_triu(rho_corr), _flat_triu(z_corr_mat))
         result["z_rho_corr"] = {
             "spearman_r": r_s, "spearman_p": p_s,
             "pearson_r":  r_p, "pearson_p":  p_p,
@@ -755,7 +900,7 @@ class VAE(PerturbModelBase):
         result["W"] = self.gate(deterministic=True).cpu().detach().numpy()
 
         # ── explained variance (condition × perturbation × gene) ─────
-        x_ntc_mat = ds.X_ntc # list over cond: cells x genes
+        x_ntc_mat = ds.X_ntc  # list over cond: cells x genes
 
         cond_unique = adata.obs[treatment_key].unique()
         conds = torch.tensor([ds.condition_dict[c] for c in cond_unique], dtype=torch.int32)
@@ -764,7 +909,7 @@ class VAE(PerturbModelBase):
         device = next(self.parameters()).device
 
         for _, cond_idx in zip(cond_unique, conds):
-            x_ntc_cond = x_ntc_mat[cond_idx]   # (cells_in_cond, G) NTC for this condition
+            x_ntc_cond = x_ntc_mat[cond_idx]
             ev_pg = self._counterfactual_effect_size(
                 x_ntc_cond=x_ntc_cond,
                 cond_idx=cond_idx,
@@ -780,5 +925,30 @@ class VAE(PerturbModelBase):
         result['conditions'] = np.array(cond_unique)
         idx_to_pert = {idx: name for name, idx in ds.perturbation_dict.items()}
         result['rho_perts'] = np.array([idx_to_pert[i] for i in range(len(idx_to_pert))])
+
+        # ── synergy matrix (P, P) + saved params for plot_synergy ────────────
+        if self.use_synergy:
+            if self.combinatorial:
+                P_idx_np = ds.P_indices  # (N, 2)
+                combo_mask_syn = P_idx_np[:, 1] != -1
+                combos_syn = P_idx_np[combo_mask_syn]
+                observed_pairs = {
+                    (int(row[0]), int(row[1]))
+                    for row in combos_syn
+                    if int(row[0]) >= 0 and int(row[1]) >= 0
+                }
+            else:
+                observed_pairs = None
+            result['synergy_matrix'] = self.get_synergy_matrix(observed_pairs=observed_pairs)
+
+            # Save the bilinear projection data so plot_synergy needs no model/pyro access
+            result['synergy_params'] = {
+                'A':         A.astype(np.float32),
+                'U_loc':     pyro.param("U_syn_loc").detach().cpu().numpy().astype(np.float32),
+                'U_scale':   pyro.param("U_syn_scale").detach().cpu().numpy().astype(np.float32),
+                'V_loc':     pyro.param("V_syn_loc").detach().cpu().numpy().astype(np.float32),
+                'V_scale':   pyro.param("V_syn_scale").detach().cpu().numpy().astype(np.float32),
+                'syn_scale': float(pyro.param("syn_scale_val").detach().cpu().item()),
+            }
 
         return result

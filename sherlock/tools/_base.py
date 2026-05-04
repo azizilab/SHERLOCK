@@ -190,6 +190,15 @@ class PerturbModelBase(ABC, nn.Module):
         return u + m_p
 
     @torch.no_grad()
+    def _combine_pert_shifts(self, m1: torch.Tensor, m2: torch.Tensor) -> torch.Tensor:
+        """
+        Combine two shift tensors for a combinatorial perturbation.
+        Default (cVAE/sVAE): additive sum — both are plain (1, d) shift vectors.
+        VAE overrides to union-merge the stacked (A*W, W) format.
+        """
+        return m1 + m2
+
+    @torch.no_grad()
     def _get_all_pert_shifts(self, device: torch.device) -> torch.Tensor | None:
         """
         Return all perturbation shift vectors of shape (P, d).
@@ -276,7 +285,11 @@ class PerturbModelBase(ABC, nn.Module):
         p_key = get_config("pert_key")
         var_names = adata.var_names
 
-        ds = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label)
+        # Use individual-gene indexing for combinatorial models (cVAE/sVAE) so
+        # non_ntc_idx aligns with their pert_emb / action_prior_mean rows.
+        combinatorial = getattr(self, "combinatorial", False)
+        ds = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label,
+                                  combinatorial=combinatorial)
         idx2pert = ds.idx_to_pert()
 
         ntc_mask = adata.obs[p_key] == ntc_label
@@ -295,6 +308,14 @@ class PerturbModelBase(ABC, nn.Module):
         non_ntc_items = [(i, n) for i, n in idx2pert.items() if n != ntc_label]
         non_ntc_idx   = [i for i, _ in non_ntc_items]
         non_ntc_names = [n for _, n in non_ntc_items]
+
+        # For combinatorial datasets, map individual gene names → dataset indices and
+        # collect combined labels (e.g. "GENE1+GENE2") present in adata.obs.
+        name_to_ds_idx = {n: i for i, n in non_ntc_items}
+        combo_labels = (
+            [lbl for lbl in sorted(set(adata.obs[p_key].values) - {ntc_label}) if "+" in lbl]
+            if combinatorial else []
+        )
 
         # Compute all perturbation shifts once (shared across conditions).
         all_shifts = self._get_all_pert_shifts(device)  # (P+1, ...) with index 0 = NTC
@@ -354,6 +375,23 @@ class PerturbModelBase(ABC, nn.Module):
                 cf_ln_k = self._lognorm(mu_cf_k.detach().cpu().numpy())   # (K, G)
                 cf_ln   = (weights.cpu().numpy()[:, None] * cf_ln_k).sum(0)  # (G,)
                 cond_effects[name] = cf_ln - ntc_ln                 # (G,)
+
+            # Combined-label effects: sum component shifts (e.g. GENE1+GENE2)
+            for label in combo_labels:
+                parts = [p.strip() for p in label.split("+")]
+                idxs  = [name_to_ds_idx[p] for p in parts if p in name_to_ds_idx]
+                if not idxs:
+                    continue
+                m_p = all_shifts[[idxs[0]]]
+                for i in idxs[1:]:
+                    m_p = self._combine_pert_shifts(m_p, all_shifts[[i]])
+                z_cf_k  = self._apply_shift(centroids, m_p)
+                mu_cf_k = self._decode_to_expr(z_cf_k, lib_med)
+                if mu_cf_k is None:
+                    continue
+                cf_ln_k = self._lognorm(mu_cf_k.detach().cpu().numpy())
+                cf_ln   = (weights.cpu().numpy()[:, None] * cf_ln_k).sum(0)
+                cond_effects[label] = cf_ln - ntc_ln
 
             cond_effects_all[cond_key] = cond_effects
             cond_sizes[cond_key] = int(cond_ntc_mask.sum())
@@ -515,7 +553,10 @@ class PerturbModelBase(ABC, nn.Module):
         ntc_label = get_config("ntc_label")
         if dataset is None:
             p_key = get_config("pert_key")
-            dataset = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label)
+            combinatorial = getattr(self, "combinatorial", False)
+            dataset = PerturbSimpleDataset(
+                adata, pert_key=p_key, ntc_label=ntc_label, combinatorial=combinatorial
+            )
 
         z_all, recon_all, p_all = self._run_inference(dataset, device, batch_size)
 
@@ -525,9 +566,20 @@ class PerturbModelBase(ABC, nn.Module):
         idx2pert = dataset.idx_to_pert()
         perts = np.array([idx2pert[i] for i in range(dataset.n_perturbs)])
 
-        z_corr, z_perts, _ = self.get_corr(z_all, p_all, perts, use_rho=False)
+        # For combinatorial datasets p_all is (N, 2): [gene_idx, -1] for single-pert,
+        # [idx1, idx2] for combo, [0, -1] for NTC.  Restrict z_corr to single-pert
+        # cells (p[:,1]==-1) so individual-gene embeddings are clean.
+        if p_all.ndim == 2:
+            single_mask = p_all[:, 1] == -1
+            p_for_corr = p_all[single_mask, 0]
+            z_for_corr = z_all[single_mask]
+        else:
+            p_for_corr = p_all
+            z_for_corr = z_all
+
+        z_corr, z_perts, z_embed = self.get_corr(z_for_corr, p_for_corr, perts, use_rho=False)
         try:
-            rho_corr, rho_perts, rho_embed = self.get_corr(z_all, p_all, perts, use_rho=True)
+            rho_corr, rho_perts, rho_embed = self.get_corr(z_for_corr, p_for_corr, perts, use_rho=True)
         except NotImplementedError:
             rho_corr = rho_embed = None
             rho_perts = z_perts
@@ -535,6 +587,7 @@ class PerturbModelBase(ABC, nn.Module):
         uns_data: dict = {
             "z_corr":    z_corr,
             "z_perts":   z_perts,
+            "z_embed":   z_embed,
             "perts":     perts,
             "rho_corr":  rho_corr,
             "rho_perts": rho_perts,

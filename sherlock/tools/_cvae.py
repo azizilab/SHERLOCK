@@ -60,6 +60,7 @@ class cVAE(PerturbModelBase):
         n_layers: int = 1,
         dropout_rate: float = 0.1,
         beta: float = 1.0,
+        combinatorial: bool = False,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -69,6 +70,7 @@ class cVAE(PerturbModelBase):
         self.n_layers = n_layers
         self.dropout_rate = dropout_rate
         self.beta = beta
+        self.combinatorial = combinatorial
 
         self.px_r = nn.Parameter(torch.randn(input_dim))
 
@@ -105,14 +107,25 @@ class cVAE(PerturbModelBase):
 
     # ── training interface ────────────────────────────────────────────────────
 
+    def _pert_shift(self, p: torch.Tensor) -> torch.Tensor:
+        """Sum pert_emb over valid components. Works for 1-D and (N,2) p."""
+        if p.ndim == 1:
+            return self.pert_emb(p.clamp(min=0))
+        # combinatorial: sum component embeddings, masking out -1 slots
+        a = self.pert_emb(p[:, 0].clamp(min=0))          # always present
+        mask1 = (p[:, 1] >= 0).float().unsqueeze(-1)      # 1 if second component exists
+        a = a + self.pert_emb(p[:, 1].clamp(min=0)) * mask1
+        return a
+
     def inference(self, x: torch.Tensor, p: torch.Tensor) -> dict:
         """
         Infer q(U | x), shift z = U + A[p].
         NTC (p == 0) has A = 0 via padding_idx, so z_NTC = U.
+        For combinatorial p (N,2), shifts for each component are summed.
         """
         library = torch.log(x.sum(1).clamp_min(1e-8)).unsqueeze(1)
         qu, u = self._encode(x)
-        a = self.pert_emb(p.clamp(min=0))   # A[NTC] == 0 by padding_idx
+        a = self._pert_shift(p)
         z = u + a
         return dict(u=u, qu=qu, z=z, library=library)
 
@@ -143,13 +156,14 @@ class cVAE(PerturbModelBase):
 
     def checkpoint_ctor_args(self) -> dict:
         return {
-            "input_dim":    self.input_dim,
-            "n_perturbs":   self.n_perturbs,
-            "latent_dim":   self.n_latent,
-            "n_hidden":     self.n_hidden,
-            "n_layers":     self.n_layers,
-            "dropout_rate": self.dropout_rate,
-            "beta":         self.beta,
+            "input_dim":     self.input_dim,
+            "n_perturbs":    self.n_perturbs,
+            "latent_dim":    self.n_latent,
+            "n_hidden":      self.n_hidden,
+            "n_layers":      self.n_layers,
+            "dropout_rate":  self.dropout_rate,
+            "beta":          self.beta,
+            "combinatorial": self.combinatorial,
         }
 
     def _get_rho_embed(
@@ -167,13 +181,13 @@ class cVAE(PerturbModelBase):
     def get_z(self, x: torch.Tensor, p: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
         """
         If p is None, return background U = E[q(U | x)].
-        If p is given, return z = U + A[p].
+        If p is given, return z = U + A[p] (summed over components for 2-D p).
         """
         qu, _ = self._encode(x)
         u = qu.loc
         if p is None:
             return u
-        return u + self.pert_emb(p.clamp(min=0))
+        return u + self._pert_shift(p)
 
     @torch.no_grad()
     def get_recon(self, x: torch.Tensor, p: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
@@ -218,7 +232,8 @@ class cVAE(PerturbModelBase):
 
         p_key     = get_config("pert_key")
         ntc_label = get_config("ntc_label")
-        ds = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label)
+        ds = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label,
+                                  combinatorial=self.combinatorial)
         idx_to_pert = ds.idx_to_pert()
         ntc_idx = ds.ntc_idx
 

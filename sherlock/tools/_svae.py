@@ -122,6 +122,7 @@ class sVAE(PerturbModelBase):
         dropout_rate: float = 0.1,
         sparse_mask_penalty: float = 1.0,
         beta: float = 1.0,
+        combinatorial: bool = False,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -132,6 +133,7 @@ class sVAE(PerturbModelBase):
         self.dropout_rate = dropout_rate
         self.sparse_mask_penalty = sparse_mask_penalty
         self.beta = beta
+        self.combinatorial = combinatorial
         self.warmup = True
         self.use_global_kl = True
 
@@ -178,42 +180,33 @@ class sVAE(PerturbModelBase):
         self.gumbel_action = GumbelSigmoid(num_action=n_perturbs, num_latent=latent_dim)
 
     def get_prior_shift(self, p: torch.Tensor, hard: bool = False) -> torch.Tensor:
-        """
-        Return sparse mechanism shift m_A = gamma_A * mu_A.
-
-        p >= 0 indexes real perturbations.
-        p < 0 is treated as NTC/control and receives zero shift.
-
-        Parameters
-        ----------
-        p    : (B,) integer perturbation indices
-        hard : if True, use thresholded mask; otherwise use sampled relaxed/hard
-            straight-through GumbelSigmoid during training.
-
-        Returns
-        -------
-        shift : (B, d)
-        """
-        shift = torch.zeros(
-            p.shape[0],
-            self.n_latent,
-            dtype=self.action_prior_mean.dtype,
-            device=p.device,
-        )
-
-        valid = p >= 0
-        if valid.any():
-            p_valid = p[valid]
-            mean = self.action_prior_mean[p_valid]
-
+        """Sparse shift m_A = gamma_A * mu_A; sums components for 2-D p (union)."""
+        if p.ndim == 2:
+            B, K = p.shape
+            valid = (p >= 0).to(self.action_prior_mean.dtype).unsqueeze(-1)  # (B, K, 1)
+            p_safe = p.clamp(min=0)                                           # (B, K)
+            means = self.action_prior_mean[p_safe]                            # (B, K, d)
             if hard:
                 proba = self.gumbel_action.get_proba().to(p.device)
-                mask = (proba[p_valid] > 0.5).to(mean.dtype)
+                masks = (proba[p_safe] > 0.5).to(means.dtype)                # (B, K, d)
             else:
-                mask = self.gumbel_action(p_valid)
+                masks = self.gumbel_action(p_safe.reshape(-1)).reshape(B, K, -1)
+            return (means * masks * valid).sum(dim=1)                         # (B, d)
 
+        shift = torch.zeros(
+            p.shape[0], self.n_latent,
+            dtype=self.action_prior_mean.dtype, device=p.device,
+        )
+        valid = p >= 0
+        if valid.any():
+            p_v = p[valid]
+            mean = self.action_prior_mean[p_v]
+            if hard:
+                proba = self.gumbel_action.get_proba().to(p.device)
+                mask = (proba[p_v] > 0.5).to(mean.dtype)
+            else:
+                mask = self.gumbel_action(p_v)
             shift[valid] = mean * mask
-
         return shift
 
     # ── forward methods (matching SpikeSlabVAEModule) ─────────────────────────
@@ -339,6 +332,7 @@ class sVAE(PerturbModelBase):
             "dropout_rate":        self.dropout_rate,
             "sparse_mask_penalty": self.sparse_mask_penalty,
             "beta":                self.beta,
+            "combinatorial":       self.combinatorial,
         }
 
     # ── PerturbModelBase interface ────────────────────────────────────────────

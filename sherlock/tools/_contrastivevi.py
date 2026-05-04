@@ -56,9 +56,10 @@ class ContrastiveVI(ContrastiveVAE, PerturbModelBase):
     **kwargs   : forwarded verbatim to ContrastiveVAE (n_input, n_batch, …)
     """
 
-    def __init__(self, n_perturbs: int, **kwargs) -> None:
+    def __init__(self, n_perturbs: int, combinatorial: bool = False, **kwargs) -> None:
         ContrastiveVAE.__init__(self, **kwargs)
         self.n_perturbs = n_perturbs
+        self.combinatorial = combinatorial
         n_s = self.n_salient_latent
         # Per-perturbation prior; init = N(0,I) matches vanilla ContrastiveVI
         self.pert_mu      = nn.Parameter(torch.zeros(n_perturbs, n_s))
@@ -75,6 +76,7 @@ class ContrastiveVI(ContrastiveVAE, PerturbModelBase):
     def checkpoint_ctor_args(self) -> dict:
         return {
             "n_perturbs":          self.n_perturbs,
+            "combinatorial":       self.combinatorial,
             "n_input":             self.n_input,
             "n_batch":             self.n_batch,
             "n_hidden":            self.n_hidden,
@@ -188,12 +190,20 @@ class ContrastiveVI(ContrastiveVAE, PerturbModelBase):
         tg_losses = self._generic_loss(tg, inference_outputs["target"],     generative_outputs["target"])
 
         # ── per-perturbation KL for target cells ─────────────────────────
-        pert_idx = tg[REGISTRY_KEYS.CONT_COVS_KEY][:, 0].long()
+        p0 = tg[REGISTRY_KEYS.CONT_COVS_KEY][:, 0].long()
 
         qs_m    = inference_outputs["target"]["qs_m"]                           # (B, n_s)
         qs_v    = inference_outputs["target"]["qs_v"]                           # (B, n_s) variance
-        prior_m = self.pert_mu[pert_idx]                                        # (B, n_s)
-        prior_v = self.pert_log_var[pert_idx].exp().clamp(min=1e-4)             # (B, n_s) variance
+        prior_m = self.pert_mu[p0]                                              # (B, n_s)
+        prior_v = self.pert_log_var[p0].exp().clamp(min=1e-4)                   # (B, n_s) variance
+
+        # combinatorial: second component in CONT_COVS column 1; -1 = absent.
+        # p(t | p1, p2) = N(mu_p1 + mu_p2, var_p1 + var_p2) by sum-of-Gaussians
+        if self.combinatorial and tg[REGISTRY_KEYS.CONT_COVS_KEY].shape[1] > 1:
+            p1 = tg[REGISTRY_KEYS.CONT_COVS_KEY][:, 1].long()                  # (B,) -1 = absent
+            has_p1 = (p1 >= 0).float().unsqueeze(-1)                            # (B, 1)
+            prior_m = prior_m + self.pert_mu[p1.clamp(min=0)] * has_p1
+            prior_v = prior_v + self.pert_log_var[p1.clamp(min=0)].exp().clamp(min=1e-4) * has_p1
 
         # KL(N(qs_m, qs_v) || N(prior_m, prior_v))
         kl_s = 0.5 * (
@@ -244,16 +254,27 @@ class ContrastiveVI(ContrastiveVAE, PerturbModelBase):
 
         p_key     = get_config("pert_key")
         ntc_label = get_config("ntc_label")
-        ds        = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label)
+        ds        = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label,
+                                          combinatorial=self.combinatorial)
 
         t_all = adata.obsm[obsm_key]   # (N, n_salient) — E[q(t|x)] per cell
-        p_all = ds.P_indices            # (N,) PerturbSimpleDataset indices
+        p_all = ds.P_indices            # (N,) or (N, 2) for combinatorial
 
         means = np.zeros((ds.n_perturbs, t_all.shape[1]), dtype=np.float32)
-        for pidx in range(ds.n_perturbs):
-            mask = p_all == pidx
-            if mask.any():
-                means[pidx] = t_all[mask].mean(0)
+        if self.combinatorial:
+            # use only single-pert cells (col 1 == -1); index from col 0
+            single_mask = p_all[:, 1] == -1
+            p_single    = p_all[single_mask, 0]
+            t_single    = t_all[single_mask]
+            for pidx in range(ds.n_perturbs):
+                mask = p_single == pidx
+                if mask.any():
+                    means[pidx] = t_single[mask].mean(0)
+        else:
+            for pidx in range(ds.n_perturbs):
+                mask = p_all == pidx
+                if mask.any():
+                    means[pidx] = t_all[mask].mean(0)
 
         self._pert_t_means = means
         return {}

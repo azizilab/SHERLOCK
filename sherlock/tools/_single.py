@@ -116,6 +116,7 @@ def run(
             perturbs=int(np.max(dataset.P_indices)) + 1,
             conds=int(len(np.unique(dataset.C_indices))),
             tau=tau_init,
+            combinatorial=combinatorial,
             **vae_kwargs,
         ).to(device)
 
@@ -169,8 +170,9 @@ def run(
     elif key == "cvae":
         p_key     = get_config("pert_key")
         ntc_label = get_config("ntc_label")
+        combinatorial = kwargs.get("combinatorial", False)
 
-        dataset = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label)
+        dataset = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label, combinatorial=combinatorial)
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -216,8 +218,9 @@ def run(
     elif key == "svae":
         p_key     = get_config("pert_key")
         ntc_label = get_config("ntc_label")
+        combinatorial = kwargs.get("combinatorial", False)
 
-        dataset = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label)
+        dataset = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label, combinatorial=combinatorial)
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -268,6 +271,7 @@ def run(
         p_key     = get_config("pert_key")
         ntc_label = get_config("ntc_label")
 
+        combinatorial       = kwargs.pop("combinatorial", False)
         n_background_latent = kwargs.pop("n_background_latent", 10)
         n_salient_latent    = kwargs.pop("n_salient_latent", 10)
         n_hidden            = kwargs.pop("n_hidden", 128)
@@ -279,14 +283,24 @@ def run(
             raise TypeError(f"Unknown keyword(s) for ContrastiveVI run: {list(kwargs)}")
 
         # Build PerturbSimpleDataset so pert indices align with PerturbModelBase eval.
-        # Store them as a float continuous covariate so scvi passes them through to
+        # Store them as float continuous covariate(s) so scvi passes them through to
         # loss() unmodified (categorical fields re-encode alphabetically, breaking
         # alignment with PerturbSimpleDataset which assigns NTC=0 then alpha order).
-        ds = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label)
-        adata.obs["_sherlock_pert_idx"] = ds.P_indices.astype(np.float32)
+        # Combinatorial mode splits "A+B" labels into individual gene indices (N, 2);
+        # both columns are registered so loss() can sum the per-component Gaussian priors.
+        # These temporary obs columns are removed after training.
+        ds = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label,
+                                  combinatorial=combinatorial)
+        if combinatorial:
+            adata.obs["_sherlock_pert_idx_0"] = ds.P_indices[:, 0].astype(np.float32)
+            adata.obs["_sherlock_pert_idx_1"] = ds.P_indices[:, 1].astype(np.float32)
+            cont_cov_keys = ["_sherlock_pert_idx_0", "_sherlock_pert_idx_1"]
+        else:
+            adata.obs["_sherlock_pert_idx"] = ds.P_indices.astype(np.float32)
+            cont_cov_keys = ["_sherlock_pert_idx"]
 
         _ScviContrastiveVI.setup_anndata(
-            adata, continuous_covariate_keys=["_sherlock_pert_idx"]
+            adata, continuous_covariate_keys=cont_cov_keys
         )
         background_indices = np.where(adata.obs[p_key] == ntc_label)[0].tolist()
         target_indices     = np.where(adata.obs[p_key] != ntc_label)[0].tolist()
@@ -319,7 +333,7 @@ def run(
             pert_module_kwargs["library_log_means"] = old.library_log_means.cpu().numpy()
             pert_module_kwargs["library_log_vars"]  = old.library_log_vars.cpu().numpy()
         best_model = _SherlockContrastiveVI(
-            n_perturbs=ds.n_perturbs, **pert_module_kwargs
+            n_perturbs=ds.n_perturbs, combinatorial=combinatorial, **pert_module_kwargs
         )
         scvi_model.module = best_model   # scvi trains this object in-place
 
@@ -335,12 +349,22 @@ def run(
                 early_stopping=early_stopping,
             )
 
+        # Remove temporary pert-index columns added for scvi's covariate pipeline
+        for col in cont_cov_keys:
+            adata.obs.drop(columns=[col], inplace=True, errors="ignore")
+
         # best_model IS scvi_model.module — the trained ContrastiveVI instance
         param_store = None
 
     elif key == "scgen":
         p_key     = get_config("pert_key")
         ntc_label = get_config("ntc_label")
+        combinatorial = kwargs.pop("combinatorial", False)
+        if combinatorial:
+            raise ValueError(
+                "scGen does not support combinatorial=True. "
+                "Use combinatorial=False and treat combined labels as atomic."
+            )
 
         scgen_params  = set(inspect.signature(SCGENModel.__init__).parameters) - {"self"}
         trainer_params = set(inspect.signature(SCGENTrainer.__init__).parameters) - {
