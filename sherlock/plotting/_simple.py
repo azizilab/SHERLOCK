@@ -59,132 +59,58 @@ def plot_corr(adata, uns_key='results'):
     corr = adata.uns[uns_key]['rho_corr']
     sns.clustermap(corr, cmap="coolwarm", annot=False)
 
-def plot_synergy(
-    adata,
-    uns_key='results',
-    n_post=500,
-    n_null=200,
-    seed=0,
-    show=True
-):
-    """
-    Plot the (P, P) synergy matrix and return synergy pairs sorted high→low.
+def plot_synergy(adata, uns_key='results'):
+    """Lollipop plot of interaction_score for all pairs, colored by classification."""
+    import matplotlib.patches as mpatches
 
-    Significance: one-sided paired t-test on (post_norm - background_mean),
-    where background_mean is the mean posterior synergy norm over n_null random
-    pairs per posterior draw.  Because observed and background pairs use the
-    same posterior sample, prior scale cancels out — the test is invariant to
-    the global scale of U/V and asks purely whether this pair stands out above
-    the background level of synergy in the learned model.
-
-    effect_size = post_mean / background_mean  (>1 = above background).
-    """
-    from scipy.stats import ttest_1samp
     uns = adata.uns[uns_key]
-    syn = uns.get('synergy_matrix')
+    syn = uns.get('synergy')
     if syn is None:
-        print("No synergy_matrix in results. Train with use_synergy=True and re-run eval().")
-        return None
+        print("No 'synergy' DataFrame in results. Run eval() with combinatorial=True.")
+        return
+    if not isinstance(syn, pd.DataFrame):
+        syn = pd.DataFrame(syn)
 
-    pert_names = uns.get('rho_perts', np.arange(syn.shape[0]))
+    df = syn.sort_values('interaction_score').copy()
+    n = len(df)
 
-    # Build pair table (upper triangle of observed non-zero entries)
-    rows, pair_idx = [], []
-    for i in range(syn.shape[0]):
-        for j in range(i + 1, syn.shape[1]):
-            if syn[i, j] != 0:
-                rows.append({"pert_i": pert_names[i], "pert_j": pert_names[j], "synergy": syn[i, j]})
-                pair_idx.append((i, j))
+    _CLASS_COLORS = {
+        'latent synergy candidate':                    '#2166ac',
+        'dominance epistasis':                         '#d73027',
+        'negative epistasis / suppressed shared effect': '#f4a582',
+        'emergent epistasis / redirection':            '#b2182b',
+        'expected shared-axis effect':                 '#92c5de',
+        'weak / undefined':                            '#aaaaaa',
+        'too few cells':                               '#dddddd',
+        'mixed / ambiguous':                           '#777777',
+    }
+    classes = df['classification'].unique()
+    color_map = {cls: _CLASS_COLORS.get(cls, '#333333') for cls in classes}
 
-    synergy_pairs_df = pd.DataFrame(rows)
-    if len(synergy_pairs_df) == 0:
-        return synergy_pairs_df
+    fig_h = max(5, n * 0.22 + 2)
+    fig, ax = plt.subplots(figsize=(9, fig_h))
 
-    synergy_params = uns.get('synergy_params')
-    if synergy_params is None:
-        print("No synergy_params in results. Re-run eval() to enable p-value computation.")
-        return synergy_pairs_df.sort_values("synergy", ascending=False).reset_index(drop=True)
+    y = np.arange(n)
+    ax.hlines(y, 0, df['interaction_score'], color='#ccc', lw=0.8, zorder=1)
+    colors = [color_map[c] for c in df['classification']]
+    ax.scatter(df['interaction_score'], y, c=colors, s=28, zorder=3, edgecolors='none')
+    ax.axvline(0, color='black', lw=0.8, linestyle='--', alpha=0.5)
 
-    A       = synergy_params['A']      # (P, d)
-    U_loc   = synergy_params['U_loc']  # (d, d, r)
-    U_scale = synergy_params['U_scale']
-    V_loc   = synergy_params['V_loc']
-    V_scale = synergy_params['V_scale']
+    ax.set_yticks(y)
+    ax.set_yticklabels(df.index, fontsize=6)
+    ax.set_xlabel('Interaction score', fontsize=9)
+    ax.set_title('Synergy classification by interaction score', fontsize=11, fontweight='bold')
+    ax.spines[['top', 'right']].set_visible(False)
 
-    P_total = A.shape[0]
-    rng = np.random.default_rng(seed)
+    legend_handles = [
+        mpatches.Patch(color=color_map[cls], label=cls)
+        for cls in sorted(classes)
+    ]
+    ax.legend(handles=legend_handles, fontsize=7, loc='lower right', frameon=True)
 
-    # Random background pairs (diagonal excluded; may overlap with observed —
-    # we want the background level of synergy in the model, not a holdout test)
-    null_i = rng.integers(0, P_total, size=n_null)
-    null_j = rng.integers(0, P_total, size=n_null)
-    null_j[null_i == null_j] = (null_j[null_i == null_j] + 1) % P_total
+    plt.tight_layout()
+    plt.show()
 
-    # Pre-sample posterior draws once, reuse for both observed and background
-    U_samp = rng.normal(U_loc, U_scale, size=(n_post,) + U_loc.shape)  # (S, d, d, r)
-    V_samp = rng.normal(V_loc, V_scale, size=(n_post,) + V_loc.shape)
-
-    post_norms = np.zeros((n_post, len(pair_idx)), dtype=float)
-    null_mean  = np.zeros(n_post, dtype=float)   # mean background norm per draw
-
-    for s in range(n_post):
-        Us, Vs = U_samp[s], V_samp[s]
-
-        for k, (i, j) in enumerate(pair_idx):
-            Ux = np.einsum("dir,i->dr", Us, A[i])
-            Vy = np.einsum("dir,i->dr", Vs, A[j])
-            post_norms[s, k] = np.linalg.norm((Ux * Vy).sum(-1))
-
-        bg = 0.0
-        for m in range(n_null):
-            Ux = np.einsum("dir,i->dr", Us, A[null_i[m]])
-            Vy = np.einsum("dir,i->dr", Vs, A[null_j[m]])
-            bg += np.linalg.norm((Ux * Vy).sum(-1))
-        null_mean[s] = bg / n_null
-
-    bg_global = null_mean.mean()
-    synergy_pairs_df["post_mean"]   = post_norms.mean(axis=0)
-    synergy_pairs_df["null_mean"]   = bg_global
-    synergy_pairs_df["effect_size"] = synergy_pairs_df["post_mean"] / max(bg_global, 1e-12)
-
-    # Paired one-sided t-test: H1: (post_norm - background_mean) > 0 per posterior draw
-    pvals = []
-    for k in range(len(pair_idx)):
-        diffs = post_norms[:, k] - null_mean   # paired: same U/V draw
-        res = ttest_1samp(diffs, 0.0, alternative='greater')
-        pvals.append(float(res.pvalue))
-
-    synergy_pairs_df["pval"] = np.asarray(pvals)
-
-    # Benjamini-Hochberg FDR
-    pv    = synergy_pairs_df["pval"].to_numpy()
-    order = np.argsort(pv)
-    q     = pv[order] * len(pv) / np.arange(1, len(pv) + 1)
-    q     = np.minimum.accumulate(q[::-1])[::-1]
-    qvals = np.empty_like(q)
-    qvals[order] = np.minimum(q, 1.0)
-    synergy_pairs_df["qval"] = qvals
-
-    # Heatmap colored by -log10(q-value); unobserved pairs stay at 0
-    P = syn.shape[0]
-    neg_log_q = np.zeros((P, P), dtype=float)
-    for k, (i, j) in enumerate(pair_idx):
-        v = -np.log10(np.clip(qvals[k], 1e-300, 1.0))
-        neg_log_q[i, j] = v
-        neg_log_q[j, i] = v
-        
-    if show:
-        heat_df = pd.DataFrame(neg_log_q, index=pert_names, columns=pert_names)
-        fig_h = max(6, P * 0.25 + 2)
-        plt.figure(figsize=(fig_h, fig_h))
-        ax = sns.heatmap(heat_df, cmap="viridis", annot=False, vmin=0)
-        ax.set_title(r"Pairwise synergy  $-\log_{10}(q)$")
-        ax.set_xlabel("Perturbation j")
-        ax.set_ylabel("Perturbation i")
-        plt.tight_layout()
-        plt.show()
-
-    return synergy_pairs_df.sort_values("synergy", ascending=False).reset_index(drop=True)
 
 def plot_zcorr(adata, uns_key='results'):
     
@@ -241,7 +167,7 @@ def plot_ev(adata, uns_key='results', cond_idx=0, cmin=None, cmax=None, top_n=No
     # (C, P, G) → (P, G) for chosen condition
     ev_pg = uns["counterfactual_effect_size"][cond_idx]  # shape (P, G)
 
-    pert_names = np.array(uns.get("rho_perts", uns["perts"]))
+    pert_names = np.array(uns["rho_perts"])
     gene_names = np.array(adata.var_names)
     P, G = ev_pg.shape
 
@@ -298,7 +224,7 @@ def _ev_results_from_uns(adata, cond_idx=0, uns_key="results", store_key="ev_res
     qvals = np.asarray(uns[store_key][cond_idx]["qvals"], dtype=float)
 
     # Perturbation names and gene names
-    perts = np.asarray(uns.get("rho_perts", uns.get("perts", np.arange(ev.shape[0]))))
+    perts = np.asarray(uns.get("rho_perts", np.arange(ev.shape[0])))
     genes = np.asarray(adata.var_names)
 
     return ev, pvals, qvals, perts, genes
@@ -488,7 +414,7 @@ def _get_cf_data(adata, uns_key="results", cf_key="counterfactual_effect_size"):
             "Run compute_counterfactual_effect_size first."
         )
     cf = np.asarray(uns[cf_key], dtype=float)          # (C, P, G)
-    perts = np.asarray(uns.get("perts", np.arange(cf.shape[1])), dtype=str)
+    perts = np.asarray(uns.get("rho_perts", np.arange(cf.shape[1])), dtype=str)
     genes = np.asarray(adata.var_names)
     return cf, perts, genes
 

@@ -791,6 +791,7 @@ class VAE(PerturbModelBase):
         sigma = pyro.param("sigma_fac").detach().to(device)
         chol_P = torch.linalg.cholesky(L @ L.T + sigma ** 2 * torch.eye(self.perturbs, device=device))
         A = (chol_P @ self.rho_enc(self.p_emb.weight).detach())  # (P, d)
+        W = self.gate(deterministic=True).detach().to(device)    # (P, d)
 
         P = self.perturbs
         syn_matrix = np.zeros((P, P), dtype=np.float32)
@@ -803,10 +804,148 @@ class VAE(PerturbModelBase):
                     continue
                 Ux = torch.einsum('dir,i->dr', pyro.param("U_syn_loc"), A[i])   # (d, r)
                 Vy = torch.einsum('dir,i->dr', pyro.param("V_syn_loc"), A[j])   # (d, r)
-                syn_vec = (Ux * Vy).sum(-1)                         # (d,)
-                syn_matrix[i, j] = float(syn_vec.norm().item())
+                syn_vec  = (Ux * Vy).sum(-1)                                     # (d,)
+                additive = W[i] * A[i] + W[j] * A[j]                            # (d,)
+                cos_sim  = (syn_vec * additive).sum() / (syn_vec.norm() * additive.norm() + 1e-8)
+                syn_matrix[i, j] = float((-cos_sim).clamp(min=0).item())
 
         return syn_matrix
+
+    @torch.no_grad()
+    def get_synergy(
+        self,
+        adata,
+        obsm_key: str,
+        eps: float = 1e-8,
+        same_thresh: float = 0.5,
+        high_thresh: float = 0.7,
+        low_thresh: float = 0.3,
+        residual_thresh: float = 0.05,
+        min_cells: int = 5,
+    ):
+        import pandas as pd
+        from ._datasets import PerturbMatchingDataset
+
+        p_key     = get_config("pert_key")
+        ntc_label = get_config("ntc_label")
+
+        labels = np.array(adata.obs[p_key].values, dtype=str)
+        z_all  = np.array(adata.obsm[obsm_key], dtype=np.float32)
+
+        mean_ntc = z_all[labels == ntc_label].mean(axis=0)
+
+        ds          = PerturbMatchingDataset(adata, combinatorial=True)
+        idx_to_pert = {v: k for k, v in ds.perturbation_dict.items()}
+        P_idx       = ds.P_indices       # (N_pert, 2)
+        z_pert      = z_all[labels != ntc_label]  # rows aligned with P_idx
+
+        def _unit(v):
+            n = np.linalg.norm(v)
+            return (v / n) if n > eps else None
+
+        def _cos(u, v):
+            return float(np.dot(u, v)) if (u is not None and v is not None) else np.nan
+
+        combo_rows  = P_idx[P_idx[:, 1] != -1]
+        unique_keys = {(min(int(r[0]), int(r[1])), max(int(r[0]), int(r[1]))) for r in combo_rows}
+
+        records = []
+        for (i, j) in sorted(unique_keys):
+            name_a = idx_to_pert[i]
+            name_b = idx_to_pert[j]
+
+            mask_a  = (P_idx[:, 0] == i) & (P_idx[:, 1] == -1)
+            mask_b  = (P_idx[:, 0] == j) & (P_idx[:, 1] == -1)
+            mask_ab = ((P_idx[:, 0] == i) & (P_idx[:, 1] == j)) | \
+                      ((P_idx[:, 0] == j) & (P_idx[:, 1] == i))
+
+            n_a  = int(mask_a.sum())
+            n_b  = int(mask_b.sum())
+            n_ab = int(mask_ab.sum())
+
+            if n_a == 0 or n_b == 0 or n_ab == 0:
+                continue
+
+            Delta_a  = z_pert[mask_a].mean(axis=0)  - mean_ntc
+            Delta_b  = z_pert[mask_b].mean(axis=0)  - mean_ntc
+            Delta_ab = z_pert[mask_ab].mean(axis=0) - mean_ntc
+
+            u_a      = _unit(Delta_a)
+            u_b      = _unit(Delta_b)
+            u_ab     = _unit(Delta_ab)
+            u_shared = _unit(u_a + u_b) if (u_a is not None and u_b is not None) else None
+
+            cos_a_b       = _cos(u_a, u_b)
+            cos_ab_a      = _cos(u_ab, u_a)
+            cos_ab_b      = _cos(u_ab, u_b)
+            cos_ab_shared = _cos(u_ab, u_shared)
+
+            if u_shared is not None:
+                proj_a_shared  = float(np.dot(Delta_a,  u_shared))
+                proj_b_shared  = float(np.dot(Delta_b,  u_shared))
+                proj_ab_shared = float(np.dot(Delta_ab, u_shared))
+                proj_residual  = proj_ab_shared - 0.5 * (proj_a_shared + proj_b_shared)
+            else:
+                proj_residual  = np.nan
+
+            # dom_residual: residual along the single-pert axis with highest cosine similarity to AB
+            if u_a is not None and u_b is not None and u_ab is not None:
+                u_dom = u_a if cos_ab_a >= cos_ab_b else u_b
+                proj_a_dom   = float(np.dot(Delta_a,  u_dom))
+                proj_b_dom   = float(np.dot(Delta_b,  u_dom))
+                proj_ab_dom  = float(np.dot(Delta_ab, u_dom))
+                dom_residual = proj_ab_dom - 0.5 * (proj_a_dom + proj_b_dom)
+            else:
+                dom_residual = np.nan
+
+            # interaction_score: magnitude of the non-additive component of Delta_ab
+            Delta_expected    = 0.5 * (Delta_a + Delta_b)
+            interaction_vector = Delta_ab - Delta_expected
+            interaction_score  = float(np.linalg.norm(interaction_vector))
+
+            dominant_pert = None
+
+            if n_a < min_cells or n_b < min_cells or n_ab < min_cells:
+                classification = "too few cells"
+            elif u_a is None or u_b is None or u_ab is None or u_shared is None:
+                classification = "weak / undefined"
+            elif cos_ab_a > high_thresh and cos_ab_b < low_thresh:
+                classification = "dominance epistasis"
+                dominant_pert  = name_a
+            elif cos_ab_b > high_thresh and cos_ab_a < low_thresh:
+                classification = "dominance epistasis"
+                dominant_pert  = name_b
+            elif cos_a_b > same_thresh and cos_ab_shared > high_thresh:
+                if proj_residual > residual_thresh:
+                    classification = "latent synergy candidate"
+                elif proj_residual < -residual_thresh:
+                    classification = "negative epistasis / suppressed shared effect"
+                else:
+                    classification = "expected shared-axis effect"
+            elif cos_ab_a < low_thresh and cos_ab_b < low_thresh and cos_ab_shared < low_thresh:
+                classification = "emergent epistasis / redirection"
+            else:
+                classification = "mixed / ambiguous"
+
+            records.append({
+                "pert_a":         name_a,
+                "pert_b":         name_b,
+                "dominant_pert":  dominant_pert,
+                "n_a":            n_a,
+                "n_b":            n_b,
+                "n_ab":           n_ab,
+                "cos_a_b":        cos_a_b,
+                "cos_ab_a":       cos_ab_a,
+                "cos_ab_b":       cos_ab_b,
+                "cos_ab_shared":  cos_ab_shared,
+                "proj_residual":    proj_residual,
+                "dom_residual":     dom_residual,
+                "interaction_score": interaction_score,
+                "classification":   classification,
+            })
+
+        index = [f"{r['pert_a']}+{r['pert_b']}" for r in records]
+        return pd.DataFrame(records, index=index)
 
     @torch.no_grad()
     def _eval(self, adata, obsm_key: str, device: torch.device) -> dict:
@@ -926,29 +1065,8 @@ class VAE(PerturbModelBase):
         idx_to_pert = {idx: name for name, idx in ds.perturbation_dict.items()}
         result['rho_perts'] = np.array([idx_to_pert[i] for i in range(len(idx_to_pert))])
 
-        # ── synergy matrix (P, P) + saved params for plot_synergy ────────────
-        if self.use_synergy:
-            if self.combinatorial:
-                P_idx_np = ds.P_indices  # (N, 2)
-                combo_mask_syn = P_idx_np[:, 1] != -1
-                combos_syn = P_idx_np[combo_mask_syn]
-                observed_pairs = {
-                    (int(row[0]), int(row[1]))
-                    for row in combos_syn
-                    if int(row[0]) >= 0 and int(row[1]) >= 0
-                }
-            else:
-                observed_pairs = None
-            result['synergy_matrix'] = self.get_synergy_matrix(observed_pairs=observed_pairs)
-
-            # Save the bilinear projection data so plot_synergy needs no model/pyro access
-            result['synergy_params'] = {
-                'A':         A.astype(np.float32),
-                'U_loc':     pyro.param("U_syn_loc").detach().cpu().numpy().astype(np.float32),
-                'U_scale':   pyro.param("U_syn_scale").detach().cpu().numpy().astype(np.float32),
-                'V_loc':     pyro.param("V_syn_loc").detach().cpu().numpy().astype(np.float32),
-                'V_scale':   pyro.param("V_syn_scale").detach().cpu().numpy().astype(np.float32),
-                'syn_scale': float(pyro.param("syn_scale_val").detach().cpu().item()),
-            }
+        # ── geometric synergy classification ──────────────────────────
+        if self.combinatorial:
+            result['synergy'] = self.get_synergy(adata, obsm_key)
 
         return result

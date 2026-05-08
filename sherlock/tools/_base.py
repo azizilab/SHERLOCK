@@ -588,7 +588,6 @@ class PerturbModelBase(ABC, nn.Module):
             "z_corr":    z_corr,
             "z_perts":   z_perts,
             "z_embed":   z_embed,
-            "perts":     perts,
             "rho_corr":  rho_corr,
             "rho_perts": rho_perts,
             "rho_embed": rho_embed,
