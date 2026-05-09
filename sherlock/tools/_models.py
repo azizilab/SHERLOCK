@@ -106,6 +106,7 @@ class VAE(PerturbModelBase):
         de_align_lambda=1e-3,
         treat_effect_map=None,
         combinatorial=False,
+        z_var=1.0,
     ):
         super().__init__()
         assert shift in ['poe', 'linear'], "shift must be 'poe' or 'linear'"
@@ -134,22 +135,23 @@ class VAE(PerturbModelBase):
         self.use_de_align_loss = bool(use_de_align_loss)
         self.de_align_lambda = float(de_align_lambda)
         self.treat_effect_map = treat_effect_map
+        self.z_var = float(z_var)
 
-        # embeddings / condition prior params
+        # embeddings
         self.p_emb = nn.Embedding(perturbs, latent_dim)
-        self.c_emb_mu = nn.Embedding(conds, latent_dim)
-        self.c_emb_logvar = nn.Embedding(conds, latent_dim)
 
         # encoders / decoders
-        def enc(in_d, out_d):
+        def hidden_enc(in_d):
             return nn.Sequential(
                 nn.Linear(in_d, 128), nn.LeakyReLU(), nn.LayerNorm(128),
                 nn.Linear(128, 128), nn.LeakyReLU(), nn.LayerNorm(128),
-                nn.Linear(128, out_d),
             )
 
-        self.z_encoder = enc(input_dim, latent_dim * 2)
-        self.z0_encoder = enc(input_dim, latent_dim * 2)
+        # separate encoders — cell_encoder gets only CE/recon gradients, no z0 KL interference
+        self.cell_encoder = hidden_enc(input_dim)   # q(z):  individual cells (gene-space residual)
+        self.cond_encoder = hidden_enc(input_dim)   # q(z0): condition mean
+        self.z0_head = nn.Linear(128, latent_dim * 2)
+        self.z_head  = nn.Linear(128, latent_dim * 2)
 
         self.z_decoder = nn.Sequential(
             nn.Linear(latent_dim, 128), nn.LeakyReLU(),
@@ -331,18 +333,11 @@ class VAE(PerturbModelBase):
         W_all         = torch.cat([zeros_ntc, W_p_eff],    dim=0)  # (n_all, d)
         lin_shift_all = torch.cat([zeros_ntc, lin_shift_p], dim=0)  # (n_all, d)
 
-        if self.use_conditions:
-            z0_loc_p   = self.c_emb_mu(c)
-            z0_scale_p = (0.5 * self.c_emb_logvar(c)).exp()
-            pyro.factor("do_prior_ridge_mu",     -1e-4 * (z0_loc_p ** 2).mean())
-            pyro.factor("do_prior_ridge_logvar", -1e-4 * (self.c_emb_logvar.weight ** 2).mean())
-            z0_loc_all   = torch.cat([zeros_ntc,                                          z0_loc_p],   dim=0)
-            z0_scale_all = torch.cat([torch.ones(n_ntc, self.latent_dim, device=device), z0_scale_p], dim=0)
-        else:
-            z0_loc_all   = torch.zeros(n_all, self.latent_dim, device=device)
-            z0_scale_all = torch.ones( n_all, self.latent_dim, device=device)
+        # isotropic z0 prior — condition adjustment done in gene space via the residual guide
+        z0_loc_all   = torch.zeros(n_all, self.latent_dim, device=device)
+        z0_scale_all = torch.ones( n_all, self.latent_dim, device=device)
 
-        z_var = pyro.param("z_var_scale", torch.ones(self.latent_dim, device=device), constraint=constraints.positive)
+        z_var = torch.full((self.latent_dim,), self.z_var, device=device)
 
         if self.shift == 'poe':
             #Here to not be in cell plate
@@ -439,27 +434,57 @@ class VAE(PerturbModelBase):
             pyro.sample("U_syn", dist.Normal(U_syn_loc, U_syn_scale).to_event(3), infer={"scale": self.kl_weight})
             pyro.sample("V_syn", dist.Normal(V_syn_loc, V_syn_scale).to_event(3), infer={"scale": self.kl_weight})
 
-        # z0: encode all NTC cells; assign each perturbed cell the mean z0 of its condition
-        z0_mu_ntc, z0_logvar_ntc = self.z0_encoder(x_ntc).chunk(2, dim=-1)
-        z0_std_ntc = (0.5 * z0_logvar_ntc).exp()
+        if self.use_conditions:
+            # q(z0): cond_encoder on NTC mean per condition (dedicated path, no CE/recon pressure)
+            # q(z):  cell_encoder on gene-space residual x - x_cond_mean (condition info removed)
+            unique_conds    = c_ntc.unique()
+            cond_means_list = []
+            z0_params_list  = []
+            for cond_i in unique_conds:
+                m     = (c_ntc == cond_i)
+                x_mean = x_ntc[m].mean(0)
+                cond_means_list.append(x_mean.unsqueeze(0))                         # (1, G)
+                z0_params_list.append(self.z0_head(self.cond_encoder(x_mean.unsqueeze(0))))  # (1, latent*2)
 
-        z0_mu_p  = torch.zeros(n, self.latent_dim, device=x_p.device)
-        z0_std_p = torch.ones( n, self.latent_dim, device=x_p.device)
-        for cond_i in c.unique():
-            ntc_mask  = (c_ntc == cond_i)
-            pert_mask = (c    == cond_i)
-            if ntc_mask.any():
-                z0_mu_p[pert_mask]  = z0_mu_ntc[ntc_mask].mean(0)
-                z0_std_p[pert_mask] = z0_std_ntc[ntc_mask].mean(0)
+            cond_means_stack = torch.cat(cond_means_list, dim=0)   # (C, G)
+            z0_params_stack  = torch.cat(z0_params_list,  dim=0)   # (C, latent*2)
+
+            cond_to_idx = {int(ci.item()): i for i, ci in enumerate(unique_conds)}
+            ntc_cidx = torch.tensor(
+                [cond_to_idx[int(ci.item())] for ci in c_ntc], dtype=torch.long, device=x_p.device
+            )
+            p_cidx = torch.tensor(
+                [cond_to_idx[int(ci.item())] for ci in c], dtype=torch.long, device=x_p.device
+            )
+
+            # q(z0): broadcast condition params to each cell
+            z0_ntc_params = z0_params_stack[ntc_cidx]
+            z0_p_params   = z0_params_stack[p_cidx]
+            z0_mu_ntc, z0_logvar_ntc = z0_ntc_params.chunk(2, dim=-1)
+            z0_std_ntc = (0.5 * z0_logvar_ntc).exp()
+            z0_mu_p, z0_logvar_p = z0_p_params.chunk(2, dim=-1)
+            z0_std_p = (0.5 * z0_logvar_p).exp()
+
+            # q(z): gene-space centering removes condition effect; cell_encoder sees only residual
+            x_cond_ntc = cond_means_stack[ntc_cidx]   # (n_ntc, G)
+            x_cond_p   = cond_means_stack[p_cidx]     # (n, G)
+            z_mu_ntc, z_logvar_ntc = self.z_head(self.cell_encoder(x_ntc - x_cond_ntc)).chunk(2, dim=-1)
+            z_std_ntc = (0.5 * z_logvar_ntc).exp()
+            z_mu_p, z_logvar_p = self.z_head(self.cell_encoder(x_p - x_cond_p)).chunk(2, dim=-1)
+            z_std_p = (0.5 * z_logvar_p).exp()
+        else:
+            # no conditions: q(z0) = N(0,I); q(z) from cell expression alone
+            z0_mu_ntc  = torch.zeros(n_ntc, self.latent_dim, device=x_p.device)
+            z0_std_ntc = torch.ones( n_ntc, self.latent_dim, device=x_p.device)
+            z0_mu_p    = torch.zeros(n,     self.latent_dim, device=x_p.device)
+            z0_std_p   = torch.ones( n,     self.latent_dim, device=x_p.device)
+            z_mu_ntc, z_logvar_ntc = self.z_head(self.cell_encoder(x_ntc)).chunk(2, dim=-1)
+            z_std_ntc = (0.5 * z_logvar_ntc).exp()
+            z_mu_p,   z_logvar_p   = self.z_head(self.cell_encoder(x_p)).chunk(2, dim=-1)
+            z_std_p   = (0.5 * z_logvar_p).exp()
 
         z0_mu_all  = torch.cat([z0_mu_ntc, z0_mu_p],  dim=0)
         z0_std_all = torch.cat([z0_std_ntc, z0_std_p], dim=0)
-
-        # z: encode NTC and perturbed cells through the same z_encoder
-        z_mu_ntc, z_logvar_ntc = self.z_encoder(x_ntc).chunk(2, dim=-1)
-        z_std_ntc = (0.5 * z_logvar_ntc).exp()
-        z_mu_p,   z_logvar_p   = self.z_encoder(x_p).chunk(2, dim=-1)
-        z_std_p   = (0.5 * z_logvar_p).exp()
 
         z_mu_all  = torch.cat([z_mu_ntc, z_mu_p],  dim=0)
         z_std_all = torch.cat([z_std_ntc, z_std_p], dim=0)
@@ -470,11 +495,96 @@ class VAE(PerturbModelBase):
 
     @torch.no_grad()
     def _abduct_z0(self, x_ntc):
-        lib_ntc = x_ntc.sum(dim=1, keepdim=True)
-        med_ntc = torch.median(lib_ntc).item()
-        x_ntc_n = torch.log1p(x_ntc / lib_ntc * med_ntc)
-        z0_mu, _ = self.z0_encoder(x_ntc_n).chunk(2, dim=-1)
-        return z0_mu
+        x_ntc_n = self._mednorm(x_ntc)
+        if self.use_conditions:
+            x_cond_mean = x_ntc_n.mean(0, keepdim=True)           # (1, G)
+            z_mu, _ = self.z_head(self.cell_encoder(x_ntc_n - x_cond_mean)).chunk(2, dim=-1)
+        else:
+            z_mu, _ = self.z_head(self.cell_encoder(x_ntc_n)).chunk(2, dim=-1)
+        return z_mu
+
+    @torch.no_grad()
+    def init_p_emb_from_adata(self, adata) -> None:
+        """Seed p_emb with PCA of per-perturbation pseudobulk expression differences vs NTC.
+
+        Baseline is NTC cells from the untreated condition only. Perturbed cells are
+        also taken from untreated only, falling back to all conditions if a perturbation
+        has no untreated cells. In combinatorial mode individual genes are model rows;
+        'A+B' labels contribute to both gene A and gene B deltas.
+        """
+        import scipy.sparse as sp
+        from sklearn.decomposition import TruncatedSVD
+
+        ntc_label       = get_config("ntc_label")
+        pert_key        = get_config("pert_key")
+        treatment_key   = get_config("treatment_key")
+        untreated_label = get_config("untreated_label")
+
+        X = adata.X
+        if sp.issparse(X):
+            X = X.toarray().astype(np.float32)
+        else:
+            X = np.asarray(X, dtype=np.float32)
+
+        lib    = X.sum(1, keepdims=True)
+        X_norm = np.log1p(X / (lib + 1e-8) * float(np.median(lib)))
+
+        obs_pert = adata.obs[pert_key].values
+        obs_cond = adata.obs[treatment_key].values
+        is_untreated = obs_cond == untreated_label
+
+        # Baseline: NTC cells in untreated condition
+        baseline_mask = (obs_pert == ntc_label) & is_untreated
+        if not baseline_mask.any():
+            baseline_mask = obs_pert == ntc_label
+        ntc_mean = X_norm[baseline_mask].mean(0)
+
+        def _pert_mean(pert_mask):
+            """Mean expression for perturbed cells, preferring untreated condition."""
+            untreated_pert = pert_mask & is_untreated
+            return X_norm[untreated_pert if untreated_pert.any() else pert_mask].mean(0)
+
+        if self.combinatorial:
+            all_genes: set = set()
+            for p in obs_pert[obs_pert != ntc_label]:
+                s = str(p)
+                for g in (s.split("+") if "+" in s else [s]):
+                    all_genes.add(g.strip())
+            non_ntc = sorted(all_genes)
+            if len(non_ntc) != self.perturbs:
+                raise ValueError(
+                    f"Perturbation count mismatch: {len(non_ntc)} genes in adata, model expects {self.perturbs}"
+                )
+            deltas = np.zeros((self.perturbs, X_norm.shape[1]), dtype=np.float32)
+            for i, gene in enumerate(non_ntc):
+                mask = np.array(
+                    [gene in (str(p).split("+") if "+" in str(p) else [str(p)])
+                     for p in obs_pert], dtype=bool
+                ) & (obs_pert != ntc_label)
+                if mask.any():
+                    deltas[i] = _pert_mean(mask) - ntc_mean
+        else:
+            non_ntc = sorted(p for p in np.unique(obs_pert) if p != ntc_label)
+            if len(non_ntc) != self.perturbs:
+                raise ValueError(
+                    f"Perturbation count mismatch: {len(non_ntc)} labels in adata, model expects {self.perturbs}"
+                )
+            deltas = np.zeros((self.perturbs, X_norm.shape[1]), dtype=np.float32)
+            for i, p in enumerate(non_ntc):
+                mask = obs_pert == p
+                if mask.any():
+                    deltas[i] = _pert_mean(mask) - ntc_mean
+
+        r   = min(self.perturbs - 1, self.latent_dim)
+        emb = TruncatedSVD(n_components=r, random_state=0).fit_transform(deltas)  # (P, r)
+        if r < self.latent_dim:
+            pad = 0.01 * np.random.default_rng(0).standard_normal(
+                (self.perturbs, self.latent_dim - r)
+            ).astype(np.float32)
+            emb = np.concatenate([emb, pad], axis=1)
+
+        emb = (emb / (emb.std(0, keepdims=True) + 1e-8)).astype(np.float32)
+        self.p_emb.weight.data.copy_(torch.tensor(emb, dtype=self.p_emb.weight.dtype))
 
     # ------------------------------ PerturbModelBase interface ----------------------------- #
 
@@ -484,27 +594,19 @@ class VAE(PerturbModelBase):
             "input_dim":      self.input_dim,
             "latent_dim":     self.latent_dim,
             "perturbs":       self.perturbs,
-            "conds":          self.conds,
+            "conds":          self.conds,   # kept for ctor compat; no longer drives c_emb
             "use_conditions": bool(self.use_conditions),
             "rank":           self.rank,
             "shift":          self.shift,
             "use_synergy":    bool(self.use_synergy),
             "synergy_rank":   self.synergy_rank,
             "combinatorial":  self.combinatorial,
+            "z_var":          self.z_var,
         }
 
     def get_z(self, x: torch.Tensor, p: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
-        """
-        Mean of q(z | x_p).
-
-        The VAE encoder does not condition on perturbation labels —
-        the perturbation effect is captured in the latent shift during
-        training and is already baked into the encoder weights.
-        """
-        lib = x.sum(dim=1, keepdim=True)
-        med = torch.median(lib).item()
-        x_norm = torch.log1p(x / lib * med)
-        z_mu, _ = self.z_encoder(x_norm).chunk(2, dim=-1)
+        x_norm = self._mednorm(x)
+        z_mu, _ = self.z_head(self.cell_encoder(x_norm)).chunk(2, dim=-1)
         return z_mu
 
     @torch.no_grad()
@@ -623,9 +725,8 @@ class VAE(PerturbModelBase):
     @torch.no_grad()
     def _run_inference(self, dataset, device, batch_size=1024):
         """
-        NTC cells are encoded via z0_encoder and z_encoder for pre and post shift; perturbed
-        cells only via z_encoder. z for NTC should reflect an unshifted state. Both are stored together in
-        so adata.obsm['z'].
+        Encode z as z_head(cell_encoder(x - x_cond_mean)) when use_conditions=True,
+        else z_head(cell_encoder(x)). NTC cells have no perturbation shift; perturbed cells do.
         """
         from torch.utils.data import DataLoader
 
@@ -649,18 +750,40 @@ class VAE(PerturbModelBase):
         else:
             ntc_mask = p_all == dataset.ntc_idx
 
-        z_out    = torch.empty(N, self.latent_dim)
+        # Build per-condition gene-space means for centering (mirrors guide logic)
+        cond_x_mean: dict = {}  # cond_int -> (G,) mean NTC x_norm on device
+        c_all = None
+        if self.use_conditions:
+            c_indices = getattr(dataset, "C_indices", None)
+            if c_indices is not None:
+                c_all = np.array(c_indices, dtype=np.int64)
+                c_ntc_np = c_all[ntc_mask.numpy()]
+                x_ntc_norm = x_norm_all[ntc_mask]
+                for cond_i in np.unique(c_ntc_np):
+                    m = torch.from_numpy(c_ntc_np == cond_i)
+                    cond_x_mean[int(cond_i)] = x_ntc_norm[m].mean(0)
+
+        z_out     = torch.empty(N, self.latent_dim)
         recon_out = torch.empty(N, G)
 
-        for encoder, mask in [(self.z_encoder, ntc_mask), (self.z_encoder, ~ntc_mask)]:
+        for mask in [ntc_mask, ~ntc_mask]:
             indices = mask.nonzero(as_tuple=True)[0]
             for i in range(0, len(indices), batch_size):
-                idx_b  = indices[i : i + batch_size]
-                xb     = x_norm_all[idx_b]
-                lib_b  = lib_all[idx_b]
-                z_mu, _ = encoder(xb).chunk(2, dim=-1)
-                logits   = self.z_decoder(z_mu)
-                z_out[idx_b]    = z_mu.detach().cpu()
+                idx_b = indices[i : i + batch_size]
+                xb    = x_norm_all[idx_b]
+                lib_b = lib_all[idx_b]
+                if cond_x_mean:
+                    c_batch  = c_all[idx_b.cpu().numpy()]
+                    xb_enc = xb.clone()
+                    for cond_i, x_mean in cond_x_mean.items():
+                        m = torch.from_numpy(c_batch == cond_i)
+                        if m.any():
+                            xb_enc[m] = xb[m] - x_mean
+                    z_mu, _ = self.z_head(self.cell_encoder(xb_enc)).chunk(2, dim=-1)
+                else:
+                    z_mu, _ = self.z_head(self.cell_encoder(xb)).chunk(2, dim=-1)
+                logits = self.z_decoder(z_mu)
+                z_out[idx_b]     = z_mu.detach().cpu()
                 recon_out[idx_b] = (lib_b * F.softmax(logits, dim=-1)).detach().cpu()
 
         return (
@@ -671,7 +794,7 @@ class VAE(PerturbModelBase):
 
     # ------------------------------ Sherlock-specific helpers ----------------------------- #
     @torch.no_grad()
-    def _counterfactual_effect_size(self, x_ntc_cond, cond_idx, device=None):
+    def _counterfactual_effect_size(self, x_ntc_cond, device=None):
         if device is None:
             device = next(self.parameters()).device
 
@@ -1051,7 +1174,6 @@ class VAE(PerturbModelBase):
             x_ntc_cond = x_ntc_mat[cond_idx]
             ev_pg = self._counterfactual_effect_size(
                 x_ntc_cond=x_ntc_cond,
-                cond_idx=cond_idx,
                 device=device,
             )
             ev_list.append(ev_pg)

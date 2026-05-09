@@ -51,6 +51,7 @@ def run(
     tau_init: float = 0.67,
     tau_end: float = 0.3,
     debug: bool = False,
+    rho_init: bool = False,
     **kwargs,
 ) -> dict:
     """
@@ -119,6 +120,9 @@ def run(
             combinatorial=combinatorial,
             **vae_kwargs,
         ).to(device)
+
+        if rho_init:
+            vae.init_p_emb_from_adata(adata)
 
         trainer = VAETrainer(
             vae=vae,

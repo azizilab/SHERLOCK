@@ -373,6 +373,18 @@ class PerturbSimpleDataset(Dataset):
 
         self.var_names: list[str] = anndata.var_names.tolist()
 
+        try:
+            treatment_key = get_config("treatment_key")
+            cond_labels = anndata.obs[treatment_key].values
+            cond_unique = np.unique(cond_labels)
+            self.condition_dict: dict[str, int] = {c: i for i, c in enumerate(cond_unique)}
+            self.C_indices: np.ndarray | None = np.array(
+                [self.condition_dict[c] for c in cond_labels], dtype=np.int64
+            )
+        except Exception:
+            self.condition_dict = {}
+            self.C_indices = None
+
     def __len__(self) -> int:
         return self.X.shape[0]
 
