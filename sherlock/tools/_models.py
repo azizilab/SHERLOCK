@@ -99,6 +99,7 @@ class VAE(PerturbModelBase):
         gate_init_p=0.5,
         rank=6,
         use_conditions=False,
+        use_residual=True,
         shift='linear',
         use_synergy=False,
         synergy_rank=4,
@@ -116,6 +117,7 @@ class VAE(PerturbModelBase):
         self.perturbs = perturbs
         self.conds = conds
         self.use_conditions = use_conditions
+        self.use_residual = use_residual if use_conditions else False
         self.rank = rank
         self.shift = shift
         self.use_synergy = use_synergy
@@ -465,12 +467,14 @@ class VAE(PerturbModelBase):
             z0_mu_p, z0_logvar_p = z0_p_params.chunk(2, dim=-1)
             z0_std_p = (0.5 * z0_logvar_p).exp()
 
-            # q(z): gene-space centering removes condition effect; cell_encoder sees only residual
+            # q(z): optionally subtract condition mean before encoding (use_residual)
             x_cond_ntc = cond_means_stack[ntc_cidx]   # (n_ntc, G)
             x_cond_p   = cond_means_stack[p_cidx]     # (n, G)
-            z_mu_ntc, z_logvar_ntc = self.z_head(self.cell_encoder(x_ntc - x_cond_ntc)).chunk(2, dim=-1)
+            x_ntc_enc = x_ntc - x_cond_ntc if self.use_residual else x_ntc
+            x_p_enc   = x_p   - x_cond_p   if self.use_residual else x_p
+            z_mu_ntc, z_logvar_ntc = self.z_head(self.cell_encoder(x_ntc_enc)).chunk(2, dim=-1)
             z_std_ntc = (0.5 * z_logvar_ntc).exp()
-            z_mu_p, z_logvar_p = self.z_head(self.cell_encoder(x_p - x_cond_p)).chunk(2, dim=-1)
+            z_mu_p, z_logvar_p = self.z_head(self.cell_encoder(x_p_enc)).chunk(2, dim=-1)
             z_std_p = (0.5 * z_logvar_p).exp()
         else:
             # no conditions: q(z0) = N(0,I); q(z) from cell expression alone
@@ -496,7 +500,7 @@ class VAE(PerturbModelBase):
     @torch.no_grad()
     def _abduct_z0(self, x_ntc):
         x_ntc_n = self._mednorm(x_ntc)
-        if self.use_conditions:
+        if self.use_conditions and self.use_residual:
             x_cond_mean = x_ntc_n.mean(0, keepdim=True)           # (1, G)
             z_mu, _ = self.z_head(self.cell_encoder(x_ntc_n - x_cond_mean)).chunk(2, dim=-1)
         else:
@@ -596,6 +600,7 @@ class VAE(PerturbModelBase):
             "perturbs":       self.perturbs,
             "conds":          self.conds,   # kept for ctor compat; no longer drives c_emb
             "use_conditions": bool(self.use_conditions),
+            "use_residual":   bool(self.use_residual),
             "rank":           self.rank,
             "shift":          self.shift,
             "use_synergy":    bool(self.use_synergy),
@@ -772,7 +777,7 @@ class VAE(PerturbModelBase):
                 idx_b = indices[i : i + batch_size]
                 xb    = x_norm_all[idx_b]
                 lib_b = lib_all[idx_b]
-                if cond_x_mean:
+                if cond_x_mean and self.use_residual:
                     c_batch  = c_all[idx_b.cpu().numpy()]
                     xb_enc = xb.clone()
                     for cond_i, x_mean in cond_x_mean.items():

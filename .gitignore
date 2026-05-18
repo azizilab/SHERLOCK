@@ -6,3 +6,4 @@ sherlock/benchmark/*
 sherlock/notebooks/results/*
 sherlock/notebooks/figures/*
 sherlock/notebooks/norman/results/*
+sherlock/notebooks/gbm/results/*
