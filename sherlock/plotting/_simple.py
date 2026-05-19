@@ -56,8 +56,11 @@ def plot_r2(adata):
                
 
 def plot_corr(adata, uns_key='results'):
-    corr = adata.uns[uns_key]['rho_corr']
-    sns.clustermap(corr, cmap="coolwarm", annot=False)
+    uns = adata.uns[uns_key]
+    corr = uns['rho_corr']
+    labels = uns.get('rho_perts')
+    corr_df = pd.DataFrame(corr, index=labels, columns=labels)
+    sns.clustermap(corr_df, cmap="coolwarm", annot=False)
 
 def plot_synergy(adata, uns_key='results'):
     """Lollipop plot of interaction_score for all pairs, colored by classification."""

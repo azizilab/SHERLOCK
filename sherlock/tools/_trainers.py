@@ -30,6 +30,7 @@ class VAETrainer:
         tau_anneal_steps: int | None = None,
         patience: int = 20,
         n_epochs_kl_warmup: int = 50,
+        n_epochs_l0_warmup: int = 50,
     ):
         self.vae = vae
         self.dataloader = dataloader
@@ -61,8 +62,9 @@ class VAETrainer:
         self.global_step = 0
         self.vae.gate.set_temperature(self.tau_init)
 
-        # KL warmup schedule
+        # KL / L0 warmup schedules
         self.n_epochs_kl_warmup = max(1, int(n_epochs_kl_warmup))
+        self.n_epochs_l0_warmup = max(1, int(n_epochs_l0_warmup))
 
         # last validated metrics (persist between evals)
         self._last_valid = dict(
@@ -81,13 +83,11 @@ class VAETrainer:
         return min(1.0, epoch / self.n_epochs_kl_warmup)
 
     def _l0_weight(self, epoch: int) -> float:
-        """Gate sparsity weight: ramps 0→1 over the epoch window
-        [n_epochs_kl_warmup, 2*n_epochs_kl_warmup].  Delaying L0 until after
-        KL warmup prevents gates from collapsing the moment KL weight reaches 1."""
+        """Gate sparsity weight: waits until KL warmup ends, then ramps 0→1 over n_epochs_l0_warmup epochs."""
         delay = self.n_epochs_kl_warmup
         if epoch <= delay:
             return 0.0
-        return min(1.0, (epoch - delay) / self.n_epochs_kl_warmup)
+        return min(1.0, (epoch - delay) / self.n_epochs_l0_warmup)
 
     def _current_tau(self, step) -> float:
         if self.tau_anneal_steps <= 0 or self.tau_init <= self.tau_end:

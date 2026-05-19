@@ -123,6 +123,10 @@ def run(
 
         if rho_init:
             vae.init_p_emb_from_adata(adata)
+        if vae.use_conditions:
+            vae.init_cond_means_from_adata(adata, dataset)
+        else:
+            vae.init_global_mean_from_adata(adata)
 
         trainer = VAETrainer(
             vae=vae,
@@ -153,15 +157,16 @@ def run(
             ax1.plot(epochs, hist_df["ATE"], "b-o", markersize=4, label="ATE")
             ax1.set_ylabel("ATE (Pearson r)")
             kl_end = trainer.n_epochs_kl_warmup
+            l0_end = trainer.n_epochs_l0_warmup
             ax1.axvline(kl_end, color="gray", linestyle="--", alpha=0.6, label="KL warmup end")
-            ax1.axvline(2 * kl_end, color="orange", linestyle="--", alpha=0.6, label="L0 warmup end")
+            ax1.axvline(l0_end, color="orange", linestyle="--", alpha=0.6, label="L0 warmup end")
             ax1.legend(fontsize=8)
             ax1.grid(True, alpha=0.3)
 
             ax2.plot(epochs, hist_df["pi25"], "g-", label="π p25 (gate activity)")
             ax2.plot(epochs, hist_df["pi99"], "r-", label="π p99 (gate activity)")
             ax2.axvline(kl_end, color="gray", linestyle="--", alpha=0.6)
-            ax2.axvline(2 * kl_end, color="orange", linestyle="--", alpha=0.6)
+            ax2.axvline(l0_end, color="orange", linestyle="--", alpha=0.6)
             ax2.set_ylabel("Gate prob. π")
             ax2.set_xlabel("Epoch")
             ax2.legend(fontsize=8)
