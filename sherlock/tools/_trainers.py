@@ -1,5 +1,6 @@
 import copy
 import math
+import warnings
 import numpy as np
 import pyro
 import pyro.poutine as poutine
@@ -65,6 +66,11 @@ class VAETrainer:
         # KL / L0 warmup schedules
         self.n_epochs_kl_warmup = max(1, int(n_epochs_kl_warmup))
         self.n_epochs_l0_warmup = max(1, int(n_epochs_l0_warmup))
+
+        # Freeze gates during KL warmup so reconstruction gradients can't drive
+        # all log_alpha positive before the L0 penalty is active.
+        self.vae.gate.log_alpha.requires_grad_(False)
+        self._gates_frozen = True
 
         # last validated metrics (persist between evals)
         self._last_valid = dict(
@@ -210,6 +216,11 @@ class VAETrainer:
 
             kl_weight = self._kl_weight(epoch)
             l0_weight = self._l0_weight(epoch)
+
+            if self._gates_frozen and l0_weight > 0.0:
+                self.vae.gate.log_alpha.requires_grad_(True)
+                self._gates_frozen = False
+
             self.vae.kl_weight = kl_weight
             self.vae.l0_weight = l0_weight
 
@@ -221,7 +232,10 @@ class VAETrainer:
                 self.vae.gate.set_temperature(tau_curr)
                 self._last_tau = tau_curr
 
-                epoch_loss += self.svi.step(X_p, X_ntc, P, C, C_ntc)
+                with warnings.catch_warnings():
+                    if self._gates_frozen:
+                        warnings.filterwarnings("ignore", message=".*gate.log_alpha.*requires_grad.*")
+                    epoch_loss += self.svi.step(X_p, X_ntc, P, C, C_ntc)
                 self.global_step += 1
 
             avg_elbo = epoch_loss / dataset_size
@@ -266,9 +280,10 @@ class VAETrainer:
                 tau=f"{self._last_tau:.3f}",
             )
 
-            # early stopping by ELBO
+            # early stopping by ELBO — don't count patience until both warmups finish
+            warmup_end = self.n_epochs_kl_warmup + self.n_epochs_l0_warmup
             score = avg_elbo
-            if score < best_score or epoch < self.num_epochs // 2:
+            if score < best_score or epoch <= warmup_end:
                 best_score = score
                 best_state = copy.deepcopy(self.vae)
                 best_param_store = copy.deepcopy(pyro.get_param_store().get_state())
