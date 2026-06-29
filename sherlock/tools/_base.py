@@ -190,11 +190,17 @@ class PerturbModelBase(ABC, nn.Module):
         return u + m_p
 
     @torch.no_grad()
-    def _combine_pert_shifts(self, m1: torch.Tensor, m2: torch.Tensor) -> torch.Tensor:
+    def _combine_pert_shifts(
+        self,
+        m1: torch.Tensor,
+        m2: torch.Tensor,
+        pert_idx_0: int | None = None,
+        pert_idx_1: int | None = None,
+    ) -> torch.Tensor:
         """
         Combine two shift tensors for a combinatorial perturbation.
         Default (cVAE/sVAE): additive sum — both are plain (1, d) shift vectors.
-        VAE overrides to union-merge the stacked (A*W, W) format.
+        VAE overrides to apply learned c1/c2 scaling using the pert indices.
         """
         return m1 + m2
 
@@ -384,7 +390,10 @@ class PerturbModelBase(ABC, nn.Module):
                     continue
                 m_p = all_shifts[[idxs[0]]]
                 for i in idxs[1:]:
-                    m_p = self._combine_pert_shifts(m_p, all_shifts[[i]])
+                    m_p = self._combine_pert_shifts(
+                        m_p, all_shifts[[i]],
+                        pert_idx_0=idxs[0], pert_idx_1=i,
+                    )
                 z_cf_k  = self._apply_shift(centroids, m_p)
                 mu_cf_k = self._decode_to_expr(z_cf_k, lib_med)
                 if mu_cf_k is None:

@@ -98,12 +98,28 @@ def load_results(path: str):
 
     # ── VAE / cVAE / sVAE ─────────────────────────────────────────────────────
     cls = _get_class(class_name)
+    ctor = dict(ckpt["ctor"])
     extra_kwargs = {}
     if class_name == "VAE":
-        extra_kwargs["tau"] = 0.5  # dummy; not stored but required by ctor
+        if "use_synergy" in ctor and "synergy" not in ctor:
+            ctor["synergy"] = ctor.pop("use_synergy")
+        else:
+            ctor.pop("use_synergy", None)
+        if "tau" not in ctor:
+            extra_kwargs["tau"] = 0.5  # dummy; not stored but required by ctor
 
-    model = cls(**ckpt["ctor"], **extra_kwargs)
-    model.load_state_dict(ckpt["state_dict"])
+    model = cls(**ctor, **extra_kwargs)
+    try:
+        model.load_state_dict(ckpt["state_dict"])
+    except RuntimeError as err:
+        if class_name != "VAE":
+            raise
+        load_result = model.load_state_dict(ckpt["state_dict"], strict=False)
+        missing = set(load_result.missing_keys)
+        unexpected = set(load_result.unexpected_keys)
+        allowed_missing = {"parent_coeff.weight", "parent_coeff.bias"}
+        if not missing.issubset(allowed_missing) or unexpected:
+            raise err
 
     if "pyro_param_store" in ckpt:
         import pyro

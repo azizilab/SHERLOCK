@@ -85,6 +85,7 @@ def run(
 
         combinatorial = kwargs.pop("combinatorial", False)
         dataset = PerturbMatchingDataset(adata, combinatorial=combinatorial)
+
         dataloader = DataLoader(
             dataset,
             collate_fn=dataset.get_collate_fn(),
@@ -157,7 +158,7 @@ def run(
             ax1.plot(epochs, hist_df["ATE"], "b-o", markersize=4, label="ATE")
             ax1.set_ylabel("ATE (Pearson r)")
             kl_end = trainer.n_epochs_kl_warmup
-            l0_end = trainer.n_epochs_l0_warmup
+            l0_end = trainer.n_epochs_kl_warmup + trainer.n_epochs_l0_warmup
             ax1.axvline(kl_end, color="gray", linestyle="--", alpha=0.6, label="KL warmup end")
             ax1.axvline(l0_end, color="orange", linestyle="--", alpha=0.6, label="L0 warmup end")
             ax1.legend(fontsize=8)

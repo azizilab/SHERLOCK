@@ -78,14 +78,17 @@ def plot_synergy(adata, uns_key='results'):
     n = len(df)
 
     _CLASS_COLORS = {
-        'latent synergy candidate':                    '#2166ac',
-        'dominance epistasis':                         '#d73027',
-        'negative epistasis / suppressed shared effect': '#f4a582',
-        'emergent epistasis / redirection':            '#b2182b',
-        'expected shared-axis effect':                 '#92c5de',
-        'weak / undefined':                            '#aaaaaa',
-        'too few cells':                               '#dddddd',
-        'mixed / ambiguous':                           '#777777',
+        'neomorphic':                    '#762a83',
+        'epistasis':                     '#d73027',
+        'approximately additive':        '#92c5de',
+        'redundant':                     '#4dac26',
+        'suppression':                   '#f4a582',
+        'synergy (similar phenotype)':   '#2166ac',
+        'synergy (dissimilar phenotype)': '#1a9850',
+        'potentiation':                  '#e08214',
+        'weak / undefined':              '#aaaaaa',
+        'too few cells':                 '#dddddd',
+        'mixed / ambiguous':             '#777777',
     }
     classes = df['classification'].unique()
     color_map = {cls: _CLASS_COLORS.get(cls, '#333333') for cls in classes}
