@@ -297,6 +297,7 @@ def classify_gi(
     pred_col: str = "predicted_gi",
     fit_mask=None,
     inplace: bool = True,
+    synergy_threshold: float = 0.779,
 ) -> "pd.DataFrame":
     """Classify GI metrics with biologically motivated equal-weight scores.
 
@@ -311,8 +312,8 @@ def classify_gi(
 
     score_specs = {
         "approximately additive": [
-            (1, "singles_to_doubles"),
             (-1, "additive_residual_norm"),
+            (-1, "norm_ab_over_additive"),
         ],
         "epistasis": [
             (1, "dominance"),
@@ -339,8 +340,8 @@ def classify_gi(
         ],
         "synergy": [
             (1, "magnitude"),
-            (1, "signed_residual_alignment"),
-            (1, "singles_similarity"),
+            (1, "norm_ab_over_additive"),
+            (2, "singles_similarity"),
         ],
     }
 
@@ -389,10 +390,7 @@ def classify_gi(
 
     pred = class_scores.idxmax(axis=1).astype(object)
     synergy_mask = pred == "synergy"
-    if synergy_mask.any():
-        threshold = out.loc[pred.index[synergy_mask], "singles_similarity"].median()
-    else:
-        threshold = out.loc[valid, "singles_similarity"].median()
+    threshold = synergy_threshold
 
     similar = synergy_mask & (
         out.loc[pred.index, "singles_similarity"].to_numpy() >= threshold
