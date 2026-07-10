@@ -22,6 +22,179 @@ class GEARSRun:
     adata: Any
     predictions: pd.DataFrame | None = None
     gi: pd.DataFrame | None = None
+    ate_metrics: dict | None = None
+    ate_result: dict | None = None
+
+    def compute_ate(
+        self,
+        combos: Sequence[str],
+        treat_effect_adata: Any,
+        val_combos: Iterable[str],
+        *,
+        sep: str = "+",
+        already_normalized: bool = False,
+        verbose: bool = True,
+    ) -> dict:
+        """
+        Predicted vs. observed ATE (average treatment effect), split into
+        all/single/combo/held-out Pearson r -- mirrors `_compute_ate_metrics`
+        used for SHERLOCK/cVAE/sVAE/contrastiveVI in the figure notebook, so
+        GEARS rows can be concatenated directly onto the same runs table.
+
+        By default this assumes the GEARS model was trained on raw-count
+        AnnData (not GEARS' usual log-normalized convention), so
+        `self.model.predict(...)` returns raw expected counts, not log2-CPM.
+        `treat_effect_adata` (from `sherlock.preprocessing.treat_effect`) is
+        in log2-CPM-delta space, so both the predicted profile and the
+        control baseline are log2-CPM normalized *independently* here before
+        differencing -- matching `SherlockBase._lognorm`'s order of
+        operations (normalize each profile, then subtract), not
+        `lognorm(pred - control)`, which would not equal the former by
+        Jensen's inequality.
+
+        If the model was instead trained on already CP10K+log2-normalized
+        input (matching `treat_effect`'s own convention -- the correct way
+        to feed GEARS, since `PertData.new_data_process()` does no
+        normalization itself and assumes pre-normalized input), pass
+        `already_normalized=True` so predictions/control are used directly
+        without re-applying that transform, which would otherwise
+        double-normalize them.
+
+        Parameters
+        ----------
+        combos : perturbation labels to predict (singles are inferred from
+            the genes appearing in these combos).
+        treat_effect_adata : AnnData with observed ATEs (obs=perturbations,
+            var=genes, X=log2-CPM delta), e.g. `data.uns['treat_effect']`.
+        val_combos : held-out combo labels (canonical, "+"-joined, sorted)
+            used to split `ate_combo` (in-distribution) from `ate_held`.
+        already_normalized : set True when the model was trained on
+            CP10K+log2-normalized input rather than raw counts.
+
+        Returns
+        -------
+        dict with keys: ate_all, ate_single, ate_combo, ate_held.
+        The full predicted/observed frames are also stashed on
+        `self.ate_result` for anyone who wants them post-hoc.
+        """
+        from gears.utils import get_mean_control
+        from scipy.stats import pearsonr
+
+        _nan_metrics = {
+            "ate_all": float("nan"), "ate_single": float("nan"),
+            "ate_combo": float("nan"), "ate_held": float("nan"),
+        }
+
+        if self.model is None:
+            self.ate_metrics = _nan_metrics
+            return _nan_metrics
+
+        val_combos = set(val_combos)
+        requested_combos = sorted({canonical_combo(c, sep=sep) for c in combos})
+
+        # Drop any perturbation containing a gene absent from the GO-derived
+        # graph GEARS was initialized with -- model.predict() raises a
+        # ValueError on those rather than skipping them itself.
+        valid_perturbs = set(getattr(self.model, "pert_list", []) or [])
+        if valid_perturbs:
+            kept, skipped, missing_genes = [], [], set()
+            for combo in requested_combos:
+                parts = split_combo(combo, sep=sep)
+                bad = [p for p in parts if p not in valid_perturbs]
+                if bad:
+                    skipped.append(combo)
+                    missing_genes.update(bad)
+                else:
+                    kept.append(combo)
+            if skipped and verbose:
+                preview = ", ".join(sorted(missing_genes)[:20])
+                suffix = "" if len(missing_genes) <= 20 else f", ... ({len(missing_genes)} genes total)"
+                print(
+                    f"[GEARS] ATE: skipping {len(skipped)} perturbations containing genes "
+                    f"absent from the GO graph: {preview}{suffix}"
+                )
+            requested_combos = kept
+
+        combo_sets = _as_gears_perturbation_sets(requested_combos, sep=sep)
+        single_genes = sorted({gene for pert_set in combo_sets for gene in pert_set})
+        single_sets = [[gene] for gene in single_genes]
+        perturbation_sets = single_sets + combo_sets
+
+        if verbose:
+            print(
+                f"[GEARS] ATE: predicting {len(single_sets)} singles and "
+                f"{len(combo_sets)} combinations"
+            )
+        prediction = self.model.predict(perturbation_sets)
+
+        mean_control = np.asarray(get_mean_control(self.model.adata).values, dtype=float)
+        _transform = (lambda x: x) if already_normalized else _lognorm_vec
+        control_ln = _transform(mean_control)
+        gene_names = list(self.model.adata.var["gene_name"].values)
+
+        rows: dict[str, np.ndarray] = {}
+        for gene in single_genes:
+            key = _prediction_key([gene])
+            if key in prediction:
+                rows[gene] = _transform(np.asarray(prediction[key], dtype=float)) - control_ln
+        for combo in requested_combos:
+            parts = split_combo(combo, sep=sep)
+            if len(parts) != 2:
+                continue
+            key = _prediction_key(parts)
+            if key in prediction:
+                rows[combo] = _transform(np.asarray(prediction[key], dtype=float)) - control_ln
+
+        if not rows:
+            self.ate_metrics = _nan_metrics
+            self.ate_result = {"corr": float("nan"), "predicted_df": pd.DataFrame(), "observed_df": pd.DataFrame()}
+            return _nan_metrics
+
+        pred_df = pd.DataFrame.from_dict(rows, orient="index", columns=gene_names)
+
+        obs_X = treat_effect_adata.X
+        if hasattr(obs_X, "toarray"):
+            obs_X = obs_X.toarray()
+        obs_df = pd.DataFrame(
+            np.asarray(obs_X),
+            index=treat_effect_adata.obs_names,
+            columns=treat_effect_adata.var_names,
+        )
+
+        common_perts = pred_df.index.intersection(obs_df.index)
+        common_genes = pred_df.columns.intersection(obs_df.columns)
+        pred_aligned = pred_df.loc[common_perts, common_genes]
+        obs_aligned = obs_df.loc[common_perts, common_genes]
+
+        def _r(idx: Sequence[str]) -> float:
+            idx = [p for p in idx if p in pred_aligned.index]
+            if len(idx) < 2:
+                return float("nan")
+            x = pred_aligned.loc[idx].values.ravel()
+            y = obs_aligned.loc[idx].values.ravel()
+            v = np.isfinite(x) & np.isfinite(y)
+            return float(pearsonr(x[v], y[v])[0]) if v.sum() > 2 else float("nan")
+
+        singles = [p for p in pred_aligned.index if sep not in str(p)]
+        in_dist_combos = [
+            p for p in pred_aligned.index if sep in str(p) and p not in val_combos
+        ]
+        held = [p for p in pred_aligned.index if p in val_combos]
+
+        x_all = pred_aligned.values.ravel()
+        y_all = obs_aligned.values.ravel()
+        v_all = np.isfinite(x_all) & np.isfinite(y_all)
+        ate_all = float(pearsonr(x_all[v_all], y_all[v_all])[0]) if v_all.sum() > 2 else float("nan")
+
+        metrics = {
+            "ate_all": ate_all,
+            "ate_single": _r(singles),
+            "ate_combo": _r(in_dist_combos),
+            "ate_held": _r(held),
+        }
+        self.ate_metrics = metrics
+        self.ate_result = {"corr": ate_all, "predicted_df": pred_aligned, "observed_df": obs_aligned}
+        return metrics
 
 
 def _require_gears():
@@ -169,6 +342,19 @@ def _default_device() -> str:
         return "cuda" if torch.cuda.is_available() else "cpu"
     except Exception:
         return "cpu"
+
+
+def _lognorm_vec(x: np.ndarray) -> np.ndarray:
+    """
+    log2-CPM normalize a single (G,) raw expected-count vector.
+
+    Matches `sherlock.tools._base.SherlockBase._lognorm`'s per-profile
+    normalization, applied *before* differencing predicted vs. control
+    (not after) so that `GEARSRun.compute_ate` lands in the same space as
+    `sherlock.preprocessing.treat_effect`'s observed ATEs.
+    """
+    total = float(x.sum())
+    return np.log2(1e4 * x / max(total, 1e-8) + 1.0)
 
 
 def canonical_combo(combo: str, sep: str = "+") -> str:

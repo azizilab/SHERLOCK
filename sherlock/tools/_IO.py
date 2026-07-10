@@ -94,6 +94,10 @@ def load_results(path: str):
             import pyro
             pyro.get_param_store().set_state(ckpt["pyro_param_store"])
 
+        # A freshly constructed nn.Module defaults to train() mode; models
+        # with BatchNorm (see load below) give wrong inference results in
+        # that mode, so force eval() before handing the model back.
+        model.eval()
         return model
 
     # ── VAE / cVAE / sVAE ─────────────────────────────────────────────────────
@@ -125,4 +129,12 @@ def load_results(path: str):
         import pyro
         pyro.get_param_store().set_state(ckpt["pyro_param_store"])
 
+    # A freshly constructed nn.Module defaults to train() mode. Models using
+    # BatchNorm (cVAE/sVAE/scgen) give badly wrong inference results in that
+    # mode — BatchNorm normalizes using the current batch's statistics
+    # instead of the learned running statistics, which is especially bad for
+    # small batches like the K-means centroids used in
+    # predict_counterfactual_effects. Force eval() so a loaded checkpoint is
+    # always ready for immediate evaluation/inference.
+    model.eval()
     return model

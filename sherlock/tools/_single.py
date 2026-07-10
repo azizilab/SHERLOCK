@@ -424,6 +424,7 @@ def run(
             f"Unknown model '{model}'. Choose from ['vae', 'cvae', 'svae', 'contrastivevi', 'scgen']."
         )
 
+    best_model.eval()
     return {"model": best_model, "param_store": param_store}
 
 
