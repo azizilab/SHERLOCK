@@ -122,7 +122,11 @@ class VAETrainer:
             for X_p, X_ntc, P, C, C_ntc in val_loader:
                 X_p, X_ntc, P, C, C_ntc = self._move_to_device(X_p, X_ntc, P, C, C_ntc)
                 all_P.append(P.detach().cpu().numpy())
-                n_ntc = X_ntc.size(0)
+                # X_ntc is batch-matched to X_p (see PerturbMatchingDataset.get_collate_fn);
+                # the guide's "cells" plate dedupes it, so mirror that here for both the
+                # z-slicing and the R² decode below to line up with z_ntc's row count.
+                X_ntc_unique = self.vae._dedupe_ntc(X_ntc)
+                n_ntc = X_ntc_unique.size(0)
 
                 guide_tr = poutine.trace(self.vae.guide).get_trace(X_p, X_ntc, P, C, C_ntc)
                 z     = guide_tr.nodes["z"]["value"]   # (n_ntc + n, d)
@@ -152,7 +156,7 @@ class VAETrainer:
                     val_n += B
 
                 # decode means for R²
-                total_ntc = X_ntc.sum(-1, keepdim=True)
+                total_ntc = X_ntc_unique.sum(-1, keepdim=True)
                 mu_ntc = total_ntc * torch.softmax(self.vae.z_decoder(z_ntc), dim=-1)
                 total_p = X_p.sum(-1, keepdim=True)
                 mu_p = total_p * torch.softmax(self.vae.z_decoder(z_p), dim=-1)
@@ -160,7 +164,7 @@ class VAETrainer:
                 preds_p.append(mu_p.detach().cpu())
                 actuals_p.append(X_p.detach().cpu())
                 preds_ntc.append(mu_ntc.detach().cpu())
-                actuals_ntc.append(X_ntc.detach().cpu())
+                actuals_ntc.append(X_ntc_unique.detach().cpu())
 
             # gate π percentiles (over perturbation×latent dims)
             pi = self.vae.gate.expected_L0().detach().flatten().cpu()

@@ -228,16 +228,24 @@ class PerturbModelBase(ABC, nn.Module):
         n_centroids: int = 25,
         observed_effect=None,
         device: torch.device | None = None,
+        approximate: bool = True,
     ) -> dict:
         """
-        NTC-population counterfactual effects via K-means centroids.
+        NTC-population counterfactual effects over abducted control backgrounds.
 
         Computes the perturbation-by-gene counterfactual effect matrix
 
             Delta_cf[p, g] = lognorm_g(E_k[f(c_k + m_p)])
                             - lognorm_g(E_k[f(c_k)])
 
-        where c_k are K-means centroids of abducted NTC backgrounds.
+        where c_k are the control backgrounds. With approximate=True (default),
+        c_k are `n_centroids` K-means centroids of the abducted NTC backgrounds
+        (weighted by cluster size) — a cheap quadrature of the population
+        expectation. With approximate=False, c_k are *all* abducted NTC cells
+        (uniform weights) — the exact population average, slower but no K-means
+        approximation. Empirically the two agree closely (~0.01 ATE); the mean
+        alone (n_centroids=1) is notably worse due to the nonlinear decoder
+        (Jensen's inequality).
 
         If `observed_effect` is provided, also computes Pearson correlation between
         the predicted counterfactual effect matrix and the observed/reference effect
@@ -249,16 +257,16 @@ class PerturbModelBase(ABC, nn.Module):
             Full dataset; NTC cells are extracted automatically using the
             configured pert_key / ntc_label.
         n_centroids : int
-            Number of K-means centroids.
+            Number of K-means centroids (only used when approximate=True).
         observed_effect : AnnData-like or pd.DataFrame, optional
             Observed treatment-effect matrix with perturbations as rows and genes
             as columns. If AnnData-like, uses `.X`, `.obs_names`, `.var_names`.
-        return_effect_df : bool
-            If True, always return the full dict (effect_df, corr, …).
-            If False, return {pert_name: (G,) effect vector} when
-            observed_effect is None.
         device : torch.device, optional
             Device to run on; defaults to the device of the model's parameters.
+        approximate : bool
+            If True (default), summarize control backgrounds with K-means
+            centroids. If False, use every abducted NTC cell as a background
+            (exact population average, no clustering — slower).
 
         Returns
         -------
@@ -347,14 +355,22 @@ class PerturbModelBase(ABC, nn.Module):
             if u_ntc is None:
                 return {}
 
-            # K-means in latent/background space for this condition
-            n_k = min(n_centroids, u_ntc.shape[0])
-            km = KMeans(n_clusters=n_k, n_init=10, random_state=0).fit(
-                u_ntc.detach().cpu().numpy()
-            )
-            centroids = torch.tensor(km.cluster_centers_, dtype=u_ntc.dtype, device=device)
-            counts = np.bincount(km.labels_, minlength=n_k)
-            weights = torch.tensor(counts / counts.sum(), dtype=u_ntc.dtype, device=device)
+            if approximate:
+                # K-means quadrature of the control-background distribution
+                n_k = min(n_centroids, u_ntc.shape[0])
+                km = KMeans(n_clusters=n_k, n_init=10, random_state=0).fit(
+                    u_ntc.detach().cpu().numpy()
+                )
+                centroids = torch.tensor(km.cluster_centers_, dtype=u_ntc.dtype, device=device)
+                counts = np.bincount(km.labels_, minlength=n_k)
+                weights = torch.tensor(counts / counts.sum(), dtype=u_ntc.dtype, device=device)
+            else:
+                # exact population average: every abducted NTC cell, uniform weight
+                centroids = u_ntc
+                n_k = u_ntc.shape[0]
+                weights = torch.full(
+                    (n_k,), 1.0 / n_k, dtype=u_ntc.dtype, device=device
+                )
 
             lib_med = float(x_ntc_cond_t.sum(-1).median().item())
 

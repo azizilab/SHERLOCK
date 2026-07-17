@@ -122,35 +122,36 @@ class MultiClassBatchSampler(Sampler[list[int]]):
 class _PerturbCollateFn:
     """Picklable collate callable for PerturbMatchingDataset (required for num_workers > 0)."""
 
-    def __init__(self, n_ntc, X_ntc):
-        self.n_ntc = n_ntc
+    def __init__(self, X_ntc):
         self.X_ntc = X_ntc
 
     def __call__(self, batch):
-        n_ntc = self.n_ntc
         X_ntc = self.X_ntc
         rng   = np.random.default_rng()
 
         x_p_list, p_list, c_list = zip(*batch)
         x_p = torch.from_numpy(np.stack(x_p_list).astype(np.float32))
-        c   = torch.tensor(list(c_list), dtype=torch.long)
+        c_arr = np.asarray(c_list, dtype=np.int64)
+        c   = torch.from_numpy(c_arr)
 
         if isinstance(p_list[0], np.ndarray):
             p = torch.from_numpy(np.stack(p_list))
         else:
             p = torch.tensor(list(p_list), dtype=torch.long)
 
-        unique_conds = np.unique(list(c_list))
-        ntc_chunks, c_ntc_chunks = [], []
-        for cond_i in unique_conds:
+        # One real NTC cell per perturbed cell, sampled with replacement from
+        # that cell's own condition's full NTC pool, row-aligned with x_p so
+        # x_ntc[i] can serve as x_p[i]'s paired background in the guide.
+        G = x_p.shape[1]
+        x_ntc_np = np.empty((len(c_arr), G), dtype=np.float32)
+        for cond_i in np.unique(c_arr):
             pool = X_ntc[int(cond_i)]
-            n    = min(n_ntc, len(pool))
-            idx  = rng.choice(len(pool), size=n, replace=False)
-            ntc_chunks.append(pool[idx].astype(np.float32))
-            c_ntc_chunks.extend([int(cond_i)] * n)
+            rows = np.where(c_arr == cond_i)[0]
+            idx  = rng.integers(0, len(pool), size=len(rows))
+            x_ntc_np[rows] = pool[idx]
 
-        x_ntc = torch.from_numpy(np.concatenate(ntc_chunks, axis=0))
-        c_ntc = torch.tensor(c_ntc_chunks, dtype=torch.long)
+        x_ntc = torch.from_numpy(x_ntc_np)
+        c_ntc = c  # row-aligned with x_p/x_ntc, so condition is just c
 
         return x_p, x_ntc, p, c, c_ntc
 
@@ -163,12 +164,12 @@ class PerturbMatchingDataset(Dataset):
     • X_ntc     – NTC cells per condition, kept for eval/_counterfactual_effect_size
     • X_ntc_flat – all NTC cells concatenated, sampled by get_collate_fn()
 
-    Use get_collate_fn() to build the DataLoader collate function, which adds
-    n_ntc randomly-sampled (without replacement) NTC cells to each batch.
-    The returned batch is (x_p, x_ntc, p, c) with x_ntc.shape[0] == n_ntc.
+    Use get_collate_fn() to build the DataLoader collate function, which draws
+    one real NTC cell per perturbed cell (with replacement, from that cell's
+    own condition's full NTC pool), row-aligned with x_p.
     """
 
-    def __init__(self, anndata, seed: int | None = None, combinatorial: bool = False, n_ntc: int = 20):
+    def __init__(self, anndata, seed: int | None = None, combinatorial: bool = False):
         rng = np.random.default_rng(seed)
 
         p_key = get_config('pert_key')
@@ -245,7 +246,6 @@ class PerturbMatchingDataset(Dataset):
             self.P_indices = P2
 
 
-        self.n_ntc = int(n_ntc)
         # Flat pool of all NTC cells for collate-time sampling
         self.X_ntc_flat = np.concatenate(self.X_ntc, axis=0).astype(np.float32)
         self.rng = rng
@@ -260,17 +260,18 @@ class PerturbMatchingDataset(Dataset):
 
     def get_collate_fn(self):
         """
-        Returns a collate_fn that samples n_ntc NTC cells *per condition* present
-        in the batch (without replacement within each condition pool).
+        Returns a collate_fn that draws one real NTC cell per perturbed cell,
+        with replacement from that cell's own condition's full NTC pool,
+        row-aligned with x_p (x_ntc[i] pairs with x_p[i]).
 
         Batch output: (x_p, x_ntc, p, c, c_ntc)
-          x_p   : (n,                  G) float32
-          x_ntc : (n_conds * n_ntc,    G) float32  — condition-grouped NTC cells
+          x_p   : (n, G) float32
+          x_ntc : (n, G) float32  — one paired NTC cell per perturbed cell
           p     : (n,) or (n, 2)          long
           c     : (n,)                    long      — condition of each perturbed cell
-          c_ntc : (n_conds * n_ntc,)      long      — condition of each NTC cell
+          c_ntc : (n,)                    long      — == c (x_ntc is row-aligned with x_p)
         """
-        return _PerturbCollateFn(self.n_ntc, self.X_ntc)
+        return _PerturbCollateFn(self.X_ntc)
 
 
 class PerturbSimpleDataset(Dataset):

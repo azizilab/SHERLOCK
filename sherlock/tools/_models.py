@@ -473,6 +473,126 @@ class QRCov(nn.Module):
         return Q @ torch.diag(s)
 
 
+def build_treat_effect_map(
+    treat_effect_adata,
+    perturbation_dict: "dict[str, int]",
+    gene_names: "list[str]",
+    exclude: "list[str] | set[str]" = (),
+    sep: str = "+",
+    top_k: "int | None" = None,
+) -> "dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]]":
+    """
+    Build the {(p0, p1): (gene_idx, target)} map consumed by
+    VAE(use_de_align_loss=True, treat_effect_map=...).
+
+    perturbation_dict : PerturbMatchingDataset.perturbation_dict (single-gene
+        name -> embedding index). Keys are (p0, -1) for singles and
+        (min(p0,p1), max(p0,p1)) for combos, matching the gene-index pairs
+        assigned to each cell's `p` tensor.
+    exclude : perturbation labels to drop (e.g. held-out combos used for
+        ate_held) — compared after sorting each label's "+"-parts, so caller
+        doesn't need to match the raw obs string ordering.
+    top_k : per perturbation, keep only the top_k genes by |observed effect|
+        (mirrors GEARS' num_de_genes). None (default) keeps *all* genes, so the
+        de-align loss supervises the full effect profile — needed for the GI
+        residual structure, which lives across all genes, not just the top-DE
+        ones. The (pred-target)^4 power still emphasizes the genes that move.
+    """
+    import pandas as pd
+
+    def canon(label: str) -> str:
+        return sep.join(sorted(x.strip() for x in str(label).split(sep) if x.strip()))
+
+    exclude_canon = {canon(e) for e in exclude}
+
+    X = treat_effect_adata.X
+    if hasattr(X, "toarray"):
+        X = X.toarray()
+    X = np.asarray(X, dtype=np.float32)
+
+    te_var = pd.Index(treat_effect_adata.var_names)
+    gene_pos = te_var.get_indexer(list(gene_names))  # -1 where gene absent from treat_effect
+
+    out: "dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]]" = {}
+    for i, label in enumerate(treat_effect_adata.obs_names):
+        if canon(label) in exclude_canon:
+            continue
+        parts = [x.strip() for x in str(label).split(sep) if x.strip()]
+        if not parts or any(part not in perturbation_dict for part in parts):
+            continue
+        if len(parts) == 1:
+            key = (perturbation_dict[parts[0]], -1)
+        elif len(parts) == 2:
+            a, b = sorted(perturbation_dict[part] for part in parts)
+            key = (a, b)
+        else:
+            continue
+
+        row = np.full(len(gene_names), np.nan, dtype=np.float32)
+        valid = gene_pos >= 0
+        row[valid] = X[i, gene_pos[valid]]
+
+        finite = np.isfinite(row)
+        if not finite.any():
+            continue
+        if top_k is None:
+            top_idx = np.where(finite)[0]                    # all genes
+        else:
+            k = min(top_k, int(finite.sum()))
+            scored = np.where(finite, np.abs(row), -np.inf)
+            top_idx = np.argpartition(scored, -k)[-k:]
+            top_idx = top_idx[np.argsort(-scored[top_idx])]
+
+        out[key] = (
+            torch.from_numpy(top_idx.astype(np.int64)),
+            torch.from_numpy(row[top_idx].astype(np.float32)),
+        )
+    return out
+
+
+def build_go_term_map(
+    gene2go: "dict[str, set[str]]",
+    perturbation_dict: "dict[str, int]",
+) -> "tuple[torch.Tensor, torch.Tensor, int]":
+    """
+    Build (term_indices, offsets, n_terms) for nn.EmbeddingBag, ordered to match
+    perturbation_dict's gene -> embedding-row index (same order as p_emb / rho).
+
+    Genes absent from gene2go, or with no annotated GO terms, get an empty bag —
+    nn.EmbeddingBag returns zeros for empty bags, so they just fall back to the
+    old flat N(0,1) prior on that row.
+
+    Parameters
+    ----------
+    gene2go : gene symbol -> set of GO term IDs (e.g. gears_data/gene2go_all.pkl)
+    perturbation_dict : PerturbMatchingDataset.perturbation_dict
+    """
+    # Restrict the vocabulary to terms actually used by genes in perturbation_dict —
+    # gene2go typically covers the whole genome (tens of thousands of genes/terms),
+    # but only a handful of genes are ever perturbed here.
+    all_terms = sorted({
+        t for gene in perturbation_dict if gene in gene2go for t in gene2go[gene]
+    })
+    term_to_idx = {t: i for i, t in enumerate(all_terms)}
+
+    P = len(perturbation_dict)
+    idx_by_gene: list[list[int]] = [[] for _ in range(P)]
+    for gene, gi in perturbation_dict.items():
+        idx_by_gene[gi] = [term_to_idx[t] for t in gene2go.get(gene, ())]
+
+    flat: list[int] = []
+    offsets: list[int] = []
+    for terms in idx_by_gene:
+        offsets.append(len(flat))
+        flat.extend(terms)
+
+    return (
+        torch.tensor(flat, dtype=torch.long),
+        torch.tensor(offsets, dtype=torch.long),
+        len(all_terms),
+    )
+
+
 class VAE(PerturbModelBase):
     def __init__(
         self,
@@ -496,11 +616,21 @@ class VAE(PerturbModelBase):
         shift='linear',
         use_de_align_loss=False,
         de_align_lambda=1e-3,
+        de_align_direction_lambda=1e-3,
+        de_align_direction_tau=0.5,
+        de_align_n_bg=64,
+        synergy_l2_lambda=1e-3,
+        parent_scale_lambda=0,
         treat_effect_map=None,
         combinatorial=False,
         synergy=False,
         synergy_rank=4,
+        synergy_hidden=32,
         z_var=1.0,
+        use_go_prior=False,
+        go_term_indices=None,
+        go_term_offsets=None,
+        n_go_terms=0,
     ):
         super().__init__()
         assert shift in ['poe', 'linear'], "shift must be 'poe' or 'linear'"
@@ -514,7 +644,23 @@ class VAE(PerturbModelBase):
         self.shift = shift
         self.combinatorial = combinatorial
         self.synergy = bool(synergy)
-        self.synergy_rank = int(synergy_rank)
+        self.synergy_rank = int(synergy_rank)      # retained for checkpoint compat; unused by MLP synergy
+        self.synergy_hidden = int(synergy_hidden)
+
+        # GO-term prior mean for rho (see build_go_term_map). go_term_emb is a real
+        # submodule (learned weights, part of state_dict/checkpoints); go_term_indices/
+        # go_term_offsets are data (nn.EmbeddingBag "offsets" format, one bag per
+        # perturbation, row-ordered to match p_emb) kept as plain attributes — not
+        # register_buffer — so they're excluded from state_dict, same as
+        # treat_effect_map: a checkpoint reload only needs go_term_emb's *weights* to
+        # be usable at eval time; resuming training with the prior active requires
+        # re-supplying go_term_indices/go_term_offsets (rebuild via build_go_term_map).
+        self.use_go_prior = bool(use_go_prior)
+        self.n_go_terms = int(n_go_terms)
+        self.go_term_indices = go_term_indices.long() if go_term_indices is not None else None
+        self.go_term_offsets = go_term_offsets.long() if go_term_offsets is not None else None
+        if self.use_go_prior:
+            self.go_term_emb = nn.EmbeddingBag(self.n_go_terms, latent_dim, mode="mean")
 
         # reg weights
         self.l0_lambda = float(l0_lambda)
@@ -528,15 +674,26 @@ class VAE(PerturbModelBase):
         self.gate_row_repulsion_lambda = float(gate_row_repulsion_lambda)
         self.use_de_align_loss = bool(use_de_align_loss)
         self.de_align_lambda = float(de_align_lambda)
+        self.de_align_direction_lambda = float(de_align_direction_lambda)
+        self.de_align_direction_tau = float(de_align_direction_tau)
+        self.de_align_n_bg = int(de_align_n_bg)
+        # Additivity prior on the combo shift: delta_ab = c_a*delta_a + c_b*delta_b + syn.
+        # Nothing else in the objective penalises syn != 0 or c != 1, so the model is
+        # free to inject non-additivity into genuinely additive combos -- it barely costs
+        # the ELBO, but it destroys the additive signature the GI classifier reads
+        # (additive_residual_norm / norm_ab_over_additive / model_fit), which is why
+        # true-additive combos get misread as interacting. These shrink the *total*
+        # delta_ab toward delta_a + delta_b -- and the total is exactly what the
+        # classifier sees, since it only ever gets the gene-space triple.
+        self.synergy_l2_lambda = float(synergy_l2_lambda)
+        self.parent_scale_lambda = float(parent_scale_lambda)
+        # {(p0, p1): (gene_idx LongTensor (K,), target FloatTensor (K,))}, p1=-1 for singles.
+        # Build with build_treat_effect_map(); must exclude held-out combo labels.
         self.treat_effect_map = treat_effect_map
         self.z_var = float(z_var)
 
         # embeddings
         self.p_emb = nn.Embedding(perturbs, latent_dim)
-        # per-condition NTC mean in mednorm space; populated by init_cond_means_from_adata
-        self.register_buffer("cond_x_mean", torch.zeros(conds, input_dim))
-        # global NTC mean across all conditions; populated by init_global_mean_from_adata
-        self.register_buffer("global_x_mean", torch.zeros(input_dim))
 
         # encoders / decoders
         def hidden_enc(in_d):
@@ -561,17 +718,37 @@ class VAE(PerturbModelBase):
             nn.Linear(latent_dim, latent_dim),
         )
         if self.synergy:
-            if self.synergy_rank <= 0:
-                raise ValueError("synergy_rank must be positive when synergy=True")
-            self.syn_factor = nn.Linear(latent_dim, self.synergy_rank, bias=False)
-            self.syn_proj = nn.Linear(self.synergy_rank, latent_dim, bias=False)
-            self.parent_coeff = nn.Linear(latent_dim, 1, bias=False)
-            nn.init.normal_(self.syn_factor.weight, mean=0.0, std=0.02)
-            nn.init.normal_(self.syn_proj.weight, mean=0.0, std=1e-3)
-            nn.init.zeros_(self.parent_coeff.weight)
+            # Nonlinear synergy: a full MLP over [rho_a, rho_b] -> latent shift.
+            # No low-rank / bilinear assumption, so it can express asymmetric
+            # (redundant/epistatic) and novel (neomorphic) interaction directions
+            # the old rank-r bilinear could not. Symmetrized at call time.
+            self.syn_mlp = nn.Sequential(
+                nn.Linear(2 * latent_dim, self.synergy_hidden),
+                nn.LeakyReLU(),
+                nn.Linear(self.synergy_hidden, latent_dim),
+            )
+            # Parent scales c_a, c_b: scalar (per-pair) reweightings of each
+            # parent's shift. Takes the *pair* [rho_self, rho_other] (2*latent_dim)
+            # rather than the antisymmetric (rho_a - rho_b) the old Linear(latent_dim, 1)
+            # used. That antisymmetry forced c_a = 1 + tanh(s), c_b = 1 - tanh(s), i.e.
+            # c_a + c_b == 2 identically -- the model could only shuffle weight between
+            # parents (dominance) and could NEVER scale the additive part up or down.
+            # Potentiation (both parents amplified) and suppression (both damped) were
+            # therefore structurally inexpressible via c and had to be contorted out of
+            # the free-form syn vector. Applying this layer to both orderings keeps the
+            # swap symmetry c_a(a,b) == c_b(b,a) while leaving the two scales free.
+            self.parent_coeff = nn.Linear(2 * latent_dim, 1, bias=False)
+            # Start ADDITIVE. Default Linear init gives score std ~1 over a 2*latent_dim
+            # input, so tanh(score) would be O(0.7) and c would span ~(0.3, 1.8) at
+            # step 0 -- i.e. the model would begin with large *random* non-additivity,
+            # which is exactly the prior we're trying to impose against. Shrinking the
+            # init puts score ~= 0 => c_a = c_b ~= 1, so delta_ab starts at delta_a +
+            # delta_b and the model must be *pushed* off additivity by the data (and pay
+            # parent_scale_lambda to stay there). Gradients still flow normally.
+            with torch.no_grad():
+                self.parent_coeff.weight.mul_(0.01)
         else:
-            self.syn_factor = None
-            self.syn_proj = None
+            self.syn_mlp = None
             self.parent_coeff = None
         self.cls_head = nn.Sequential(
             nn.Linear(latent_dim, 128), nn.LeakyReLU(),
@@ -611,6 +788,19 @@ class VAE(PerturbModelBase):
         med = torch.median(lib).item()
         return torch.log1p(x / torch.clamp(lib, min=1e-8) * med)
 
+    @staticmethod
+    def _dedupe_ntc(x_ntc: torch.Tensor) -> torch.Tensor:
+        """
+        Collapse the batch-matched, with-replacement NTC sample back down to
+        the distinct real cells actually drawn (duplicate rows are bit-identical
+        copies from the same source pool, so this is exact) — keeps NTC decode
+        cost independent of x_p's batch size. Must be called on the *raw* x_ntc
+        (before _mednorm) in both model() and guide() so both dedupe on identical
+        values and agree on row order — model()'s replayed "z0"/"z" sites must
+        line up position-for-position with guide()'s.
+        """
+        return torch.unique(x_ntc, dim=0)
+
     @torch.no_grad()
     def _get_cov(self):
         L = self.qr().detach()
@@ -634,7 +824,170 @@ class VAE(PerturbModelBase):
         mu = total_counts * mu_prob
         pyro.deterministic(d_key, mu)
         logits_nb = (mu + 1e-6).log() - theta.log()
-        return logits_nb
+        return logits_nb, mu
+
+    @staticmethod
+    def _lognorm_t(x: torch.Tensor) -> torch.Tensor:
+        """log2-CPM normalise, torch/differentiable — matches PerturbModelBase._lognorm
+        and preprocessing.treat_effect(method='perturbseq')."""
+        lib = x.sum(-1, keepdim=True)
+        return torch.log2(1e4 * x / torch.clamp(lib, min=1e-8) + 1.0)
+
+    def _de_align_lookup(self, device: torch.device):
+        """
+        Precompute (once per device, then cached) the dense tables that let
+        _de_align_loss group a batch by perturbation without a Python loop:
+
+        gene_idx/target/mask : (M, top_k) — M = number of treat_effect_map
+            entries, top_k = widest entry's gene count (others zero-padded,
+            masked off).
+        single_group_id : (P,)   -> row in the above tables, or -1
+        combo_group_id  : (P, P) -> row in the above tables, or -1 (indexed by
+            [min(p0,p1), max(p0,p1)], matching treat_effect_map's key convention)
+        """
+        cache = getattr(self, "_de_align_cache", None)
+        if cache is not None and cache[0] == device:
+            return cache[1]
+
+        keys = list(self.treat_effect_map.keys())
+        M = len(keys)
+        top_k = max((idx.numel() for idx, _ in self.treat_effect_map.values()), default=0)
+
+        gene_idx_mat = torch.zeros(M, top_k, dtype=torch.long)
+        target_mat = torch.zeros(M, top_k, dtype=torch.float32)
+        mask_mat = torch.zeros(M, top_k, dtype=torch.float32)
+        single_group_id = torch.full((self.perturbs,), -1, dtype=torch.long)
+        combo_group_id = torch.full((self.perturbs, self.perturbs), -1, dtype=torch.long)
+        # perturbation gene index (or -1) for each group row, to rebuild its shift
+        group_p0 = torch.zeros(M, dtype=torch.long)
+        group_p1 = torch.full((M,), -1, dtype=torch.long)
+
+        for gi, (key, (idx, tgt)) in enumerate(zip(keys, self.treat_effect_map.values())):
+            k = idx.numel()
+            gene_idx_mat[gi, :k] = idx
+            target_mat[gi, :k] = tgt
+            mask_mat[gi, :k] = 1.0
+            a, b = key
+            group_p0[gi] = a
+            group_p1[gi] = b  # -1 for singles
+            if b == -1:
+                single_group_id[a] = gi
+            else:
+                combo_group_id[a, b] = gi
+
+        tables = (
+            gene_idx_mat.to(device), target_mat.to(device), mask_mat.to(device),
+            single_group_id.to(device), combo_group_id.to(device),
+            group_p0.to(device), group_p1.to(device), M,
+        )
+        self._de_align_cache = (device, tables)
+        return tables
+
+    def _de_align_loss(
+        self,
+        z0_bg: torch.Tensor,
+        A: torch.Tensor,
+        W: torch.Tensor,
+        rho: torch.Tensor,
+        p: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        GEARS-style DE-gene supervision on the actual COUNTERFACTUAL path.
+
+        For each perturbation present in the batch, predict its effect the same
+        way eval does — apply the learned shift to real NTC backgrounds,
+            z_cf = z0*(1 - gate_p) + shift_p,
+        decode, and compare lognorm(decode(z_cf)) - lognorm(decode(z0)) to the
+        observed treat_effect on that perturbation's top-DE genes, using GEARS'
+        (pred-y)^4 + direction_lambda * sign-mismatch loss (utils.loss_fct).
+
+        This trains the exact quantity eval measures — A*W (+ parent_coeff/synergy
+        for combos) applied to backgrounds — unlike the previous version, which
+        supervised decode(cell_encoder(x_p)) (the reconstruction path) and reached
+        A*W only second-hand through KL(q(z)||p(z|z0)).
+
+        z0_bg : (n_ntc, d) abducted NTC backgrounds (detached — treated as fixed
+                controls, GEARS-style; de_align shapes shift+decoder, not encoder).
+        A, W  : (P, d) per-perturbation shift factor and gate (training-time,
+                stochastic — same tensors model() uses to build z_loc).
+        rho   : (P, d) per-perturbation rho sample (training-time, same tensor
+                model() uses for parent_coeff/synergy) — needed so combo shifts
+                here match model()'s combinatorial branch exactly, including
+                syn_mlp; without it de-align silently never trains synergy.
+        """
+        if not self.treat_effect_map:
+            return z0_bg.new_zeros(())
+
+        device = z0_bg.device
+        (gene_idx_mat, target_mat, mask_mat, single_group_id, combo_group_id,
+         group_p0, group_p1, M) = self._de_align_lookup(device)
+
+        # groups (perturbations) present in this batch
+        if p.ndim == 1:
+            gid = single_group_id[p.clamp(min=0)]
+        else:
+            p0 = p[:, 0].clamp(min=0)
+            p1 = p[:, 1]
+            is_single = p1 == -1
+            p1c = p1.clamp(min=0)
+            a = torch.minimum(p0, p1c)
+            b = torch.maximum(p0, p1c)
+            gid = torch.where(is_single, single_group_id[p0], combo_group_id[a, b])
+        present = torch.unique(gid[gid >= 0])
+        if present.numel() == 0:
+            return z0_bg.new_zeros(())
+
+        # fixed-control backgrounds; subsample to bound decode cost
+        z0_bg = z0_bg.detach()
+        n_bg = z0_bg.shape[0]
+        if n_bg > self.de_align_n_bg:
+            sel = torch.randperm(n_bg, device=device)[: self.de_align_n_bg]
+            z0_bg = z0_bg[sel]
+            n_bg = self.de_align_n_bg
+
+        # per-present-group shift from A, W, rho — matches model()'s combinatorial
+        # branch exactly: singles get shift_a alone; combos get
+        # c_a*shift_a + c_b*shift_b + syn(rho_a, rho_b). _parent_scales_from_rho /
+        # _synergy_shift_from_rho degrade to (1, 1, 0) when synergy=False, so this
+        # formula is correct (== plain additive) in both cases — no branching needed.
+        gp0 = group_p0[present]
+        gp1 = group_p1[present]
+        combo_m = (gp1 >= 0).unsqueeze(-1).to(z0_bg.dtype)   # (nP, 1)
+        gp1c = gp1.clamp(min=0)
+
+        shift_a = A[gp0] * W[gp0]
+        shift_b = A[gp1c] * W[gp1c]
+        c_a, c_b = self._parent_scales_from_rho(rho[gp0], rho[gp1c])
+        syn = self._synergy_shift_from_rho(rho[gp0], rho[gp1c])
+        combo_shift = c_a * shift_a + c_b * shift_b + syn
+        shift = shift_a * (1.0 - combo_m) + combo_shift * combo_m   # (nP, d)
+
+        nP = present.numel()
+        # z_cf[g, b] = z0_bg[b] + shift[g]   (pure-additive, matches model()/_apply_shift)
+        z_cf = z0_bg.unsqueeze(0) + shift.unsqueeze(1)  # (nP, n_bg, d)
+        mu_cf = torch.softmax(self.z_decoder(z_cf.reshape(nP * n_bg, -1)), dim=-1)
+        ln_cf = self._lognorm_t(mu_cf).reshape(nP, n_bg, -1).mean(1)                # (nP, G)
+
+        mu_base = torch.softmax(self.z_decoder(z0_bg), dim=-1)                      # (n_bg, G)
+        base_ln = self._lognorm_t(mu_base).mean(0)                                  # (G,)
+
+        delta = ln_cf - base_ln.unsqueeze(0)                                        # (nP, G)
+
+        idx = gene_idx_mat[present]
+        tgt = target_mat[present]
+        mask = mask_mat[present]
+        pred = torch.gather(delta, 1, idx)
+
+        denom = mask.sum().clamp(min=1)
+        mse = ((pred - tgt).pow(4) * mask).sum() / denom
+        # torch.sign(pred) has zero gradient everywhere (flat step function), so a
+        # raw sign-mismatch term is inert regardless of de_align_direction_lambda.
+        # tanh(pred/tau) is a differentiable surrogate for sign(pred) (-> exact sign
+        # as tau -> 0); target side stays exact sign since it's a constant, no
+        # gradient needed there.
+        pred_dir = torch.tanh(pred / self.de_align_direction_tau)
+        direction = ((torch.sign(tgt) - pred_dir).pow(2) * mask).sum() / denom
+        return mse + self.de_align_direction_lambda * direction
 
     def _synergy_shift_from_rho(
         self,
@@ -643,9 +996,11 @@ class VAE(PerturbModelBase):
     ) -> torch.Tensor:
         if not self.synergy:
             return torch.zeros_like(rho_a)
-        h_a = self.syn_factor(rho_a)
-        h_b = self.syn_factor(rho_b)
-        return self.syn_proj(h_a * h_b)
+        # Symmetric nonlinear synergy: average the MLP over both orderings so
+        # syn(a, b) == syn(b, a) (A+B and B+A are the same combo).
+        ab = torch.cat([rho_a, rho_b], dim=-1)
+        ba = torch.cat([rho_b, rho_a], dim=-1)
+        return 0.5 * (self.syn_mlp(ab) + self.syn_mlp(ba))
 
     def _parent_scales_from_rho(
         self,
@@ -656,9 +1011,20 @@ class VAE(PerturbModelBase):
             ones = rho_a.new_ones((*rho_a.shape[:-1], 1))
             return ones, ones
 
-        score = self.parent_coeff(rho_a - rho_b)
-        c_a = 1.0 + torch.tanh(score)
-        c_b = 1.0 + torch.tanh(-score)
+        # Free, symmetric parent scales. Scoring [rho_self, rho_other] in both
+        # orderings gives c_a(a, b) == c_b(b, a) (swap-equivariant) WITHOUT the
+        # old antisymmetry that pinned c_a + c_b to 2. Writing the layer weight as
+        # W = [W1; W2], the old form is exactly the special case W2 = -W1; with W1,
+        # W2 free, c_a and c_b are independent, so both can rise above 1
+        # (potentiation) or both fall below 1 (suppression).
+        # tanh keeps each scale in (0, 2): a parent can be damped or up to doubled,
+        # but can't flip sign or blow up. Deviation from 1 is penalised by
+        # parent_scale_lambda (see model()), so additive (c = 1) is the default and
+        # the model pays to move away from it.
+        ab = torch.cat([rho_a, rho_b], dim=-1)
+        ba = torch.cat([rho_b, rho_a], dim=-1)
+        c_a = 1.0 + torch.tanh(self.parent_coeff(ab))
+        c_b = 1.0 + torch.tanh(self.parent_coeff(ba))
         return c_a, c_b
 
     # --- model/guide ---
@@ -677,10 +1043,20 @@ class VAE(PerturbModelBase):
         pyro.factor("half_normal_energy", -0.5 * (sigma / 0.05) ** 2)
         pyro.factor("cov_ridge", - self.cov_lambda * (L ** 2).sum())
 
+        if self.use_go_prior and self.go_term_indices is not None:
+            # GO-informed prior mean: KL(q(rho)||p(rho)) pulls the guide's rho
+            # posterior toward this instead of toward zero — a real Bayesian
+            # shrinkage prior, not a competing loss term (see build_go_term_map).
+            mu_rho = self.go_term_emb(
+                self.go_term_indices.to(device), self.go_term_offsets.to(device)
+            )  # (P, d)
+        else:
+            mu_rho = torch.zeros_like(self.p_emb.weight)
+
         with pyro.plate("perturbations", self.perturbs):
             rho_single = pyro.sample(
                 "rho",
-                dist.Normal(torch.zeros_like(self.p_emb.weight), torch.ones_like(self.p_emb.weight)).to_event(1),
+                dist.Normal(mu_rho, torch.ones_like(mu_rho)).to_event(1),
                 infer={"scale": self.kl_weight},
             )
         chol_P = torch.linalg.cholesky(row_cov)
@@ -710,7 +1086,8 @@ class VAE(PerturbModelBase):
             pyro.factor("gate_row_repulsion", - self.gate_row_repulsion_lambda * repulsion)
 
         # ── per-perturbed-cell shift ─────────────────────────────────────
-        n_ntc = x_ntc.size(0)
+        x_ntc_unique = self._dedupe_ntc(x_ntc)
+        n_ntc = x_ntc_unique.size(0)
         n     = x_p.size(0)
         n_all = n_ntc + n
 
@@ -733,19 +1110,24 @@ class VAE(PerturbModelBase):
                 lin_shift_p = shift_a * (1.0 - combo_mask) + scaled_shift_p * combo_mask
                 syn_shift_p = syn_shift_p * combo_mask
                 parent_scale_penalty = (((c_a - 1.0) ** 2) + ((c_b - 1.0) ** 2)) * combo_mask
-                pyro.factor("synergy_l2", -self.l2_lambda * syn_shift_p.pow(2).sum())
-                pyro.factor("parent_scale_l2", -self.l2_lambda * parent_scale_penalty.sum())
+                # Additivity prior. Own lambdas (NOT the gate's l2_lambda, which is
+                # already doing duty on the gate and couldn't be tuned independently).
+                # Both default to 0.0 => exactly the old behaviour, so this is a clean A/B.
+                # Summed over combo cells to match the ELBO's summed likelihood, keeping
+                # the prior/likelihood ratio invariant to batch size.
+                if self.synergy_l2_lambda > 0.0:
+                    pyro.factor("synergy_l2",
+                                -self.synergy_l2_lambda * syn_shift_p.pow(2).sum())
+                if self.parent_scale_lambda > 0.0:
+                    pyro.factor("parent_scale_l2",
+                                -self.parent_scale_lambda * parent_scale_penalty.sum())
                 pyro.deterministic("syn_shift", syn_shift_p)
                 pyro.deterministic("parent_scale", torch.cat([c_a, c_b], dim=-1))
-            W_b_eff     = W[p1] * valid_m.float().unsqueeze(-1)
-            W_p_eff     = W[p0] + W_b_eff - W[p0] * W_b_eff
         else:
             lin_shift_p = A[p] * W[p]                                  # (n, d)
-            W_p_eff     = W[p]                                         # (n, d)
 
-        # ── n_all tensors: NTC cells first (W=0), perturbed cells second ─
+        # ── n_all tensors: NTC cells first (no shift), perturbed cells second ─
         zeros_ntc     = torch.zeros(n_ntc, self.latent_dim, device=device)
-        W_all         = torch.cat([zeros_ntc, W_p_eff],    dim=0)  # (n_all, d)
         lin_shift_all = torch.cat([zeros_ntc, lin_shift_p], dim=0)  # (n_all, d)
 
         # isotropic z0 prior — condition adjustment done in gene space via the residual guide
@@ -759,19 +1141,23 @@ class VAE(PerturbModelBase):
             W_scale = pyro.param("W_scale", 0.1 * torch.ones(self.latent_dim, device=device), constraint=constraints.positive)
             pyro.factor("W_scale_prior", -0.5 * (W_scale / 0.1).pow(2).sum())
 
-        # ── cells plate: one z per cell (NTC: W=0 ⟹ z≈z0; perturbed: z=shift(z0)) ─
+        # ── cells plate: one z per cell (NTC: no shift ⟹ z≈z0; perturbed: z=z0+shift) ─
+        # Pure-additive shift: z = z0 + A*W. The background z0 is NOT masked
+        # (dropped the old z0*(1-W) term) — with a non-binary gate that masking
+        # attenuated z0 (~0.5x) and made the effective shift W*(A - z0)
+        # background-dependent; additive matches the latent-arithmetic that works
+        # (scGen/sVAE). The gate W still scales/selects shift dims via A*W.
         with pyro.plate("cells", n_all):
             #TODO this is not proper POE for what we need. should be using z0_mu and z0_std
             #but gradient won't flow this way since its not from pyro.sample. Temp fix using
             #sampled z0 but its not ideal since it won't have the same mean/var as the guide's z0 distribution.
             #A better fix would be to implement the POE logic manually in the guide and model instead of relying on pyro.sample for z0
             z0     = pyro.sample("z0", dist.Normal(z0_loc_all, z0_scale_all).to_event(1), infer={"scale": self.kl_weight})
-            z0_mod = z0 * (1.0 - W_all)
 
             if self.shift == 'poe':
-                z_loc = self.__poe(z0_mod, lin_shift_all, W_scale.pow(2))
+                z_loc = self.__poe(z0, lin_shift_all, W_scale.pow(2))
             elif self.shift == 'linear':
-                z_loc = z0_mod + lin_shift_all
+                z_loc = z0 + lin_shift_all
             else:
                 raise ValueError("Invalid shift type")
 
@@ -794,19 +1180,34 @@ class VAE(PerturbModelBase):
             CE_loss = F.binary_cross_entropy_with_logits(cls_logits, target, reduction="sum")
         pyro.factor("CE_loss", -self.ce_lambda * CE_loss)
 
-        logits_ntc  = self.__decode(x_ntc, z_ntc_z, self.z_decoder, theta, "x_ntc")
-        ntc_logprob = dist.NegativeBinomial(total_count=theta, logits=logits_ntc).log_prob(x_ntc.float()).sum()
+        logits_ntc, mu_ntc = self.__decode(x_ntc_unique, z_ntc_z, self.z_decoder, theta, "x_ntc")
+        ntc_logprob = dist.NegativeBinomial(total_count=theta, logits=logits_ntc).log_prob(x_ntc_unique.float()).sum()
         pyro.factor("X_ntc_logprob", self.ntc_lambda * ntc_logprob)
 
-        logits_p  = self.__decode(x_p, z_p_z, self.z_decoder, theta, "x_p")
+        logits_p, mu_p = self.__decode(x_p, z_p_z, self.z_decoder, theta, "x_p")
         p_logprob = dist.NegativeBinomial(total_count=theta, logits=logits_p).log_prob(x_p.float()).sum()
         pyro.factor("X_p_logprob", self.pert_lambda * p_logprob)
+
+        if self.use_de_align_loss and self.treat_effect_map:
+            # Counterfactual-path supervision: apply the learned shift (A, W,
+            # rho_single) to the NTC backgrounds z_ntc_z and match the observed
+            # effect — trains the shift (incl. synergy for combos) directly (what
+            # eval uses), not decode(cell_encoder(x_p)).
+            de_loss = self._de_align_loss(z_ntc_z, A, W, rho_single, p)
+            pyro.factor("de_align_loss", -self.de_align_lambda * de_loss)
 
     def guide(self, x_p, x_ntc, p, c, c_ntc):
         pyro.module("VAE", self)
 
-        x_p   = self._mednorm(x_p)
-        x_ntc = self._mednorm(x_ntc)
+        # x_ntc arrives batch-matched to x_p (one real NTC cell per perturbed
+        # cell, with replacement — see PerturbMatchingDataset.get_collate_fn).
+        # x_ntc_paired keeps that full, row-aligned version for the perturbed
+        # branch's z0; x_ntc itself is deduped down to the distinct real cells
+        # actually drawn, matching model()'s _dedupe_ntc so both agree on the
+        # "cells" plate's NTC row count/order.
+        x_ntc_paired = self._mednorm(x_ntc)
+        x_p          = self._mednorm(x_p)
+        x_ntc        = self._mednorm(self._dedupe_ntc(x_ntc))
 
         n_ntc = x_ntc.size(0)
         n     = x_p.size(0)
@@ -818,33 +1219,38 @@ class VAE(PerturbModelBase):
 
 
         if self.use_conditions:
-            # NTC: z0 = z — encode each NTC cell through cond_encoder (same path as
-            # perturbed z0). No residual: cond_encoder carries per-cell background.
+            # NTC: z0 = z — encode each distinct NTC cell through cond_encoder (same
+            # path as perturbed z0). No residual: cond_encoder carries per-cell background.
             z0_mu_ntc, z0_logvar_ntc = self.z0_head(self.cond_encoder(x_ntc)).chunk(2, dim=-1)
             z0_std_ntc = (0.5 * z0_logvar_ntc).exp()
             z_mu_ntc   = z0_mu_ntc
             z_std_ntc  = z0_std_ntc
 
-            # Perturbed: z0 from fixed per-condition mean buffer; z from per-cell residual.
-            cond_mean_p = self.cond_x_mean[c]   # (n, G) — fixed buffer, no gradient
-            z0_mu_p, z0_logvar_p = self.z0_head(self.cond_encoder(cond_mean_p)).chunk(2, dim=-1)
+            # Perturbed: z0 from a paired real NTC cell (with replacement, row-aligned
+            # to x_p and already drawn from that cell's own condition at the collate
+            # level — see PerturbMatchingDataset.get_collate_fn). z is a plain encode
+            # of x_p itself, no hand-subtracted residual.
+            z0_mu_p, z0_logvar_p = self.z0_head(self.cond_encoder(x_ntc_paired)).chunk(2, dim=-1)
             z0_std_p = (0.5 * z0_logvar_p).exp()
-            x_p_enc  = x_p - cond_mean_p
-            z_mu_p, z_logvar_p = self.z_head(self.cell_encoder(x_p_enc)).chunk(2, dim=-1)
+            z_mu_p, z_logvar_p = self.z_head(self.cell_encoder(x_p)).chunk(2, dim=-1)
             z_std_p  = (0.5 * z_logvar_p).exp()
         else:
-            # no conditions: mirrors use_conditions path with global NTC mean as background
-            # NTC: z0 = z via cond_encoder(x_ntc) — per-cell background
+            # NTC: z0 = z via cond_encoder(x_ntc) — per-cell background, on the
+            # distinct real NTC cells actually drawn this batch.
             z0_mu_ntc, z0_logvar_ntc = self.z0_head(self.cond_encoder(x_ntc)).chunk(2, dim=-1)
             z0_std_ntc = (0.5 * z0_logvar_ntc).exp()
             z_mu_ntc   = z0_mu_ntc
             z_std_ntc  = z0_std_ntc
 
-            # Perturbed: z0 from global NTC mean buffer; z from per-cell residual
-            global_mean_p = self.global_x_mean.unsqueeze(0).expand(n, -1)
-            z0_mu_p, z0_logvar_p = self.z0_head(self.cond_encoder(global_mean_p)).chunk(2, dim=-1)
+            # Perturbed: z0 from a paired real NTC cell (with replacement, row-aligned
+            # to x_p at the collate level) — genuine per-cell background instead of the
+            # population mean. z is then a plain encode of x_p itself, no hand-subtracted
+            # residual: z0 already carries a real per-row background, so the
+            # background/shift decomposition is left to the model's KL rather than
+            # being manually centered here.
+            z0_mu_p, z0_logvar_p = self.z0_head(self.cond_encoder(x_ntc_paired)).chunk(2, dim=-1)
             z0_std_p = (0.5 * z0_logvar_p).exp()
-            z_mu_p, z_logvar_p = self.z_head(self.cell_encoder(x_p - global_mean_p)).chunk(2, dim=-1)
+            z_mu_p, z_logvar_p = self.z_head(self.cell_encoder(x_p)).chunk(2, dim=-1)
             z_std_p  = (0.5 * z_logvar_p).exp()
 
         z0_mu_all  = torch.cat([z0_mu_ntc, z0_mu_p],  dim=0)
@@ -946,64 +1352,16 @@ class VAE(PerturbModelBase):
         emb = (emb / (emb.std(0, keepdims=True) + 1e-8)).astype(np.float32)
         self.p_emb.weight.data.copy_(torch.tensor(emb, dtype=self.p_emb.weight.dtype))
 
-    def init_cond_means_from_adata(self, adata, dataset) -> None:
-        """Populate cond_x_mean and global_x_mean buffers with NTC means in mednorm space."""
-        import scipy.sparse as sp
-
-        ntc_label     = get_config("ntc_label")
-        pert_key      = get_config("pert_key")
-        treatment_key = get_config("treatment_key")
-
-        X = adata.X
-        if sp.issparse(X):
-            X = X.toarray().astype(np.float32)
-        else:
-            X = np.asarray(X, dtype=np.float32)
-
-        lib    = X.sum(1, keepdims=True)
-        med    = float(np.median(lib))
-        X_norm = np.log1p(X / (lib + 1e-8) * med)
-
-        obs_pert = adata.obs[pert_key].values
-        obs_cond = adata.obs[treatment_key].values
-
-        means = np.zeros((self.conds, self.input_dim), dtype=np.float32)
-        for cond_label, cond_idx in dataset.condition_dict.items():
-            mask = (obs_pert == ntc_label) & (obs_cond == cond_label)
-            if mask.any():
-                means[cond_idx] = X_norm[mask].mean(0)
-
-        self.cond_x_mean.copy_(torch.tensor(means))
-
-        ntc_mask = obs_pert == ntc_label
-        global_mean = X_norm[ntc_mask].mean(0) if ntc_mask.any() else np.zeros(self.input_dim, dtype=np.float32)
-        self.global_x_mean.copy_(torch.tensor(global_mean))
-
-    def init_global_mean_from_adata(self, adata) -> None:
-        """Populate global_x_mean buffer with the NTC mean in mednorm space (no-conditions path)."""
-        import scipy.sparse as sp
-
-        ntc_label = get_config("ntc_label")
-        pert_key  = get_config("pert_key")
-
-        X = adata.X
-        if sp.issparse(X):
-            X = X.toarray().astype(np.float32)
-        else:
-            X = np.asarray(X, dtype=np.float32)
-
-        lib    = X.sum(1, keepdims=True)
-        med    = float(np.median(lib))
-        X_norm = np.log1p(X / (lib + 1e-8) * med)
-
-        ntc_mask = adata.obs[pert_key].values == ntc_label
-        global_mean = X_norm[ntc_mask].mean(0) if ntc_mask.any() else np.zeros(self.input_dim, dtype=np.float32)
-        self.global_x_mean.copy_(torch.tensor(global_mean))
-
     # ------------------------------ PerturbModelBase interface ----------------------------- #
 
     @torch.no_grad()
     def checkpoint_ctor_args(self) -> dict:
+        # NOTE: go_term_emb's trained weights round-trip via state_dict, so a
+        # reload is usable at eval time as-is. But go_term_indices/go_term_offsets
+        # aren't stored here (data-shaped, like treat_effect_map) — resuming
+        # training with the GO prior active needs them re-supplied (rebuild via
+        # build_go_term_map); otherwise model() silently falls back to the flat
+        # N(0,1) prior on rho.
         return {
             "input_dim":          self.input_dim,
             "latent_dim":         self.latent_dim,
@@ -1015,7 +1373,10 @@ class VAE(PerturbModelBase):
             "combinatorial":      self.combinatorial,
             "synergy":            self.synergy,
             "synergy_rank":       self.synergy_rank,
+            "synergy_hidden":     self.synergy_hidden,
             "z_var":              self.z_var,
+            "use_go_prior":       self.use_go_prior,
+            "n_go_terms":         self.n_go_terms,
         }
 
     def get_z(self, x: torch.Tensor, p: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
@@ -1081,7 +1442,8 @@ class VAE(PerturbModelBase):
 
     @torch.no_grad()
     def _apply_shift(self, u: torch.Tensor, m_p: torch.Tensor) -> torch.Tensor:
-        """Apply perturbation shift via PoE or linear."""
+        """Apply perturbation shift via PoE or linear. Pure-additive background
+        (no u*(1-W) masking) — matches model()'s z = z0 + A*W."""
 
         m_p, w_p, a_p, s_p = (
             m_p[:, 0, :],
@@ -1090,18 +1452,16 @@ class VAE(PerturbModelBase):
             m_p[:, 3, :],
         )
 
-        u_mod = u * (1.0 - w_p)
-
         if self.shift == "poe":
             W_scale = pyro.param(
                 "W_scale",
                 0.1 * torch.ones(self.latent_dim),
                 constraint=constraints.positive,
             ).to(u.device)
-            return self.__poe(u_mod, m_p, W_scale.pow(2)) + s_p
+            return self.__poe(u, m_p, W_scale.pow(2)) + s_p
 
         elif self.shift == "linear":
-            return u_mod + m_p + s_p
+            return u + m_p + s_p
 
         raise ValueError("Invalid shift type")
 
@@ -1116,7 +1476,12 @@ class VAE(PerturbModelBase):
         """Combine two single-pert shift tensors, adding optional bilinear synergy."""
         shift_a = m1[:, 0, :]
         shift_b = m2[:, 0, :]
-        gate  = (m1[:, 1, :] + m2[:, 1, :]).clamp(0.0, 1.0)
+        # The gate slot (index 1) is retained for tuple-shape compatibility but is
+        # vestigial: _apply_shift is now pure-additive and no longer masks the
+        # background with it. Keep the OR combination for anyone reading it.
+        w_a = m1[:, 1, :]
+        w_b = m2[:, 1, :]
+        gate  = w_a + w_b - w_a * w_b
         rho_a = m1[:, 2, :]
         rho_b = m2[:, 2, :]
         if self.synergy:
@@ -1141,8 +1506,9 @@ class VAE(PerturbModelBase):
     @torch.no_grad()
     def _run_inference(self, dataset, device, batch_size=1024):
         """
-        Encode z as z_head(cell_encoder(x - x_cond_mean)) when use_conditions=True,
-        else z_head(cell_encoder(x)). NTC cells have no perturbation shift; perturbed cells do.
+        Encode z = z0_head(cond_encoder(x)) for NTC cells (z0 = z, no shift) and
+        z = z_head(cell_encoder(x)) for perturbed cells — matching guide(), which
+        no longer subtracts any background mean before cell_encoder.
         """
         from torch.utils.data import DataLoader
 
@@ -1166,13 +1532,6 @@ class VAE(PerturbModelBase):
         else:
             ntc_mask = p_all == dataset.ntc_idx
 
-        # Load condition indices if available for perturbed-cell residual subtraction
-        c_all = None
-        if self.use_conditions:
-            c_indices = getattr(dataset, "C_indices", None)
-            if c_indices is not None:
-                c_all = np.array(c_indices, dtype=np.int64)
-
         z_out     = torch.empty(N, self.latent_dim)
         recon_out = torch.empty(N, G)
 
@@ -1185,15 +1544,9 @@ class VAE(PerturbModelBase):
                 if is_ntc:
                     # NTC: z = z0 = cond_encoder(x_ntc), matching guide
                     z_mu, _ = self.z0_head(self.cond_encoder(xb)).chunk(2, dim=-1)
-                elif self.use_conditions and c_all is not None:
-                    # perturbed with conditions: subtract per-condition buffer mean
-                    c_batch = torch.from_numpy(c_all[idx_b.cpu().numpy()]).to(xb.device)
-                    xb_enc  = xb - self.cond_x_mean[c_batch]
-                    z_mu, _ = self.z_head(self.cell_encoder(xb_enc)).chunk(2, dim=-1)
                 else:
-                    # perturbed without conditions: subtract global NTC mean
-                    xb_enc = xb - self.global_x_mean.to(xb.device)
-                    z_mu, _ = self.z_head(self.cell_encoder(xb_enc)).chunk(2, dim=-1)
+                    # perturbed: z = z_head(cell_encoder(x_p)), matching guide
+                    z_mu, _ = self.z_head(self.cell_encoder(xb)).chunk(2, dim=-1)
                 logits = self.z_decoder(z_mu)
                 z_out[idx_b]     = z_mu.detach().cpu()
                 recon_out[idx_b] = (lib_b * F.softmax(logits, dim=-1)).detach().cpu()
@@ -1310,394 +1663,162 @@ class VAE(PerturbModelBase):
     def get_gi(
         self,
         adata,
-        obsm_key: str,
         min_cells: int = 5,
-        observed: bool | str = True,
+        mode: str = "hybrid",
+        observed_singles: str = "decoded",
+        obsm_key: str = "z",
+        approximate: bool = False,
+        device=None,
     ) -> "pd.DataFrame":
-        """Compute gene-space GI metrics for every combo pair via Norman-style regression.
+        """Norman-style genetic-interaction metrics; regressed by the shared
+        ``regress_gi_params`` (the *same* downstream GEARS uses), on plain
+        log2-CPM deltas over all genes (no z-scoring).
+
+        Doubles are always *generated* (control + learned combo shift), so GI is
+        OOD-capable. Singles depend on ``mode``:
+
+        - ``mode='hybrid'`` (default): **observed** singles + generated doubles.
+          Regressing the generated double against real singles keeps the GI
+          residual discriminative (fully-generated collapses it: the additive
+          part is exactly the singles it's regressed against). Best on the
+          classification metrics; component singles are always observed even for
+          held-out combos, so this still handles OOD doubles.
+        - ``mode='generated'``: singles *and* doubles generated (fully
+          counterfactual — the strictly-fair-vs-GEARS setting, but limited by how
+          non-additive the learned combo shift is).
+
+        All three effect vectors share one baseline (population-average decoded
+        NTC), so the additive residual is clean. Assumes a single condition.
 
         Parameters
         ----------
-        observed
-            If True, use observed encoded z means from ``adata.obsm[obsm_key]``.
-            If False, use generated perturbation latents from the model's learned
-            perturbation shifts. If ``"hybrid"``, use observed single-perturbation
-            z means and generated double-perturbation latents. The default True
-            path preserves the historical behavior used by previous runs.
+        min_cells : minimum observed cells per perturbation to score a pair.
+        mode : 'hybrid' or 'generated'.
+        observed_singles : for hybrid, 'decoded' (decode of mean q(z) — stays in
+            decoder space, consistent with the generated double) or 'raw' (mean
+            of log-normed raw counts — preserves real single structure, which the
+            similarity-based classes like synergy-dissimilar depend on).
+        obsm_key : obs latents used by observed_singles='decoded' (needs eval()).
+        approximate : True = 25 K-means centroids for the NTC background; False
+            (default) = every NTC cell (exact population average).
         """
         import numpy as np
         import pandas as pd
-        import scipy.sparse as sp
         import torch
-        import dcor as _dcor
-        from sklearn.linear_model import TheilSenRegressor
-        from tqdm.auto import tqdm
-        from ._datasets import PerturbMatchingDataset
+        from sklearn.cluster import KMeans
+        from .._configs import get_config
+
+        if mode not in ("hybrid", "generated"):
+            raise ValueError("mode must be 'hybrid' or 'generated'.")
+        if observed_singles not in ("decoded", "raw"):
+            raise ValueError("observed_singles must be 'decoded' or 'raw'.")
 
         p_key     = get_config("pert_key")
         ntc_label = get_config("ntc_label")
-        eps_      = 1e-8
+        sep = "+"
 
-        mode = observed
-        if isinstance(mode, str):
-            mode = mode.lower()
-        valid_modes = {True, False, "hybrid"}
-        if mode not in valid_modes:
-            raise ValueError('observed must be True, False, or "hybrid".')
+        def canon(s):
+            s = str(s)
+            return sep.join(sorted(s.split(sep))) if sep in s else s
 
-        def _norm(x):
-            return float(np.linalg.norm(x))
+        if device is None:
+            device = next(self.parameters()).device
 
-        def _cos(x, y):
-            denom = np.linalg.norm(x) * np.linalg.norm(y)
-            if denom < eps_:
-                return np.nan
-            return float(np.dot(x, y) / denom)
+        from ._datasets import PerturbSimpleDataset
+        ds = PerturbSimpleDataset(adata, pert_key=p_key, ntc_label=ntc_label, combinatorial=True)
+        idx2pert = ds.idx_to_pert()
+        name2idx = {n: i for i, n in idx2pert.items()}
+        all_shifts = self._get_all_pert_shifts(device)   # (P+1, 4, d), row 0 = NTC
 
-        _device = next(self.parameters()).device
+        labels = np.asarray(adata.obs[p_key].astype(str))
 
-        labels   = np.array(adata.obs[p_key].values, dtype=str)
-        z_all    = np.array(adata.obsm[obsm_key], dtype=np.float32)
-        mean_ntc = z_all[labels == ntc_label].mean(axis=0)
-
-        # P_idx from PerturbMatchingDataset is aligned to non-NTC cells.
-        z_pert = z_all[labels != ntc_label]
-
-        # Norman-style control normalization from observed NTC raw counts
-        X_ntc = adata.X[labels == ntc_label]
-        lib_ntc = np.asarray(X_ntc.sum(axis=1)).ravel()
-        target_umi = float(np.median(lib_ntc[lib_ntc > eps_]))
-
-        scale = target_umi / np.maximum(lib_ntc, eps_)
-        if sp.issparse(X_ntc):
-            X_ntc_scaled = X_ntc.multiply(scale[:, None])
-            ctrl_mean = np.asarray(X_ntc_scaled.mean(axis=0)).ravel()
-            ctrl_sq_mean = np.asarray(X_ntc_scaled.power(2).mean(axis=0)).ravel()
+        # ── NTC background + one shared baseline ─────────────────────────────
+        ntc_mask = labels == str(ntc_label)
+        x_ntc = adata.X[ntc_mask]
+        x_ntc = x_ntc.toarray() if hasattr(x_ntc, "toarray") else np.asarray(x_ntc)
+        u_ntc = self._abduct_ntc(torch.tensor(x_ntc, dtype=torch.float32, device=device))
+        if approximate:
+            n_k = min(25, u_ntc.shape[0])
+            km = KMeans(n_clusters=n_k, n_init=10, random_state=0).fit(u_ntc.detach().cpu().numpy())
+            centroids = torch.tensor(km.cluster_centers_, dtype=u_ntc.dtype, device=device)
+            cnt = np.bincount(km.labels_, minlength=n_k)
+            weights = (cnt / cnt.sum())[:, None]
         else:
-            X_ntc_scaled = np.asarray(X_ntc, dtype=np.float64) * scale[:, None]
-            ctrl_mean = X_ntc_scaled.mean(axis=0)
-            ctrl_sq_mean = (X_ntc_scaled ** 2).mean(axis=0)
+            centroids = u_ntc
+            weights = np.full((u_ntc.shape[0], 1), 1.0 / u_ntc.shape[0])
 
-        ctrl_std = np.sqrt(np.maximum(ctrl_sq_mean - ctrl_mean ** 2, eps_))
+        def wln(z):  # weighted-mean log2-CPM of decode(z) over backgrounds -> (G,)
+            mu = self._decode_to_expr(z, 1.0)                       # proportions
+            return (weights * self._lognorm(mu.detach().cpu().numpy())).sum(0)
 
-        def _norm_decoded_expr(x):
-            x = np.asarray(x, dtype=np.float64).ravel()
-            x = x * (target_umi / max(float(x.sum()), eps_))
-            return (x - ctrl_mean) / (ctrl_std + eps_)
+        def mean_ln_decode(Z):  # mean over rows of log2-CPM(decode(Z)) -> (G,)
+            out = None
+            for i in range(0, Z.shape[0], 4096):
+                ln = self._lognorm(self._decode_to_expr(Z[i:i + 4096], 1.0).detach().cpu().numpy())
+                out = ln.sum(0) if out is None else out + ln.sum(0)
+            return out / Z.shape[0]
 
-        def _decode_z_to_norm_expr(z):
-            z_t = torch.tensor(z, dtype=torch.float32, device=_device)
-            expr_raw = self._decode_to_expr(
-                z_t.unsqueeze(0), 1.0
-            ).squeeze(0).detach()
-            return _norm_decoded_expr(expr_raw.cpu().numpy())
+        baseline_ln = wln(centroids)                       # decoded NTC baseline (mean-of-decode)
+        raw_baseline_ln = self._lognorm(x_ntc).mean(0)     # raw NTC baseline (mean-of-lognorm)
 
-        ds          = PerturbMatchingDataset(adata, combinatorial=True)
-        idx_to_pert = {v: k for k, v in ds.perturbation_dict.items()}
-        P_idx       = ds.P_indices
+        def gen_effect(shift_tuple):
+            return wln(self._apply_shift(centroids, shift_tuple)) - baseline_ln
 
-        if len(P_idx) != len(z_pert):
-            raise ValueError(
-                f"P_idx length {len(P_idx)} does not match non-NTC z length {len(z_pert)}. "
-                "Use z_pert = z_all[labels != ntc_label], or check PerturbMatchingDataset alignment."
-            )
+        z_obs = np.asarray(adata.obsm[obsm_key], dtype=np.float32) if (
+            mode == "hybrid" and observed_singles == "decoded") else None
 
-        # Exclude perturbation target genes from regression/metrics
-        pert_genes = set()
-        for p in idx_to_pert.values():
-            if str(p) != str(ntc_label):
-                for g in str(p).split("+"):
-                    g = g.strip()
-                    if g:
-                        pert_genes.add(g)
+        def obs_single(gene):
+            mask = labels == str(gene)
+            if mask.sum() == 0:
+                return None
+            if observed_singles == "decoded":
+                # mean-of-decode over the cells (NOT decode-of-mean): matches the
+                # mean-of-decode baseline, so a null single -> 0 (decode-of-mean vs
+                # mean-of-decode baseline leaves a Jensen offset that biases the fit).
+                Z = torch.tensor(z_obs[mask], dtype=torch.float32, device=device)
+                return mean_ln_decode(Z) - baseline_ln
+            # raw: real log-normed expression minus the *raw* NTC baseline (both in
+            # observed space -> null single -> 0), not the decoded baseline.
+            xr = adata.X[mask]
+            xr = xr.toarray() if hasattr(xr, "toarray") else np.asarray(xr)
+            return self._lognorm(xr).mean(0) - raw_baseline_ln
 
-        gene_names = np.asarray(adata.var_names.astype(str))
-        reg_gene_mask = ~np.isin(gene_names, list(pert_genes))
-
-        expr_ntc = _decode_z_to_norm_expr(mean_ntc)
-
-        generated_z_cache = {}
-
-        if mode is False or mode == "hybrid":
-            base_z = torch.tensor(
-                mean_ntc,
-                dtype=torch.float32,
-                device=_device,
-            ).unsqueeze(0)
-            all_shifts = self._get_all_pert_shifts(_device)
-
-            def _generated_single_z(idx):
-                key = ("single", int(idx))
-                if key not in generated_z_cache:
-                    shift = all_shifts[[int(idx) + 1]]
-                    generated_z_cache[key] = (
-                        self._apply_shift(base_z, shift)
-                        .squeeze(0)
-                        .detach()
-                        .cpu()
-                        .numpy()
-                    )
-                return generated_z_cache[key]
-
-            def _generated_combo_z(idx_a, idx_b):
-                idx_a = int(idx_a)
-                idx_b = int(idx_b)
-                key = ("combo", min(idx_a, idx_b), max(idx_a, idx_b))
-                if key not in generated_z_cache:
-                    shift_a = all_shifts[[idx_a + 1]]
-                    shift_b = all_shifts[[idx_b + 1]]
-                    combo_shift = self._combine_pert_shifts(
-                        shift_a,
-                        shift_b,
-                        pert_idx_0=idx_a,
-                        pert_idx_1=idx_b,
-                    )
-                    generated_z_cache[key] = (
-                        self._apply_shift(base_z, combo_shift)
-                        .squeeze(0)
-                        .detach()
-                        .cpu()
-                        .numpy()
-                    )
-                return generated_z_cache[key]
-
-        combo_rows  = P_idx[P_idx[:, 1] != -1]
-        unique_keys = {
-            (min(int(r[0]), int(r[1])), max(int(r[0]), int(r[1])))
-            for r in combo_rows
-        }
-
-        records = []
-
-        desc = "get_gi" if mode is True else ("get_gi_hybrid" if mode == "hybrid" else "get_gi_generated")
-        for (i, j) in tqdm(sorted(unique_keys), desc=desc, unit="pair"):
-            name_a = idx_to_pert[i]
-            name_b = idx_to_pert[j]
-
-            mask_a  = (P_idx[:, 0] == i) & (P_idx[:, 1] == -1)
-            mask_b  = (P_idx[:, 0] == j) & (P_idx[:, 1] == -1)
-            mask_ab = ((P_idx[:, 0] == i) & (P_idx[:, 1] == j)) | \
-                    ((P_idx[:, 0] == j) & (P_idx[:, 1] == i))
-
-            n_a, n_b, n_ab = int(mask_a.sum()), int(mask_b.sum()), int(mask_ab.sum())
-
-            if n_a < min_cells or n_b < min_cells or n_ab < min_cells:
-                records.append({
-                    "pert_a": name_a,
-                    "pert_b": name_b,
-                    "n_a": n_a,
-                    "n_b": n_b,
-                    "n_ab": n_ab,
-                })
-                continue
-
-            if mode is True:
-                # Observed encoded-z means. This is the historical path.
-                mean_z_a  = z_pert[mask_a].mean(axis=0)
-                mean_z_b  = z_pert[mask_b].mean(axis=0)
-                mean_z_ab = z_pert[mask_ab].mean(axis=0)
-            elif mode == "hybrid":
-                # Observed single perturbations, generated double perturbation.
-                mean_z_a  = z_pert[mask_a].mean(axis=0)
-                mean_z_b  = z_pert[mask_b].mean(axis=0)
-                mean_z_ab = _generated_combo_z(i, j)
+        # ── build effect vectors ─────────────────────────────────────────────
+        effects: dict[str, np.ndarray] = {}
+        genes = [n for i, n in idx2pert.items() if n != ntc_label]
+        for g in genes:
+            if mode == "generated":
+                effects[canon(g)] = gen_effect(all_shifts[[name2idx[g]]])
             else:
-                # Generated counterfactual latents using the learned perturbation shifts.
-                mean_z_a  = _generated_single_z(i)
-                mean_z_b  = _generated_single_z(j)
-                mean_z_ab = _generated_combo_z(i, j)
+                v = obs_single(g)
+                if v is not None:
+                    effects[canon(g)] = v
 
-            expr_a  = _decode_z_to_norm_expr(mean_z_a)
-            expr_b  = _decode_z_to_norm_expr(mean_z_b)
-            expr_ab = _decode_z_to_norm_expr(mean_z_ab)
-
-            da_dec = (expr_a  - expr_ntc).astype(np.float64)
-            db_dec = (expr_b  - expr_ntc).astype(np.float64)
-            dab    = (expr_ab - expr_ntc).astype(np.float64)
-
-            # Remove perturbation target genes from expression-space metrics.
-            da_dec = da_dec[reg_gene_mask]
-            db_dec = db_dec[reg_gene_mask]
-            dab    = dab[reg_gene_mask]
-
-            additive = da_dec + db_dec
-
-            # Norman model: dab ≈ c1*da_dec + c2*db_dec.
-            # Norman's paper used a robust Theil-Sen fit for the model coefficients.
-            X = np.column_stack([da_dec, db_dec])
-            ts = TheilSenRegressor(
-                fit_intercept=False,
-                max_subpopulation=5000, #100000
-                max_iter=300, #1000
-                random_state=1000,
+        combo_labels = sorted({canon(l) for l in set(labels) - {str(ntc_label)} if sep in str(l)})
+        for c in combo_labels:
+            idxs = [name2idx[p] for p in c.split(sep) if p in name2idx]
+            if len(idxs) != 2:
+                continue
+            m_p = self._combine_pert_shifts(
+                all_shifts[[idxs[0]]], all_shifts[[idxs[1]]],
+                pert_idx_0=idxs[0], pert_idx_1=idxs[1],
             )
-            ts.fit(X, dab)
-            coef = np.asarray(ts.coef_, dtype=np.float64)
-            c1, c2 = float(coef[0]), float(coef[1])
-            y_pred = ts.predict(X).astype(np.float64)
+            effects[c] = gen_effect(m_p)
 
-            magnitude = float(np.sqrt(c1 ** 2 + c2 ** 2))
-            dominance = float(abs(np.log10((abs(c1) + eps_) / (abs(c2) + eps_))))
-            ss_res = float(np.sum((dab - y_pred) ** 2))
-            ss_tot = float(np.sum(dab ** 2))
-            model_fit = float(1.0 - ss_res / (ss_tot + eps_))
-            ss_tot_centered = float(np.sum((dab - dab.mean()) ** 2))
-            model_fit_r2_centered = float(1.0 - ss_res / (ss_tot_centered + eps_))
-            model_fit_dcor = float(_dcor.distance_correlation(
-                dab.reshape(-1, 1),
-                y_pred.reshape(-1, 1),
-            ))
-            model_corr = _cos(y_pred, dab)
+        combos = [c for c in combo_labels
+                  if c in effects and all(canon(p) in effects for p in c.split(sep))]
 
-            singles_sim = float(_dcor.distance_correlation(da_dec, db_dec))
-            singles_to_dbl = float(_dcor.distance_correlation(
-                np.column_stack([da_dec, db_dec]), dab
-            ))
+        raw = adata.obs[p_key].astype(str).value_counts().to_dict()
+        n_obs = {canon(k): int(v) for k, v in raw.items() if str(k) != str(ntc_label)}
 
-            dc_a = float(_dcor.distance_correlation(da_dec, dab))
-            dc_b = float(_dcor.distance_correlation(db_dec, dab))
-
-            eq_contrib = (
-                min(dc_a, dc_b) / (max(dc_a, dc_b) + eps_)
-                if np.isfinite(dc_a) and np.isfinite(dc_b) else np.nan
-            )
-
-            # Parent/double dcor details
-            max_parent_dcor = max(dc_a, dc_b)
-            min_parent_dcor = min(dc_a, dc_b)
-            parent_dcor_diff = abs(dc_a - dc_b)
-
-            # Coefficient structure
-            c1_abs = abs(c1)
-            c2_abs = abs(c2)
-            c1_plus_c2 = c1 + c2
-            c1_minus_c2 = c1 - c2
-            c1_times_c2 = c1 * c2
-            same_sign_coeffs = float(np.sign(c1) == np.sign(c2))
-
-            # Norms
-            norm_a = _norm(da_dec)
-            norm_b = _norm(db_dec)
-            norm_ab = _norm(dab)
-            norm_additive = _norm(additive)
-            norm_fit = _norm(y_pred)
-
-            norm_ab_over_additive = norm_ab / (norm_additive + eps_)
-            norm_fit_over_ab = norm_fit / (norm_ab + eps_)
-
-            # Effective fitted contributions
-            contrib_a = c1_abs * norm_a
-            contrib_b = c2_abs * norm_b
-
-            effective_dominance = float(
-                abs(np.log10((contrib_a + eps_) / (contrib_b + eps_)))
-            )
-            contribution_balance = float(
-                min(contrib_a, contrib_b) / (max(contrib_a, contrib_b) + eps_)
-            )
-
-            # Cosine geometry
-            cos_a_b = _cos(da_dec, db_dec)
-            cos_ab_a = _cos(dab, da_dec)
-            cos_ab_b = _cos(dab, db_dec)
-            cos_ab_additive = _cos(dab, additive)
-            cos_ab_fit = _cos(dab, y_pred)
-
-            # Residual geometry
-            fit_resid = dab - y_pred
-            add_resid = dab - additive
-            span_coef, *_ = np.linalg.lstsq(X, dab, rcond=None)
-            span_pred = X @ span_coef
-            span_resid = dab - span_pred
-
-            fit_residual_norm = _norm(fit_resid) / (norm_ab + eps_)
-            additive_residual_norm = _norm(add_resid) / (norm_additive + eps_)
-            orthogonal_residual_norm = _norm(span_resid) / (norm_ab + eps_)
-            orthogonal_residual_fraction = _norm(span_resid) / (_norm(fit_resid) + eps_)
-
-            cos_fit_resid_a = _cos(fit_resid, da_dec)
-            cos_fit_resid_b = _cos(fit_resid, db_dec)
-            cos_fit_resid_ab = _cos(fit_resid, dab)
-
-            cos_add_resid_a = _cos(add_resid, da_dec)
-            cos_add_resid_b = _cos(add_resid, db_dec)
-            cos_add_resid_ab = _cos(add_resid, dab)
-            signed_residual_alignment = cos_add_resid_ab
-
-            records.append({
-                "pert_a": name_a,
-                "pert_b": name_b,
-                "n_a": n_a,
-                "n_b": n_b,
-                "n_ab": n_ab,
-
-                # Norman six
-                "magnitude": magnitude,
-                "dominance": dominance,
-                "model_fit": model_fit,
-                "singles_similarity": singles_sim,
-                "singles_to_doubles": singles_to_dbl,
-                "equality_contribution": eq_contrib,
-                "model_fit_r2_centered": model_fit_r2_centered,
-                "model_fit_dcor": model_fit_dcor,
-                "model_corr": model_corr,
-
-                # Parent-to-double details
-                "dcor_a": dc_a,
-                "dcor_b": dc_b,
-                "max_parent_dcor": max_parent_dcor,
-                "min_parent_dcor": min_parent_dcor,
-                "parent_dcor_diff": parent_dcor_diff,
-
-                # Coefficients
-                "c1": c1,
-                "c2": c2,
-                "c1_abs": c1_abs,
-                "c2_abs": c2_abs,
-                "c1_plus_c2": c1_plus_c2,
-                "c1_minus_c2": c1_minus_c2,
-                "c1_times_c2": c1_times_c2,
-                "same_sign_coeffs": same_sign_coeffs,
-
-                # Effective contribution
-                "contrib_a": contrib_a,
-                "contrib_b": contrib_b,
-                "effective_dominance": effective_dominance,
-                "contribution_balance": contribution_balance,
-
-                # Norms
-                "norm_a": norm_a,
-                "norm_b": norm_b,
-                "norm_ab": norm_ab,
-                "norm_additive": norm_additive,
-                "norm_fit": norm_fit,
-                "norm_ab_over_additive": norm_ab_over_additive,
-                "norm_fit_over_ab": norm_fit_over_ab,
-
-                # Cosines
-                "cos_a_b": cos_a_b,
-                "cos_ab_a": cos_ab_a,
-                "cos_ab_b": cos_ab_b,
-                "cos_ab_additive": cos_ab_additive,
-                "cos_ab_fit": cos_ab_fit,
-
-                # Residuals
-                "fit_residual_norm": fit_residual_norm,
-                "additive_residual_norm": additive_residual_norm,
-                "orthogonal_residual_norm": orthogonal_residual_norm,
-                "orthogonal_residual_fraction": orthogonal_residual_fraction,
-                "cos_fit_resid_a": cos_fit_resid_a,
-                "cos_fit_resid_b": cos_fit_resid_b,
-                "cos_fit_resid_ab": cos_fit_resid_ab,
-                "cos_add_resid_a": cos_add_resid_a,
-                "cos_add_resid_b": cos_add_resid_b,
-                "cos_add_resid_ab": cos_add_resid_ab,
-                "signed_residual_alignment": signed_residual_alignment,
-            })
-
-        df = pd.DataFrame(records)
-        df.index = df["pert_a"] + "+" + df["pert_b"]
-        return df
+        return regress_gi_params(
+            effects,
+            combos=combos,
+            sep=sep,
+            n_obs=n_obs,
+            min_cells=min_cells,
+            progress=True,
+        )
 
     @torch.no_grad()
     def _eval(self, adata, obsm_key: str, device: torch.device) -> dict:

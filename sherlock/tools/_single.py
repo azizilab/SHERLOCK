@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import inspect
 import multiprocessing as mp
+import pickle
 import random
+from pathlib import Path
 
 import numpy as np
 import pyro
@@ -23,12 +25,19 @@ import torch
 from torch.utils.data import DataLoader
 
 from ._datasets import PerturbMatchingDataset, PerturbSimpleDataset
-from ._models import VAE
+from ._models import VAE, build_treat_effect_map, build_go_term_map
 from ._cvae import cVAE
 from ._svae import sVAE
 from ._scgen import SCGENModel
 from ._trainers import VAETrainer, cVAETrainer, sVAETrainer, SCGENTrainer
 from .._configs import get_config
+
+# TODO: hardcoded to the Norman gene2go cache pending an auto-download fallback
+# (gears.utils.get_go_auto) that would work for arbitrary datasets.
+_DEFAULT_GENE2GO_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "notebooks" / "norman" / "gears_data" / "gene2go_all.pkl"
+)
 
 
 # ── run ───────────────────────────────────────────────────────────────────────
@@ -66,7 +75,15 @@ def run(
     tau_init         : initial gate temperature (VAE).
     tau_end          : final gate temperature after annealing (VAE).
     seed             : RNG seed for reproducibility (covers weight init + training).
-    **kwargs         : additional model-specific constructor arguments.
+    **kwargs         : additional model-specific constructor arguments. For
+                       model='vae' with use_de_align_loss=True, treat_effect_map
+                       is auto-built from adata.uns[treat_effect_key] unless
+                       passed explicitly; de_align_exclude (e.g. held-out combo
+                       labels) and de_align_top_k control that construction.
+                       With use_go_prior=True, go_term_indices/go_term_offsets/
+                       n_go_terms are auto-built from a hardcoded gene2go pickle
+                       (_DEFAULT_GENE2GO_PATH, currently Norman-specific) unless
+                       go_term_indices is passed explicitly.
 
     Returns
     -------
@@ -84,7 +101,28 @@ def run(
         ctx = mp.get_context("spawn") if num_workers > 0 else None
 
         combinatorial = kwargs.pop("combinatorial", False)
+        de_align_exclude = kwargs.pop("de_align_exclude", ())
+        de_align_top_k = kwargs.pop("de_align_top_k", None)   # None => all genes
         dataset = PerturbMatchingDataset(adata, combinatorial=combinatorial)
+
+        if kwargs.get("use_de_align_loss", False) and "treat_effect_map" not in kwargs:
+            kwargs["treat_effect_map"] = build_treat_effect_map(
+                adata.uns[treat_effect_key],
+                dataset.perturbation_dict,
+                list(adata.var_names),
+                exclude=de_align_exclude,
+                top_k=de_align_top_k,
+            )
+
+        if kwargs.get("use_go_prior", False) and "go_term_indices" not in kwargs:
+            with open(_DEFAULT_GENE2GO_PATH, "rb") as f:
+                gene2go = pickle.load(f)
+            go_term_indices, go_term_offsets, n_go_terms = build_go_term_map(
+                gene2go, dataset.perturbation_dict
+            )
+            kwargs["go_term_indices"] = go_term_indices
+            kwargs["go_term_offsets"] = go_term_offsets
+            kwargs["n_go_terms"] = n_go_terms
 
         dataloader = DataLoader(
             dataset,
@@ -124,10 +162,6 @@ def run(
 
         if rho_init:
             vae.init_p_emb_from_adata(adata)
-        if vae.use_conditions:
-            vae.init_cond_means_from_adata(adata, dataset)
-        else:
-            vae.init_global_mean_from_adata(adata)
 
         trainer = VAETrainer(
             vae=vae,
