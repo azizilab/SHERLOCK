@@ -7,3 +7,12 @@ sherlock/notebooks/results/*
 sherlock/notebooks/figures/*
 sherlock/notebooks/norman/results/*
 sherlock/notebooks/gbm/results/*
+
+# Local data, model checkpoints, and reference files
+sherlock/notebooks/data/
+sherlock/notebooks/norman/data/
+sherlock/notebooks/norman/gears_*/
+sherlock/notebooks/norman/genetic_interactions.csv
+*.pdf
+*.bak*
+.claude/
