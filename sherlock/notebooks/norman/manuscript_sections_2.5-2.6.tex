@@ -1,0 +1,321 @@
+% =====================================================================
+%  SHERLOCK manuscript — Results sections 2.5–2.6 (Norman 2019,
+%  combinatorial perturbations and genetic interactions)
+%
+%  FIGURE REFERENCE NOTES (update labels to match the master file):
+%   * \ref{fig:fig6}  = NORMAN MAIN FIGURE. Panels assumed, in order:
+%       (a) SHERLOCK latent space (UMAP of z; singles + combinations,
+%           coloured by Norman Supplementary Table 6 gene module)
+%       (b) Counterfactual ATE (SHERLOCK / GEARS / cVAE / sVAE /
+%           contrastiveVI / scGen; all, singles, combos, held-out combos)
+%       (c) Norman GI labels vs SHERLOCK GI prediction (observed mode)
+%           — GI-metric embedding
+%       (d) GI classification (observed mode, all labelled pairs):
+%           per-class AUC-ROC + F1/ARI/AMI
+%       (e) GI categories in reconstructed gene space
+%     -> If panel letters differ in the master file, only the
+%        \ref{fig:fig6}X letters below need editing.
+%   * Supplementary figures cited as: fig:SuppNormanCov,
+%     fig:SuppNormanLatent, fig:SuppNormanRepro, fig:SuppNormanGears,
+%     fig:SuppNormanGIheldout, fig:SuppNormanGIraw. Renumber to the
+%     \label{fig:SupplementaryfigN} scheme used elsewhere when merging.
+%   * NEW citation keys used below — add to refs.bib if absent:
+%     norman2019exploring, roohani2023gears, akiba2019optuna, sen1968estimates,
+%     horlbeck2018mapping, cuenda2007p38, friedman2007cebp,
+%     rosenbauer2007transcription, davis2003eto, siatecka2011klf1,
+%     sherr1999cdk, caunt2013dual, mohapatra2013cbl, tsygankov2013tula,
+%     youle2008bcl2.
+% =====================================================================
+
+\subsection{SHERLOCK models combinatorial perturbations as compositional latent interventions}
+
+The three preceding sections addressed perturbation grouping, downstream target-gene inference, and
+condition-dependent responses. The fourth dimension of a perturbation screen---how perturbations
+interact when applied jointly---requires a model in which a combination is not an independent label
+but a composition of the mechanisms of its constituents. We therefore evaluated SHERLOCK on the
+CRISPRa combinatorial screen of Norman et al. \cite{norman2019exploring}, which profiles 105 single
+and 131 double perturbations in K562 cells (111,255 cells; 3,270 genes retained after keeping genes
+with mean expression $>0.5$ UMI per cell together with all perturbation-target genes). K562 is a
+chronic myelogenous leukaemia line poised between erythroid and megakaryocytic fates, and the
+perturbation library was constructed around regulators that push it along those axes---erythroid
+(\textit{KLF1}, \textit{LYL1}, \textit{SLC4A1}), granulocytic/monocytic (\textit{CEBPA},
+\textit{CEBPB}, \textit{CEBPE}, \textit{SPI1}), growth-factor and MAPK signalling (\textit{MAPK1},
+\textit{MAP2K3}, \textit{MAP2K6}, \textit{DUSP9}), and cell-cycle and apoptotic control
+(\textit{CDKN1A/B/C}, \textit{BAK1}, \textit{BCL2L11})---so that combinations probe how these
+programs compose. Eighty-eight of the double perturbations carry expert-assigned
+genetic-interaction (GI) annotations spanning eight categories.
+
+In SHERLOCK a combination label $A{+}B$ is decomposed into its components, and the joint latent
+intervention is constructed from the two single-perturbation shifts rather than from a free
+embedding of the pair:
+\[
+\Delta_{AB} \;=\; c_A(\rho_A,\rho_B)\,\Delta_A \;+\; c_B(\rho_A,\rho_B)\,\Delta_B \;+\; s(\rho_A,\rho_B),
+\qquad \Delta_p = W_p \odot \big(\Sigma^{1/2}\rho_p\big).
+\]
+The parent coefficients $c_A,c_B$ are scalar reweightings of each parent's shift, produced by a
+shared linear map applied to the ordered pair $[\rho_{\text{self}},\rho_{\text{other}}]$ in both
+orderings; this makes the construction swap-equivariant ($c_A(A,B)=c_B(B,A)$, so $A{+}B$ and $B{+}A$
+are identical) while leaving the two coefficients free to move independently. Passing the score
+through $1+\tanh(\cdot)$ confines each coefficient to $(0,2)$: a parent's program can be damped or up
+to doubled, but cannot change sign or diverge. Biologically, this is the degree of freedom that
+distinguishes suppression (both parents damped) and potentiation (both amplified) from dominance of
+one parent over the other, all of which are attested categories in the Norman annotation. The
+interaction residual $s$ is a symmetrised multilayer perceptron over $(\rho_A,\rho_B)$ and is
+therefore not restricted to the span of the two parent shifts, so it can express interaction
+directions---asymmetric masking, or transcriptional states absent from either single, as in
+neomorphic pairs---that a bilinear or low-rank interaction term cannot represent.
+
+Two design choices make additivity the model's null hypothesis rather than an artefact of
+parameterisation. First, the parent-coefficient map is initialised near zero so that
+$c_A=c_B\approx 1$ at the start of training and $\Delta_{AB}$ begins exactly at $\Delta_A+\Delta_B$;
+the model must be driven off additivity by the data. Second, deviations are explicitly priced: the
+objective carries an $\ell_2$ penalty on the interaction residual $s$ and on $(c-1)^2$. Because
+nothing else in the ELBO penalises non-additivity, without these terms the model could inject
+interaction structure into genuinely additive pairs at negligible likelihood cost, which would erase
+precisely the additive signature that downstream GI quantification reads out. Finally, because
+combinations reuse their parents' embeddings, gates, and the shared low-rank covariance $\Sigma$
+rather than acquiring their own, a double perturbation that was never observed in training still
+inherits a fully specified latent intervention---the property that makes out-of-distribution
+combination prediction possible at all.
+
+Under the structural-causal reading of the model (see \textbf{Theory}), a combination is an
+intervention like any other: $\mathrm{do}(P{=}A{+}B)$ applied to a background abducted from
+non-targeting control cells. Because our identifiability result is stated for a set of target
+perturbations evaluated under a single abduction, the joint counterfactual over $\{A, B, A{+}B\}$---
+and hence the interaction contrast $\Delta_{AB}-(\Delta_A+\Delta_B)$ defined on it---is identified
+for any combination the assay contains. What is identified is the total shift $\Delta_{AB}$; its
+split into parent scaling and interaction residual is not, and we therefore do not interpret the two
+separately.
+
+Identification is, however, relative to the distribution the model is fitted to, and this bounds what
+can be claimed for combinations the model has not seen. Withholding a combination removes precisely
+the conditional that identifies its mechanism, so the prediction the model then makes for it is not
+an identified counterfactual but an extrapolation: it is produced by applying parent coefficients and
+an interaction residual fitted on other pairs. What licenses it is structural rather than
+inferential---because a combination reuses its constituents' embeddings, gates and covariance rather
+than acquiring parameters of its own, it inherits a fully specified latent intervention even when
+absent from training---and whether that extrapolation is accurate is an empirical question, not a
+consequence of the identifiability result. We therefore do not claim to identify the counterfactual
+of an unseen combination. We claim instead that the compositional parameterisation supports
+extrapolation to one, and we test that claim directly: withheld combinations were assayed even though
+they were not shown to the model, so their effects are independently measured and predictions for
+them can be scored against measurement. The two tests are the held-out average treatment effect
+below, and the held-out genetic-interaction classification in the following section.
+
+Accordingly, we held out 20\% of the labelled double perturbations
+stratified by GI class (22 of 88 pairs) and removed all of their cells from training, retaining every
+single perturbation. We then quantified counterfactual average treatment effects (ATE) as the
+Pearson correlation between predicted and observed log$_2$-CPM effect profiles, reported separately
+for all perturbations, singles only, training-visible combinations, and held-out combinations
+(Fig.~\ref{fig:fig6}b). Across five independently seeded runs SHERLOCK attained $r=0.852\pm0.004$
+overall, $0.812\pm0.009$ on singles and $0.874\pm0.005$ on seen combinations, and---critically---
+$0.836\pm0.005$ on combinations that were entirely absent from training, exceeding GEARS in every
+column ($0.833\pm0.001$, $0.789\pm0.003$, $0.859\pm0.001$, $0.810\pm0.008$; Welch's $t$-test with
+Benjamini--Hochberg correction across all comparisons, $q<0.003$ for every column). The generative
+baselines are further behind in distribution (scGen $0.805\pm0.035$, cVAE $0.498\pm0.005$,
+contrastiveVI $0.496\pm0.023$, sVAE $0.428\pm0.023$), scGen being the closest of them---SHERLOCK
+exceeds it overall and on combinations ($q=0.042$ and $q=0.026$) though not on singles alone
+($q=0.23$). More importantly, none of these baselines can be scored out of distribution at all: each
+treats $A{+}B$ as an atomic label with its own independent embedding, so a combination absent from
+training has no representation to evaluate and held-out ATE is undefined by construction rather than
+merely poor. For fairness of comparison, the generative baselines were tuned with Optuna
+\cite{akiba2019optuna}, SHERLOCK hyperparameters were selected by grid search, and GEARS was run with
+the hyperparameters specified for the Norman dataset in its original publication
+\cite{roohani2023gears}.
+
+Because these conclusions rest on a learned latent geometry, we also quantified run-to-run stability
+across the five seeds. The learned perturbation covariance was highly reproducible (leave-one-out
+Spearman $r=0.788$, 95\% CI $[0.772,0.804]$ between each run's $\rho$ correlation matrix and the mean
+of the others), as were the counterfactual effect magnitudes ($r=0.924\pm0.007$ between predicted and
+observed per-perturbation effect norms), while the raw gate co-activation pattern was more variable
+($r=0.494$, 95\% CI $[0.446,0.533]$)---expected, since individual latent coordinates are exchangeable
+across runs and only their induced relational structure is identified
+(Supplementary Fig.~\ref{fig:SuppNormanRepro}).
+
+The structure that makes this composition work is visible directly in the learned perturbation
+covariance $\Sigma$, which is shared between singles and combinations and is therefore the object
+through which a combination inherits its parents' mechanisms. Its correlation structure recovers
+gene families and signalling relationships without any pathway supervision
+(Supplementary Fig.~\ref{fig:SuppNormanCov}). The most strongly coupled perturbation pairs are
+almost uniformly paralogues or direct pathway partners: the posterior \textit{HOX13} paralogues
+\textit{HOXA13}/\textit{HOXC13} ($r=0.89$), \textit{ETS2}/\textit{MAPK1} ($r=0.89$), where ETS2 is a
+canonical ERK substrate, the CIP/KIP cyclin-dependent kinase inhibitors \textit{CDKN1A},
+\textit{CDKN1B} and \textit{CDKN1C} (pairwise $r=0.79$--$0.89$) \cite{sherr1999cdk}, the tyrosine
+phosphatases \textit{PTPN1}, \textit{PTPN9} and the TULA-family phosphatase \textit{UBASH3B}
+($r=0.84$--$0.88$) \cite{tsygankov2013tula}, the C/EBP bZIP factors \textit{CEBPA}/\textit{CEBPB}
+($r=0.87$) \cite{friedman2007cebp}, the forkhead paralogues \textit{FOXA1}/\textit{FOXA3} ($r=0.85$)
+and \textit{FOXF1}/\textit{FOXL2} ($r=0.76$), the two p38 MAP2Ks \textit{MAP2K3}/\textit{MAP2K6}
+($r=0.82$) \cite{cuenda2007p38}, and the immunoglobulin-domain paralogues
+\textit{IGDCC3}/\textit{PRTG} ($r=0.81$). Quantitatively, every perturbation module annotated by
+Norman et al. (Supplementary Table 6 of \cite{norman2019exploring}) is enriched in the learned
+covariance relative to the rest of the screen: mean within-module versus between-module correlation
+is $0.82$ versus $-0.20$ for the MAP2K module, $0.81$ versus $0.12$ for the Ig-domain module, $0.66$
+versus $-0.01$ for the bZIP transcription-factor module, $0.65$ versus $0.12$ for the tyrosine
+phosphatases, $0.63$ versus $0.21$ for the MAP4K module, and $0.50$ versus $0.20$ for the
+regulation-of-apoptosis module. Hierarchical clustering of $\Sigma$ additionally isolates coherent
+programs that cut across those annotations---an erythroid/Notch block
+(\textit{KLF1}, \textit{CSRNP1}, \textit{MAML2}, \textit{TGFBR2}, \textit{ZC3HAV1}), with KLF1 the
+master erythroid regulator \cite{siatecka2011klf1}; a myeloid-differentiation block containing the
+three C/EBP factors together with \textit{SPI1} (PU.1) and the ETO-family corepressors
+\textit{RUNX1T1} and \textit{CBFA2T3} \cite{rosenbauer2007transcription,davis2003eto}; a p38/MAPK
+block (\textit{MAP2K3}, \textit{MAP2K6}, \textit{ELMSAN1}, \textit{PTPN12}, \textit{SET},
+\textit{TBX2}, \textit{IRF1}); and a two-member apoptotic block pairing the pore-forming effector
+\textit{BAK1} with the BH3-only activator \textit{BCL2L11} (BIM) \cite{youle2008bcl2}. The remaining
+majority of perturbations forms a large weakly coupled group, consistent with the observation that
+most single CRISPRa perturbations in this screen produce only modest transcriptional responses
+\cite{norman2019exploring}.
+
+These covariance modules are what the SHERLOCK latent space renders geometrically
+(Fig.~\ref{fig:fig6}a). Restricting to the Norman Supplementary Table 6 modules and to every
+combination containing at least one module member (45,231 cells, 116 perturbations), the annotated
+modules---MAP2K, MAP4K, tyrosine phosphatase, Ig-domain-containing, kinesin, bZIP transcription
+factor, homeobox transcription factor, Brachyury transcription factor, and regulation of
+apoptosis---occupy coherent territories, and combinations of two module members are placed in the
+region defined by their parents rather than in isolated islands
+(Supplementary Fig.~\ref{fig:SuppNormanLatent}). Perturbations that share a covariance module also
+share latent territory, so the colouring of the embedding and the block structure of $\Sigma$ are two
+views of the same learned quantity: mechanistic relatedness of the parents is inherited by the pair.
+This is the behaviour expected of a modular genetic-interaction landscape, in which functionally
+related regulators produce convergent transcriptional outcomes and interactions concentrate within
+and between coherent functional modules \cite{norman2019exploring,horlbeck2018mapping}.
+
+Individual pairs make the correspondence between latent geometry and interaction type explicit. For
+\textit{IKZF3}$+$\textit{MAP2K6}, annotated as epistatic, the double-perturbed cells overlay the
+\textit{MAP2K6} single population and are clearly displaced from the \textit{IKZF3} population---the
+direct latent signature of one parent's program masking the other. This is the expected direction
+biologically: MAP2K6 is a dedicated activator of p38 MAPK and drives a strong stress and
+differentiation response in K562 \cite{cuenda2007p38}, whereas IKZF3 (Aiolos) is a lymphoid Ikaros
+family factor with limited transcriptional consequence in this myeloid background. The corresponding
+GI metrics are strongly asymmetric (dominance $0.54$, parent distance-correlation difference $0.52$,
+equality of contribution $0.44$) and SHERLOCK assigns the pair to epistasis, matching the reference
+label. For \textit{CEBPE}$+$\textit{SET}, the double-perturbed cells sit markedly closer to the
+unperturbed background than either single, with a joint effect less than half the additive
+expectation (ratio of joint to additive norm $0.44$) despite a well-fit parent regression---the
+signature of mutual suppression, and the class SHERLOCK assigns
+(Supplementary Fig.~\ref{fig:SuppNormanLatent}). This too is consistent with the antagonism of the
+two programs involved: CEBPE drives granulocytic differentiation \cite{friedman2007cebp}, whereas SET
+(I2PP2A) is an oncoprotein inhibitor of PP2A associated with a differentiation block in myeloid
+leukaemia, and every other C/EBP pairing that carries a reference label in this screen falls into the
+redundancy or suppression family.
+
+\subsection{SHERLOCK recovers Norman genetic-interaction categories from decoded perturbation effects}
+
+We next asked whether the modelled combination effects are quantitative enough to reproduce the
+expert GI assignments of Norman et al. We adopted their own formulation: for each double
+perturbation, the joint effect profile is regressed on its two single-perturbation profiles by
+Theil--Sen regression without intercept \cite{sen1968estimates}, yielding coefficients $c_1,c_2$ from
+which magnitude $\sqrt{c_1^2+c_2^2}$, dominance $|\log_{10}(|c_1|/|c_2|)|$, model fit, equality of
+contribution, and the distance correlation between the two singles are derived, together with
+residual-geometry terms comparing the joint effect to the additive expectation (the additive residual
+norm, the ratio of joint to additive norm, and the signed alignment of the additive residual with the
+joint effect). These quantities map onto the biological definitions directly: a dominant coefficient
+with unequal parental contribution is epistasis; near-identical single profiles whose combination
+adds little is redundancy; a joint response smaller or larger than the additive expectation while
+retaining parental direction is suppression or potentiation; and a joint response poorly explained by
+any weighting of its parents is neomorphic. Categories are assigned by an equal-weight composite of
+$z$-scored metrics---one score per class, argmax over classes. Crucially, this entire downstream is a
+single shared routine applied identically to SHERLOCK and to GEARS; the only difference between the
+two evaluations is which per-perturbation effect vectors enter it, so the comparison isolates the
+quality of the modelled effects rather than the scoring convention. The Norman annotation splits
+synergy into similar- and dissimilar-phenotype subtypes; we score synergy as a single class, giving
+seven categories evaluated over the 86 labelled pairs for which both models produce complete metrics.
+
+The main-figure evaluation takes both the single- and the double-perturbation effect vectors from
+the model's decode of the posterior $q(z)$ over each perturbation's own cells, referenced to a common
+decoded control baseline. Two considerations motivate this over the composed-shift contrast, which by
+Corollary~\ref{cor:gi-id} targets the same estimand. First, generating all three vectors from the
+composed shift makes the regression of the double on its singles close to degenerate by construction:
+the fitted coefficients and residual would return the model's own parent coefficients and interaction
+term rather than a comparison against data. Second, the Norman categories were assigned from measured
+joint profiles, so an estimator whose joint effect derives from the cells that received the pair
+mirrors the construction the labels came from.
+In this setting SHERLOCK outperforms GEARS on every summary metric (Fig.~\ref{fig:fig6}d): weighted
+F1 $0.712\pm0.017$ versus $0.623\pm0.035$, adjusted Rand index $0.440\pm0.017$ versus $0.387\pm0.033$,
+and adjusted mutual information $0.512\pm0.022$ versus $0.446\pm0.050$ across five runs (Welch's
+$t$-test with Benjamini--Hochberg correction across the three metrics; $q=0.008$, $0.028$ and $0.040$
+respectively). Per-class one-versus-rest AUC-ROC shows that the advantage is not carried by a single
+easy category: SHERLOCK reaches $0.979\pm0.005$ for epistasis, $0.860\pm0.038$ for suppression,
+$0.845\pm0.009$ for synergy, $0.810\pm0.005$ for potentiation, $0.770\pm0.021$ for approximately
+additive, $0.767\pm0.028$ for neomorphic and $0.736\pm0.027$ for redundancy, exceeding GEARS on five
+of the seven classes. The largest margins fall on the two categories that depend on the additive null
+being represented faithfully---approximately additive ($0.770$ versus $0.657$) and suppression
+($0.860$ versus $0.713$)---which is the behaviour the additivity prior on $c$ and $s$ was introduced
+to protect. GEARS is modestly stronger on potentiation and redundancy. Embedding the pairs in the
+space of GI metrics gives the same picture qualitatively: the SHERLOCK-derived embedding separates
+the Norman classes more cleanly than the GEARS-derived one (macro-averaged silhouette in the metric
+space $0.085$ versus $0.050$; Fig.~\ref{fig:fig6}c and Supplementary
+Fig.~\ref{fig:SuppNormanGears}), with suppression, epistasis and approximately additive forming the
+most coherent territories and neomorphic---by definition a residual category of responses unlike
+either parent---the most diffuse.
+
+Two controls delimit what this result does and does not claim. First, we repeated the evaluation on
+the 22 held-out pairs with each pair's effect generated from the composed shift, so that both models
+predict a combination from its two constituents and neither uses the pair's own cells. This is the
+second of the two tests of compositional extrapolation set out above, now at the level of interaction
+type rather than of effect magnitude: the categories are assigned from a joint effect the model
+constructed rather than measured, and scored against the annotation derived from the measured one.
+The two models are indistinguishable on it (SHERLOCK weighted F1 $0.692\pm0.047$, GEARS
+$0.696\pm0.120$; $q=0.95$ for all three summary metrics after correction; Supplementary
+Fig.~\ref{fig:SuppNormanGIheldout}). With 22 pairs distributed over seven classes the per-class
+supports are in the low single digits, and the GEARS run-to-run spread is more than twice
+SHERLOCK's, so this test resolves only large differences; we report it as evidence that composition
+extrapolates to unseen combinations as well as a graph-based predictor does, not as evidence of
+superiority out of distribution. Second, we repeated the GI
+evaluation protocol of the GEARS study---their published metric and threshold definitions, scored by
+precision@10 and F1 over the five original Norman subtypes---using observed (raw) expression profiles
+as an additional reference alongside both models (Supplementary Fig.~\ref{fig:SuppNormanGIraw}). Raw
+expression is the strongest source in that protocol (overall F1 $0.573$; precision@10 of $0.9$ for
+neomorphism and $0.7$ for epistasis, against $0.34$ and $0.28$ for the best model-derived scores).
+This is expected and, we would argue, appropriate: the Norman categories are defined \emph{on}
+measured expression, so a procedure that consumes measured expression directly is scoring against its
+own definition, including whatever unmodelled noise structure that expression carries. We do not
+claim to improve on genetic interactions computed from raw expression, and we do not reformulate them
+in latent space---which the model could readily do, but which would define the categories in a space
+different from the one in which the reference labels were assigned. A representation-learning model
+is not well served by being judged on absolute expression reconstruction; the relevant question is
+whether a compact, interpretable latent parameterisation retains enough interaction structure to
+recover the expert categories, and the answer here is that it does.
+
+Finally, we asked whether the assigned categories correspond to interpretable transcriptional
+patterns rather than only to positions in a derived metric space. For each Norman category we
+selected a correctly classified held-out pair and reconstructed the effect profiles of the two
+singles and the double from the model's own decode, restricted to the 100 highest-variance genes
+across perturbations and hierarchically ordered (Fig.~\ref{fig:fig6}e). All seven exemplars are drawn
+from the held-out set, so each displayed reconstruction is a genuine extrapolation, and each matches
+its category both visually and mechanistically. The redundant exemplar
+\textit{MAP2K3}$+$\textit{MAP2K6} pairs the two MAP2Ks that phosphorylate p38 on the same activation
+loop residues \cite{cuenda2007p38}; their single profiles are nearly identical (singles similarity
+$0.94$) and the combination adds little beyond either ($c$-magnitude $1.05$, joint-to-additive norm
+ratio $0.80$)---textbook functional redundancy, and the same relationship the covariance matrix
+independently assigns the highest within-module correlation in the screen. The suppression exemplar
+\textit{CEBPB}$+$\textit{PTPN12} combines a myeloid differentiation driver with a tyrosine phosphatase
+that dampens receptor tyrosine kinase signalling, and yields a joint response attenuated relative to
+both parents. The synergy exemplar \textit{CBL}$+$\textit{CNN1} shows a joint response exceeding the
+additive expectation while retaining the direction of both parents (joint-to-additive ratio $1.23$,
+singles similarity $0.84$), consistent with CBL acting as an E3 ligase that terminates
+growth-factor-receptor signalling \cite{mohapatra2013cbl} and with the erythroid-differentiation
+program Norman et al. report for CBL-containing combinations; the closely related pair
+\textit{CBL}$+$\textit{PTPN12}, which joins two negative regulators of the same signalling axis, is
+likewise correctly called as synergy. The epistasis exemplar
+\textit{CEBPA}$+$\textit{ZC3HAV1} is dominated by the C/EBP program, and the neomorphic exemplars
+\textit{KLF1}$+$\textit{TGFBR2} and \textit{DUSP9}$+$\textit{MAPK1} produce responses poorly explained
+by any weighting of their parents---in the latter case unsurprisingly, since DUSP9 is a dual-specificity
+phosphatase that directly inactivates ERK2/MAPK1, so co-activating a kinase and its own phosphatase
+places the cell in a state neither single perturbation visits \cite{caunt2013dual}.
+
+The remaining 45 double perturbations in the screen carry no reference annotation in the label set
+available to us, and the model assigns each of them a category as well. We treat these as internal
+consistency checks rather than as findings: several fall where the pair's own covariance module would
+place it, including \textit{CDKN1A}$+$\textit{CDKN1B} (p21/p27) called redundant, as expected for two
+CIP/KIP inhibitors acting on overlapping cyclin--CDK complexes \cite{sherr1999cdk};
+\textit{UBASH3A}$+$\textit{UBASH3B} called synergistic, matching the paralogous
+TULA-family phosphatases \cite{tsygankov2013tula}; and \textit{BAK1}$+$\textit{BCL2L11}, the pair that
+forms its own two-member apoptotic block in the learned covariance \cite{youle2008bcl2}. That the
+unlabelled calls agree with the relationships the covariance matrix encodes, without any of these
+pairs contributing to the labelled evaluation, supports the interpretation that the compositional
+latent parameterisation captures interaction structure rather than fitting the labelled subset.
+
+Taken together, these results show that representing a combination as a structured composition of its
+constituents' latent mechanisms---rather than as an independent embedding---is what makes both
+out-of-distribution combination prediction and quantitative genetic-interaction recovery possible
+within a single interpretable generative model.

@@ -1,0 +1,249 @@
+% =====================================================================
+%  Methods — combinatorial perturbations and genetic-interaction scoring
+%  Rewritten against sherlock/tools/_models.py (VAE.model, VAE.get_gi,
+%  regress_gi_params, classify_gi). Replaces the previous version of
+%  \subsection{Combinatorial perturbations and genetic interaction scoring}.
+%
+%  Cross-references to fix on merge: Sections~4.1--4.4, Eq.~(13),
+%  \eqref{eq:full-elbo} are carried over from the old text and must match
+%  the surrounding Methods numbering.
+%  \ref{sec:causal} points at "Causal Inference of Perturbation Effect";
+%  add \label{sec:causal} to that subsection or change the reference.
+% =====================================================================
+
+\subsection{Combinatorial perturbations and genetic interaction scoring}
+\label{sec:combo}
+
+The sections above describe the single-perturbation case in which each cell carries exactly one
+perturbation label $p_n$. We now extend the model to data in which cells may be exposed to a
+\emph{pair} of perturbations simultaneously, and introduce a learned interaction term that captures
+non-additive effects.
+
+\subsubsection{Notation and input encoding}
+\label{sec:combo-notation}
+
+In the combinatorial setting each cell $n$ is associated with an ordered pair
+$\mathbf{p}_n = (p_n^{(1)}, p_n^{(2)}) \in \{1,\dots,P\}^2$, where $p_n^{(2)} = \varnothing$
+(encoded as $-1$) for single-perturbation cells. Perturbation labels are indexed at the level of
+individual genes: a label \texttt{A+B} is split into its components, so a combination introduces no
+parameters of its own and instead reuses the embeddings, gates and covariance of its two
+constituents. Let
+\[
+  v_n \;=\; \mathbf{1}\big[p_n^{(2)} \neq \varnothing\big]
+\]
+indicate that cell $n$ carries a second perturbation. All remaining notation---$A$, $W$, $\rho$,
+$z^0$, $z$, $\theta$---is unchanged from Sections~4.1--4.4; in particular $A = \Sigma_P^{1/2}\rho$ is
+the covariance-transformed perturbation embedding and $W \in [0,1]^{P\times d}$ the gate.
+
+\subsubsection{Combinatorial latent shift}
+\label{sec:combo-shift}
+
+For a single-perturbation cell the gated shift is unchanged,
+$\Delta_n = W_{p_n} \odot A_{p_n}$. For a combinatorial cell the shift is a reweighted sum of the two
+parent shifts plus a learned interaction residual:
+\begin{align}
+  \Delta_n^{\mathrm{combo}}
+  \;=\;
+  c_a\,\big(W_{p_n^{(1)}} \odot A_{p_n^{(1)}}\big)
+  \;+\;
+  c_b\,\big(W_{p_n^{(2)}} \odot A_{p_n^{(2)}}\big)
+  \;+\;
+  s\big(\rho_{p_n^{(1)}},\, \rho_{p_n^{(2)}}\big),
+  \label{eq:combo-full}
+\end{align}
+with $c_a = c_b = 1$ and $s = \mathbf{0}$ recovering the additive baseline
+$\Delta_n^{\mathrm{add}} = W_{p_n^{(1)}} \odot A_{p_n^{(1)}} + W_{p_n^{(2)}} \odot A_{p_n^{(2)}}$.
+Single-perturbation cells bypass \eqref{eq:combo-full} entirely and retain
+$\Delta_n = W_{p_n} \odot A_{p_n}$. The shift enters the latent transition exactly as in the
+single-perturbation case, with $\Delta_n^{\mathrm{combo}}$ substituted for $\Delta_n$; the decoder,
+KL terms and remaining ELBO structure are unchanged.
+
+\paragraph{Interaction residual.}
+The residual $s$ is a two-layer perceptron applied to the concatenated pair of perturbation
+embeddings and symmetrised over both orderings:
+\begin{align}
+  s(\rho_a, \rho_b)
+  \;=\;
+  \tfrac{1}{2}\Big[
+    g\big([\rho_a;\rho_b]\big) + g\big([\rho_b;\rho_a]\big)
+  \Big],
+  \qquad
+  g(u) \;=\; W_2\,\mathrm{LeakyReLU}\big(W_1 u + b_1\big) + b_2,
+  \label{eq:syn-shift}
+\end{align} 
+with $W_1 \in \mathbb{R}^{h \times 2d}$, $W_2 \in \mathbb{R}^{d \times h}$ and hidden width $h$.
+Averaging the two orderings enforces $s(\rho_a,\rho_b) = s(\rho_b,\rho_a)$, so \texttt{A+B} and
+\texttt{B+A} induce identical shifts. The residual is unconstrained in direction and is therefore
+free to point outside the span of the two parent shifts, which is what allows it to represent
+asymmetric masking (epistasis) and transcriptional states absent from either single perturbation
+(neomorphic effects).
+
+\paragraph{Parent coefficients.}
+The scalar coefficients $c_a, c_b$ rescale each parent's contribution in the context of the
+combination. Both are produced by a single bias-free linear map $w \in \mathbb{R}^{2d}$ applied to
+the ordered pair, evaluated in both orderings:
+\begin{align}
+  c_a \;=\; 1 + \tanh\!\big(w^\top [\rho_a;\rho_b]\big),
+  \qquad
+  c_b \;=\; 1 + \tanh\!\big(w^\top [\rho_b;\rho_a]\big).
+  \label{eq:parent-scale}
+\end{align}
+This construction has the two properties the interaction classes require. It is swap-equivariant,
+$c_a(\rho_a,\rho_b) = c_b(\rho_b,\rho_a)$, giving the label-order invariance appropriate to an
+unordered pair. And because the map acts on the full ordered pair, the two coefficients vary
+independently and their sum is unconstrained, so a combination can scale its additive component as a
+whole---both parents amplified, as in potentiation, or both damped, as in suppression---as well as
+redistribute weight between them, as in dominance. The $\tanh$ confines each coefficient to $(0,2)$,
+so a parent's program may be damped or up to doubled but cannot change sign or diverge, and $w$ is
+initialised near zero so that $c_a = c_b \approx 1$ at initialisation.
+
+\subsubsection{Additivity prior and objective}
+\label{sec:combo-elbo}
+
+Nothing in the reconstruction likelihood penalises non-additivity, so without an explicit prior the
+model can introduce interaction structure into genuinely additive pairs at negligible cost to the
+ELBO---which would erase the additive signature that the genetic-interaction scoring below reads
+out. We therefore add two quadratic penalties over combinatorial cells:
+\begin{align}
+  \mathcal{R}_{\mathrm{syn}}
+  \;=\;
+  -\lambda_{s} \sum_{n\,:\,v_n=1} \big\| s_n \big\|_2^2
+  \;-\;
+  \lambda_{c} \sum_{n\,:\,v_n=1} \Big[(c_{a,n}-1)^2 + (c_{b,n}-1)^2\Big].
+  \label{eq:syn-reg}
+\end{align}
+Both accumulate over the cells carrying a combination, as its likelihood contribution does, so how
+much evidence a pair must show before departing from additivity does not depend on how many cells
+happen to carry it. Together with the near-zero initialisation of $w$, these make the additive model
+the default: the model begins exactly at $\Delta^{\mathrm{add}}$ and must be driven away from it by
+the data. The complete objective is
+\begin{align}
+  \mathcal{L}^{\mathrm{combo}}
+  \;=\;
+  \mathcal{L}\big|_{\Delta \leftarrow \Delta^{\mathrm{combo}}}
+  \;+\;
+  \mathcal{R}_{\mathrm{syn}},
+\end{align}
+where $\mathcal{L}$ is \eqref{eq:full-elbo} evaluated with the combinatorial shift
+\eqref{eq:combo-full}. The auxiliary classifier loss is the one component that changes form: the
+single-label cross-entropy in (13) is replaced by binary cross-entropy against a multi-hot target
+$\mathbf{t}_n \in \{0,1\}^P$ with $t_{n,p} = 1$ for each perturbation present in cell $n$,
+\begin{align}
+  \log p_\psi(y_n \mid z_n)
+  \;\equiv\;
+  -\mathrm{BCE}\big(\sigma(h_\psi(z_n)),\; \mathbf{t}_n\big),
+  \label{eq:combo-ce}
+\end{align}
+with $\sigma$ the element-wise sigmoid.
+
+\subsubsection{Effect vectors for interaction scoring}
+\label{sec:gi-effects}
+
+Interaction scoring operates on effect vectors in gene space---one per single perturbation and one
+per pair. In the main analysis each vector is taken from the model's approximate posterior over that
+perturbation's own cells: we decode $q(z)$ for every cell carrying the perturbation, average the
+decoded profiles, and subtract a non-targeting control (NTC) baseline obtained the same way from the
+full NTC population. All three vectors entering a comparison---$\delta_a$, $\delta_b$ and
+$\delta_{ab} \in \mathbb{R}^G$---are referenced to this single shared baseline and expressed as
+$\log_2$ CPM differences, so a null perturbation maps to $\mathbf{0}$ and the additive residual is
+not offset by a baseline mismatch. Perturbations with fewer than five observed cells are not scored.
+
+The alternative is to generate each effect by applying the corresponding latent shift---
+\eqref{eq:combo-full} for a pair---to a background abducted from NTC cells and decoding, reusing the
+same background throughout. Both estimators target the marginal interventional means identified by
+Corollary~\ref{cor:gi-id}, so the choice between them is one of estimator behaviour rather than of
+what is identified. We score from the posterior for two reasons. Generating all three vectors makes
+the regression close to degenerate by construction: the double is then a reweighted sum of the
+singles plus the interaction residual, so the fitted coefficients and residual recover the model's own
+parameters rather than a comparison against data. And the reference categories were assigned from
+measured joint profiles, so estimating the joint effect from the cells that received the pair mirrors
+the construction those labels came from.
+
+For combinations withheld from training we instead generate the pair's effect from
+\eqref{eq:combo-full} while retaining posterior-decoded singles, so that the pair is predicted from
+its two constituents and its own cells are not used. Regressing a generated double against observed
+singles also keeps the interaction residual discriminative.
+
+The status of this setting should be stated precisely, since it differs from the rest of the
+analysis. Identification is relative to the distribution a model is fitted to: withholding a
+combination removes the very conditional that identifies its mechanism, so the resulting prediction
+is an extrapolation rather than an identified counterfactual, obtained by applying parent
+coefficients and an interaction residual fitted on other pairs. What makes the extrapolation possible
+is structural---a combination reuses its constituents' parameters and therefore has a fully specified
+shift whether or not it was observed---and whether it is accurate is an empirical question. We make
+no identification claim for withheld combinations. Because such combinations were nonetheless
+assayed, their effects are independently measured, and we evaluate the extrapolation against that
+measurement in two ways: as the correlation between predicted and measured effect profiles, and as
+the accuracy of the interaction classes assigned from the generated joint effect.
+
+\subsubsection{Genetic interaction metrics}
+\label{sec:gi-scoring}
+
+We quantify the interaction type of each pair by Norman-style regression in decoded gene-expression
+space. Writing the additive prediction as $\delta^{\mathrm{add}}_{ab} = \delta_a + \delta_b$, the
+double effect is regressed on its two single effects,
+\begin{align}
+  \delta_{ab} \;\approx\; c_1\,\delta_a + c_2\,\delta_b,
+  \label{eq:norman}
+\end{align}
+by Theil--Sen regression without intercept, giving coefficients $(c_1,c_2)$ and fitted double
+$\hat{\delta}_{ab} = c_1\delta_a + c_2\delta_b$. Note that $(c_1,c_2)$ are post hoc regression
+coefficients in gene space and are distinct from the model's parent coefficients $(c_a,c_b)$ of
+\eqref{eq:parent-scale}. Table~\ref{tab:gi-metrics} lists the eleven scalar metrics derived from
+$(\delta_a, \delta_b, \delta_{ab}, \hat{\delta}_{ab}, c_1, c_2)$. The same routine is applied to the
+effect vectors of any method under comparison, so that only the effect vectors, and not the scoring
+convention, differ between methods.
+
+\begin{table}[!htbp]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+Metric & Symbol & Definition \\
+\midrule
+Fit magnitude            & $m$        & $\sqrt{c_1^2 + c_2^2}$ \\
+Dominance                & $D$        & $\big|\log_{10}(|c_1|/|c_2|)\big|$ \\
+Parent asymmetry         & $\Delta_{\!\rho}$ & $|\,\mathrm{dCor}(\delta_a,\delta_{ab}) - \mathrm{dCor}(\delta_b,\delta_{ab})\,|$ \\
+Contribution balance     & $E$        & $\min / \max$ of the same two distance correlations \\
+Single-effect similarity & $S$        & $\mathrm{dCor}(\delta_a, \delta_b)$ \\
+Additive residual        & $R$        & $\|\delta_{ab} - \delta^{\mathrm{add}}_{ab}\| \,/\, \|\delta^{\mathrm{add}}_{ab}\|$ \\
+Joint-to-additive ratio  & $\eta$     & $\|\delta_{ab}\| \,/\, \|\delta^{\mathrm{add}}_{ab}\|$ \\
+Residual alignment       & $\alpha$   & $\cos\big(\delta_{ab} - \delta^{\mathrm{add}}_{ab},\; \delta_{ab}\big)$ \\
+Fit quality              & $F$        & $\mathrm{dCor}(\delta_{ab}, \hat{\delta}_{ab})$ \\
+Fitted-effect norm       & $\nu$      & $\|\hat{\delta}_{ab}\|$ \\
+Fitted-to-joint ratio    & $\phi$     & $\|\hat{\delta}_{ab}\| \,/\, \|\delta_{ab}\|$ \\
+\bottomrule
+\end{tabular}
+\caption{Genetic-interaction metrics. $\mathrm{dCor}$ denotes distance correlation.}
+\label{tab:gi-metrics}
+\end{table}
+
+\subsubsection{Interaction classification}
+\label{sec:gi-classification}
+
+Each metric is $z$-scored across the pairs being classified. Every class is assigned a composite
+score equal to the mean of its signed $z$-scored terms (Table~\ref{tab:gi-classes}), and each pair
+receives the class with the highest score. Pairs with any non-finite metric are left unclassified.
+The reference annotation distinguishes two synergy subtypes by whether the two single perturbations
+induce similar or dissimilar phenotypes; we do not make this distinction and score synergy as one
+class throughout, collapsing the reference subtypes accordingly.
+
+\begin{table}[!htbp]
+\centering
+\small
+\begin{tabular}{lp{7.2cm}l}
+\toprule
+Class & Biological interpretation & Composite score \\
+\midrule
+Approximately additive & Double effect explained by the sum of the singles & $-R - \eta$ \\[3pt]
+Epistasis              & One parent dominates and masks the other & $+D + \Delta_{\!\rho} - E$ \\[3pt]
+Redundant              & Parents act on a shared program; the double adds little beyond either alone & $+S - \eta$ \\[3pt]
+Suppression            & Joint response damped relative to what both parents predict & $-\eta + \phi - m$ \\[3pt]
+Neomorphic             & Double not explained by any weighting of the parents & $-F - \nu$ \\[3pt]
+Potentiation           & Double exceeds the additive expectation; parents act on dissimilar programs & $+\eta + \alpha - S$ \\[3pt]
+Synergy                & Double exceeds the additive expectation; parents act on similar programs & $+m + \eta + 2S$ \\
+\bottomrule
+\end{tabular}
+\caption{Composite scores over $z$-scored metrics; each is averaged over its terms.}
+\label{tab:gi-classes}
+\end{table}

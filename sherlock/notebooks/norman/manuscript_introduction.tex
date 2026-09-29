@@ -1,0 +1,152 @@
+% =====================================================================
+%  Introduction — revised against the outline
+%
+%  WHAT CHANGED (everything else is the previous text, largely verbatim):
+%   1. The three prior-work paragraphs (scGen/ContrastiveVI; SAMS-VAE;
+%      SVAE/SVAE+) are merged into two, grouped by what the methods do
+%      rather than one paragraph per baseline.
+%   2. The gap paragraph now lists four requirements rather than three,
+%      adding combinatorial interactions so it matches the four
+%      dimensions introduced two paragraphs earlier and the outline.
+%   3. The SHERLOCK paragraph describes the additive displacement of the
+%      background used by the model (see Methods). The background is also
+%      no longer described as condition-dependent.
+%
+%  Text that differs from the previous version is wrapped in { }. These
+%  are LaTeX groups, so they are visible in the source and invisible in
+%  the output; strip them once the changes are approved.
+%
+%  STILL TO RESOLVE: the [CITE ...] placeholders are carried over
+%  unchanged. Elham's outline block is retained at the top for comparison
+%  and can be deleted once the text is approved.
+%
+%  NOTE: the sentence in Results 2.1 describing the latent transition
+%  still needs replacing to match this paragraph.
+% =====================================================================
+
+\section{Introduction}
+\label{sec:intro}
+\ea{outline: Para 1: The opportunity: Single-cell perturbation technologies (CRISPR, chemical, and spatial perturbation screens) now enable systematic interrogation of gene function at unprecedented scale, creating an urgent need for computational methods that extract mechanistic insight from these large interventional datasets.
+Para2 – The bio questions: A single perturbation screen should ideally answer four fundamental questions: (i) which perturbations share mechanisms, (ii) what downstream genes and pathways they affect, (iii) how their effects change across experimental conditions, and (iv) how perturbations interact in combinations.
+Para3 – The computational gap: Existing methods address these questions separately—focusing on perturbation prediction, differential expression, representation learning, or combinatorial perturbations—but no single framework enables all of these analyses from a common perturbation representation.
+Para4 – The gap: Achieving this requires learning structured representations of perturbations that capture shared biological mechanisms while simultaneously supporting counterfactual estimation of downstream perturbation effects, quantification of condition-dependent responses, and analysis of combinatorial interactions.
+Para5 –  solution: An interpretable generative framework that learns structured perturbation representations to organize perturbations into mechanistic groups, infer counterfactual perturbation-to-gene effect networks, quantify condition-dependent perturbation responses, and model combinatorial perturbation effects across diverse single-cell perturbation modalities.}
+
+Large-scale perturbation assays, including CRISPR-based, chemical, and spatial screens, enable
+systematic characterization of cellular responses and gene function. These experiments generate
+high-dimensional measurements of transcriptional changes induced by diverse perturbations across
+heterogeneous biological and experimental contexts. The increasing scale and complexity of such
+datasets require computational methods that can move beyond simply predicting post-perturbation gene
+expression in and out-of-distributions and infer perturbation-response relationships to extract
+causal mechanistic structure from interventional data.
+
+An ideal perturbation screen should support systematic characterization of molecular systems along
+four complementary dimensions. First, it should quantify the downstream effects of each perturbation,
+including changes in gene expression, signaling pathways, regulatory programs, and cellular
+phenotypes, while resolving variation across cell types, states, and experimental contexts. Second,
+it should identify similarities and differences among perturbations by comparing their response
+profiles and determining whether they act through shared, partially overlapping, or distinct
+mechanisms of action. Third, it should characterize how exogenous variables, including environmental
+conditions, treatment settings, temporal context, and other measured covariates, modify the
+magnitude, direction, and specificity of perturbation effects. Fourth, it should model interactions
+among multiple perturbations under combinatorial interventions, including additive, synergistic,
+antagonistic, and context-dependent effects. Joint analysis of these four dimensions is required to
+infer perturbation-response mechanisms, prioritize candidate therapeutic targets, identify
+context-specific vulnerabilities, and characterize the structure and dynamics of cellular state
+transitions.
+
+Existing computational approaches for single-cell perturbation analysis typically address these
+objectives in isolation and often do not explicitly represent the mechanistic structure required for
+causal effect estimation under interventions on exogenous variables. In addition, increasing reliance
+on high capacity models such as foundation models and large language models[CITE GEAR, scGPT,
+cell2sentence, etc.], can limit interpretability of perturbation-response mechanisms and introduce
+statistical and computational challenges related to identifiability, over-parameterization, and
+overfitting. These limitations are particularly consequential for counterfactual inference, which
+requires the model to first infer the latent exogenous noise variables that are compatible with the
+observed data, then apply alternative do-interventions while holding the abducted noise realization
+fixed, and finally propagate the intervened system through the structural equations to estimate
+counterfactual outcomes. Without an identifiable latent-variable parameterization and a separation
+between exogenous variation and intervention-specific mechanisms, predictive models of
+post-perturbation expression cannot, in general, support counterfactual estimation at the higher
+levels of Pearl's causal hierarchy[CITE Elias and Pearl, 2020 paper and Pearl 1999 paper].
+
+Even if we zoom in to more interpretable frameworks such as deep generative models, existing
+VAE-based approaches do not jointly address these objectives. scGen\cite{lotfollahi2019scgen}
+represents a perturbation as a global displacement vector estimated by latent-space arithmetic
+between control and perturbed populations{, a formulation that assumes} the perturbation effect can be
+summarized by a context-invariant translation and {that} generally models each perturbation
+independently. ContrastiveVI\cite{weinberger2023contrastivevi} {instead }decomposes cellular variation
+into shared and salient latent components to distinguish background variation from
+condition-associated variation{; this binary decomposition, however,} does not assign individual
+perturbations to specific latent mechanisms or characterize which transcriptional programs, pathways,
+or regulatory modules mediate their effects. {Neither identifies perturbation-specific regulatory
+programs, represents dependencies among perturbations, or specifies how exogenous variables modify
+the perturbation mechanism, and neither provides a structural representation of perturbation
+interactions.}
+
+{Sparse mechanism-shift and structured latent-variable models come closer.}
+SAMS-VAE\cite{bereket2023samsvae} introduces perturbation-specific masks over latent variables,
+allowing each intervention to modify a subset of latent dimensions{, while
+SVAE\cite{lachapelle2022mechanism} and SVAE+\cite{lopez2023sviaeplus} impose additional structure or
+supervision on the latent representation to improve correspondence between latent variables and
+generative factors}. Although {these parameterizations} encode modularity and can improve sparsity of
+the inferred perturbation effects, the latent variables remain non-identifiable in general: multiple
+latent parameterizations may induce the same observed-data distribution while assigning different
+biological interpretations to the masked dimensions. Sparsity {or supervision }alone therefore does not
+guarantee recovery of the underlying causal mechanisms, regulatory programs, or intervention targets.
+Moreover, perturbation embeddings are typically {parameterized independently, without} an explicit
+relational structure linking perturbations through shared targets, pathways, or mechanisms{, so these
+models} do not directly represent mechanistic similarity among interventions, context-dependent
+modulation of perturbation effects, or higher-order interactions between perturbations. More
+generally, without an identifiable structural causal model that separates exogenous variation,
+endogenous cellular state, and intervention-specific mechanisms, these VAE formulations cannot
+implement counterfactual inference through abduction, intervention, and prediction while holding the
+inferred exogenous noise realization fixed.
+
+Most fundamentally, existing methods struggle with interpretability: the learned latent dimensions
+often lack clear biological meaning, making it difficult to translate computational findings into
+testable mechanistic hypotheses. Methods that enforce sparsity frequently do so at the expense of
+predictive accuracy, whereas methods optimized for prediction tend to produce entangled
+representations in which perturbation effects are diffusely distributed across latent dimensions. As
+a result, the field still lacks a unified framework that can simultaneously: (1) learn structured
+groupings of perturbations that reflect underlying mechanistic relationships; (2) robustly link
+genetic perturbations to their downstream transcriptional consequences to enable mechanistic insight;
+(3) explicitly model condition-dependent perturbation effects{; and (4) represent combinatorial
+interventions in a way that exposes how perturbations interact}. This framework should generalize
+across diverse perturbation settings, including different CRISPR modalities (CRISPRi, CRISPRa, and
+CRISPR knockout), as well as across single-cell and spatial data modalities, while supporting
+biological discovery and hypothesis generation.
+
+Here, we introduce SHERLOCK, a variational autoencoder framework that addresses these limitations. We
+represent perturbations as structured interventions on a shared latent cellular state, in order to
+have both a generative view and a structural causal model(SCM) view of our model to allow
+counterfactual estimation. Each perturbation is parameterized by a sparse latent shift,
+\[
+\Delta_p = W_p \odot A_p,
+\]
+where the gate selects affected latent coordinates and the low-rank covariance over $A$ captures
+dependencies among perturbation mechanisms. {A background variable ($z_0$), inferred from control
+cells, is displaced additively by ($\Delta_p$)}, separating contextual variation from
+intervention-specific effects. This structure also allows explicit abduction step so we can infer
+joint distribution of exogenous noise and hold them fixed. A shared negative-binomial decoder maps
+intervened latent states to gene-expression distributions, enabling perturbation-to-gene effects to
+be defined as contrasts between decoded potential outcomes. The model extends to combinatorial
+interventions through additive perturbation shifts and a learned interaction residual. We specify
+causal estimands induced by the SCM view of our model and estimates them under stated structural and
+statistical assumptions, and prove theoretical results such as causal estimand identifiability while
+showing empirical evidence of reproducibility.
+
+Applied to the genome-wide Perturb-seq dataset generated by Replogle et al.,
+\cite{replogle2022mapping}, our approach revealed coherent grouping of perturbations according to
+pathway annotations, demonstrating that it captures ground truth biological grouping and pathway
+structures more faithfully than existing methods, achieves interpretable separation of underlying
+mechanisms, and generalizes to diverse experimental conditions. In addition, it demonstrated strong
+performance across multiple perturbation modalities, including drug treatment\cite{giglio2025heterogeneous},
+CRISPR inhibition \cite{replogle2022mapping}, activation\cite{shi2026drug}, and RAEFISH spatial
+perturbation datasets\cite{cell2025spatial}. Overall, the framework supports meaningful grouping of
+perturbations, the construction of perturbation-to-target gene graphs, {identification of conditional
+perturbation response, and quantification of genetic interactions between combined perturbations},
+providing a robust platform for both exploratory analysis and principled hypothesis testing in
+perturbation biology. Through our approach, we aim to bridge data-driven modeling with mechanistic
+understanding, advancing the field's capacity for biological discovery in high-dimensional
+experimental data.
