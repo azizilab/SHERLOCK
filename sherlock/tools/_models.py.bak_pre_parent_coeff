@@ -619,8 +619,6 @@ class VAE(PerturbModelBase):
         de_align_direction_lambda=1e-3,
         de_align_direction_tau=0.5,
         de_align_n_bg=64,
-        synergy_l2_lambda=1e-3,
-        parent_scale_lambda=0,
         treat_effect_map=None,
         combinatorial=False,
         synergy=False,
@@ -677,16 +675,6 @@ class VAE(PerturbModelBase):
         self.de_align_direction_lambda = float(de_align_direction_lambda)
         self.de_align_direction_tau = float(de_align_direction_tau)
         self.de_align_n_bg = int(de_align_n_bg)
-        # Additivity prior on the combo shift: delta_ab = c_a*delta_a + c_b*delta_b + syn.
-        # Nothing else in the objective penalises syn != 0 or c != 1, so the model is
-        # free to inject non-additivity into genuinely additive combos -- it barely costs
-        # the ELBO, but it destroys the additive signature the GI classifier reads
-        # (additive_residual_norm / norm_ab_over_additive / model_fit), which is why
-        # true-additive combos get misread as interacting. These shrink the *total*
-        # delta_ab toward delta_a + delta_b -- and the total is exactly what the
-        # classifier sees, since it only ever gets the gene-space triple.
-        self.synergy_l2_lambda = float(synergy_l2_lambda)
-        self.parent_scale_lambda = float(parent_scale_lambda)
         # {(p0, p1): (gene_idx LongTensor (K,), target FloatTensor (K,))}, p1=-1 for singles.
         # Build with build_treat_effect_map(); must exclude held-out combo labels.
         self.treat_effect_map = treat_effect_map
@@ -727,26 +715,7 @@ class VAE(PerturbModelBase):
                 nn.LeakyReLU(),
                 nn.Linear(self.synergy_hidden, latent_dim),
             )
-            # Parent scales c_a, c_b: scalar (per-pair) reweightings of each
-            # parent's shift. Takes the *pair* [rho_self, rho_other] (2*latent_dim)
-            # rather than the antisymmetric (rho_a - rho_b) the old Linear(latent_dim, 1)
-            # used. That antisymmetry forced c_a = 1 + tanh(s), c_b = 1 - tanh(s), i.e.
-            # c_a + c_b == 2 identically -- the model could only shuffle weight between
-            # parents (dominance) and could NEVER scale the additive part up or down.
-            # Potentiation (both parents amplified) and suppression (both damped) were
-            # therefore structurally inexpressible via c and had to be contorted out of
-            # the free-form syn vector. Applying this layer to both orderings keeps the
-            # swap symmetry c_a(a,b) == c_b(b,a) while leaving the two scales free.
-            self.parent_coeff = nn.Linear(2 * latent_dim, 1, bias=False)
-            # Start ADDITIVE. Default Linear init gives score std ~1 over a 2*latent_dim
-            # input, so tanh(score) would be O(0.7) and c would span ~(0.3, 1.8) at
-            # step 0 -- i.e. the model would begin with large *random* non-additivity,
-            # which is exactly the prior we're trying to impose against. Shrinking the
-            # init puts score ~= 0 => c_a = c_b ~= 1, so delta_ab starts at delta_a +
-            # delta_b and the model must be *pushed* off additivity by the data (and pay
-            # parent_scale_lambda to stay there). Gradients still flow normally.
-            with torch.no_grad():
-                self.parent_coeff.weight.mul_(0.01)
+            self.parent_coeff = nn.Linear(latent_dim, 1, bias=False)
         else:
             self.syn_mlp = None
             self.parent_coeff = None
@@ -1011,20 +980,9 @@ class VAE(PerturbModelBase):
             ones = rho_a.new_ones((*rho_a.shape[:-1], 1))
             return ones, ones
 
-        # Free, symmetric parent scales. Scoring [rho_self, rho_other] in both
-        # orderings gives c_a(a, b) == c_b(b, a) (swap-equivariant) WITHOUT the
-        # old antisymmetry that pinned c_a + c_b to 2. Writing the layer weight as
-        # W = [W1; W2], the old form is exactly the special case W2 = -W1; with W1,
-        # W2 free, c_a and c_b are independent, so both can rise above 1
-        # (potentiation) or both fall below 1 (suppression).
-        # tanh keeps each scale in (0, 2): a parent can be damped or up to doubled,
-        # but can't flip sign or blow up. Deviation from 1 is penalised by
-        # parent_scale_lambda (see model()), so additive (c = 1) is the default and
-        # the model pays to move away from it.
-        ab = torch.cat([rho_a, rho_b], dim=-1)
-        ba = torch.cat([rho_b, rho_a], dim=-1)
-        c_a = 1.0 + torch.tanh(self.parent_coeff(ab))
-        c_b = 1.0 + torch.tanh(self.parent_coeff(ba))
+        score = self.parent_coeff(rho_a - rho_b)
+        c_a = 1.0 + torch.tanh(score)
+        c_b = 1.0 + torch.tanh(-score)
         return c_a, c_b
 
     # --- model/guide ---
@@ -1110,17 +1068,8 @@ class VAE(PerturbModelBase):
                 lin_shift_p = shift_a * (1.0 - combo_mask) + scaled_shift_p * combo_mask
                 syn_shift_p = syn_shift_p * combo_mask
                 parent_scale_penalty = (((c_a - 1.0) ** 2) + ((c_b - 1.0) ** 2)) * combo_mask
-                # Additivity prior. Own lambdas (NOT the gate's l2_lambda, which is
-                # already doing duty on the gate and couldn't be tuned independently).
-                # Both default to 0.0 => exactly the old behaviour, so this is a clean A/B.
-                # Summed over combo cells to match the ELBO's summed likelihood, keeping
-                # the prior/likelihood ratio invariant to batch size.
-                if self.synergy_l2_lambda > 0.0:
-                    pyro.factor("synergy_l2",
-                                -self.synergy_l2_lambda * syn_shift_p.pow(2).sum())
-                if self.parent_scale_lambda > 0.0:
-                    pyro.factor("parent_scale_l2",
-                                -self.parent_scale_lambda * parent_scale_penalty.sum())
+                # pyro.factor("synergy_l2", -self.l2_lambda * syn_shift_p.pow(2).sum())
+                # pyro.factor("parent_scale_l2", -self.l2_lambda * parent_scale_penalty.sum())
                 pyro.deterministic("syn_shift", syn_shift_p)
                 pyro.deterministic("parent_scale", torch.cat([c_a, c_b], dim=-1))
         else:
@@ -1674,7 +1623,8 @@ class VAE(PerturbModelBase):
         ``regress_gi_params`` (the *same* downstream GEARS uses), on plain
         log2-CPM deltas over all genes (no z-scoring).
 
-        Singles and doubles depend on ``mode``:
+        Doubles are always *generated* (control + learned combo shift), so GI is
+        OOD-capable. Singles depend on ``mode``:
 
         - ``mode='hybrid'`` (default): **observed** singles + generated doubles.
           Regressing the generated double against real singles keeps the GI
@@ -1685,11 +1635,6 @@ class VAE(PerturbModelBase):
         - ``mode='generated'``: singles *and* doubles generated (fully
           counterfactual — the strictly-fair-vs-GEARS setting, but limited by how
           non-additive the learned combo shift is).
-        - ``mode='observed'``: singles *and* doubles taken from the decoded
-          observed q(z) (mean-of-decode over each perturbation's own cells). No
-          counterfactual shift is applied anywhere, so this needs the combo cells
-          to be present in ``adata`` (not OOD-capable), but it measures GI purely
-          from the model's reconstruction of the real data.
 
         All three effect vectors share one baseline (population-average decoded
         NTC), so the additive residual is clean. Assumes a single condition.
@@ -1697,7 +1642,7 @@ class VAE(PerturbModelBase):
         Parameters
         ----------
         min_cells : minimum observed cells per perturbation to score a pair.
-        mode : 'hybrid', 'generated', or 'observed'.
+        mode : 'hybrid' or 'generated'.
         observed_singles : for hybrid, 'decoded' (decode of mean q(z) — stays in
             decoder space, consistent with the generated double) or 'raw' (mean
             of log-normed raw counts — preserves real single structure, which the
@@ -1712,8 +1657,8 @@ class VAE(PerturbModelBase):
         from sklearn.cluster import KMeans
         from .._configs import get_config
 
-        if mode not in ("hybrid", "generated", "observed"):
-            raise ValueError("mode must be 'hybrid', 'generated', or 'observed'.")
+        if mode not in ("hybrid", "generated"):
+            raise ValueError("mode must be 'hybrid' or 'generated'.")
         if observed_singles not in ("decoded", "raw"):
             raise ValueError("observed_singles must be 'decoded' or 'raw'.")
 
@@ -1769,8 +1714,7 @@ class VAE(PerturbModelBase):
             return wln(self._apply_shift(centroids, shift_tuple)) - baseline_ln
 
         z_obs = np.asarray(adata.obsm[obsm_key], dtype=np.float32) if (
-            (mode == "hybrid" and observed_singles == "decoded")
-            or mode == "observed") else None
+            mode == "hybrid" and observed_singles == "decoded") else None
 
         def obs_single(gene):
             mask = labels == str(gene)
@@ -1800,19 +1744,9 @@ class VAE(PerturbModelBase):
                     effects[canon(g)] = v
 
         combo_labels = sorted({canon(l) for l in set(labels) - {str(ntc_label)} if sep in str(l)})
-        canon_labels = np.array([canon(l) for l in labels]) if mode == "observed" else None
         for c in combo_labels:
             idxs = [name2idx[p] for p in c.split(sep) if p in name2idx]
             if len(idxs) != 2:
-                continue
-            if mode == "observed":
-                # decoded q(z) of the combo's own observed cells (mean-of-decode),
-                # matching the decoded-NTC baseline — no counterfactual shift.
-                cmask = canon_labels == c
-                if cmask.sum() == 0:
-                    continue
-                Z = torch.tensor(z_obs[cmask], dtype=torch.float32, device=device)
-                effects[c] = mean_ln_decode(Z) - baseline_ln
                 continue
             m_p = self._combine_pert_shifts(
                 all_shifts[[idxs[0]]], all_shifts[[idxs[1]]],

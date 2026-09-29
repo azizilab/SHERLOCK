@@ -1,0 +1,270 @@
+% =====================================================================
+%  Methods — model, inference and objective
+%  Updated against sherlock/tools/_models.py (VAE.model, VAE.guide,
+%  HardConcreteGate, QRCov) and sherlock/tools/_datasets.py
+%  (PerturbMatchingDataset.get_collate_fn).
+%
+%  CHANGES FROM THE PREVIOUS VERSION (all others left as they were):
+%   1. Latent transition is additive (z = z0 + Delta). The previous
+%      product-of-experts fusion, Eq. (eq:poe) and the diagonal scale W_s
+%      are removed; the transition now has a fixed isotropic variance.
+%   2. The background z0 of a perturbed cell is a MONTE CARLO draw: each
+%      perturbed cell is paired with a real NTC cell sampled with
+%      replacement from its condition's NTC pool, and z0 is the encoding of
+%      that cell. Previously z0 was encoded from a single background per
+%      cell without the resampling/dedup structure.
+%   3. The z0 prior is standard normal in all cases. The condition-dependent
+%      prior with learned embeddings (mu^(c), sigma^(c)) is no longer in the
+%      model; condition dependence enters through which NTC pool the paired
+%      background is drawn from.
+%   4. Added the gate row-repulsion regulariser, and the warm-up weights on
+%      the KL and gate-sparsity terms.
+%   5. Added the reconstruction weights lambda_ntc, lambda_p.
+%
+%  \eqref{eq:full-elbo} and the equation numbering are preserved so the
+%  combinatorial Methods subsection continues to reference them.
+% =====================================================================
+
+\section{Methods}
+
+\subsection{Notations}
+Let $G$ be the number of genes, $d$ the latent dimension, $P$ the number of perturbation labels, and
+$C$ the number of experimental conditions. For a cell $n=1,\dots,N$ we observe: (i) a perturbation
+label $p_n \in \{1,\dots,P\}$; (ii) optional condition label $c_n \in \{1,\dots,C\}$; (iii) a count
+vector $x^{(\mathrm{p})}_n \in \mathbb{N}^G$ under perturbation, together with a count vector
+$x^{(\mathrm{ntc})}_n \in \mathbb{N}^G$ from a non-target control (NTC) cell drawn uniformly at
+random, with replacement, from the NTC pool of cell $n$'s own condition. The NTC cell paired with
+$x^{(\mathrm{p})}_n$ therefore varies between epochs and serves as a Monte Carlo sample of the
+background population rather than as a fixed partner. Let $\theta \in \mathbb{R}^G_{>0}$ denote
+Negative Binomial (NB) total-count parameters, one per gene.
+
+\subsection{Generative model}
+VAE latent spaces lack identifiability without explicitly regularizing the generative process. In
+order to learn interpretable representations, we inject latent geometry structure via a low rank
+perturbation covariance and a sparsity gating mechanism.
+
+\subsubsection{Low-rank perturbation covariance and gated shifts}
+We introduce a latent matrix $A \in \mathbb{R}^{P \times d}$ that encodes perturbation-specific
+shifts in latent space. The rows of $A$ are Gaussian with shared row-covariance $\Sigma_P$:
+\begin{align}
+  A &\sim \Normal\!\big(0,\ \Sigma_P \otimes I_d\big),
+  &
+  \Sigma_P \;=\; L L^\top + \sigma^2 I_P,
+  \label{eq:row-cov}
+\end{align}
+where $L \in \mathbb{R}^{P \times r}$ comes from an orthonormal--scaled QR parametrization
+$L = Q \diag(s)$ with $Q^\top Q=I_r$ and $s \in \mathbb{R}^r_{\ge 0}$, and $\sigma>0$ is a learned
+scalar. The factorization is canonicalized at every evaluation by fixing the sign of each column of
+$Q$ and ordering the columns by decreasing $s$, which removes the sign and permutation ambiguity of
+the QR decomposition. More specifically,
+\[
+A \;=\; \mathrm{chol}(\Sigma_P)\,\rho,\qquad
+\rho \stackrel{\text{i.i.d.}}{\sim} \Normal(0, I_d)\ \ \text{row-wise}.
+\]
+
+To sparsify and select which latent coordinates respond to each perturbation, we use a HardConcrete
+gate $W \in [0,1]^{P\times d}$. For perturbation $p$ and latent coordinate $j$,
+\begin{align}
+  s_{pj} &\sim \text{Concrete}\big(\alpha_{pj}, \tau\big),\qquad
+  \bar{s}_{pj} \;=\; s_{pj}(\zeta-\gamma) + \gamma, \\
+  W_{pj} &= \mathrm{clip}(\bar{s}_{pj}, 0, 1)\; +\; \big(\bar{s}_{pj} - \mathrm{clip}(\bar{s}_{pj}, 0,1)\big)_{\text{stop-grad}},
+\end{align}
+with $\tau>0$ temperature and stretch parameters $\gamma<0<1<\zeta$; at evaluation the stochastic
+Concrete draw is replaced by its deterministic counterpart $s_{pj} = \sigma(\alpha_{pj}/\tau)$.
+The expected L0 usage per gate used in regularization is
+\begin{align}
+  \pi_{pj}\;\coloneqq\; \mathbb{E}[\1\{W_{pj}>0\}]
+  \;=\; \sigma\!\left(\alpha_{pj} - \tau \log\!\frac{-\gamma}{\zeta}\right),
+  \label{eq:expected-l0}
+\end{align}
+where $\sigma(\cdot)$ is the logistic sigmoid and $\alpha_{pj}$ is the learnable logit.
+
+\subsubsection{Background state and latent transition}
+Each cell has two latent Gaussian variables:
+\begin{itemize}
+\item A background latent $z^0_n \in \mathbb{R}^d$, modeling the unperturbed cellular state, with an
+isotropic prior
+\begin{align}
+  z^0_n \,\sim\, \Normal(0, I_d).
+\end{align}
+Condition dependence is not carried by this prior. It enters instead through the pairing described
+in the Notations: the NTC cell whose encoding supplies $z^0_n$ is drawn from cell $n$'s own
+condition, so the background is a sample from the appropriate control population by construction.
+\item A perturbed latent $z_n \in \mathbb{R}^d$ obtained by displacing the background with the gated
+shift of the assigned perturbation. Define
+\[
+\Delta_{n} \;=\; W_{p_n} \odot A_{p_n}\ \in \mathbb{R}^d,
+\]
+and take the transition to be additive with fixed isotropic variance $\sigma_z^2$:
+\begin{align}
+  z_n \;\sim\; \Normal\!\big(z^0_n + \Delta_n,\ \sigma_z^2 I_d\big).
+  \label{eq:linear-shift}
+\end{align}
+\end{itemize}
+The gate enters only through $\Delta_n$: it selects and scales the coordinates a perturbation moves
+and leaves $z^0_n$ itself unchanged, so background variation is preserved along the coordinates a
+perturbation does not act on. NTC cells receive $\Delta_n = 0$ and hence $z_n \approx z^0_n$.
+
+\subsubsection{Monte Carlo background sampling}
+Because $z^0_n$ for a perturbed cell is the encoding of a randomly drawn NTC cell rather than of
+$x^{(\mathrm{p})}_n$ itself, each minibatch supplies a fresh background draw for every perturbed
+cell, so that over training the expectation in the objective is taken over the control population as
+a whole rather than over any one background state. Sampling with replacement means one NTC cell may be
+paired with several perturbed cells within a batch. The duplicated rows are exact copies, so before
+evaluating the background reconstruction term we reduce the batch's NTC rows to the distinct cells
+actually drawn; this keeps the NTC likelihood from being counted once per pairing and keeps the cost
+of the background decode independent of the perturbed batch size. The same reduction is applied in
+the model and in the guide so that the two agree on the number and order of background rows.
+
+\subsubsection{NB decoder and auxiliary classifier}
+Given a decoder $g_\phi:\mathbb{R}^d \to \mathbb{R}^G$, let
+\begin{align}
+  \ell_n &= g_\phi(z_n)\in\mathbb{R}^G, &
+  \pi_n &= \softmax(\ell_n)\in\Delta^{G-1}, &
+  \mu_n &= \big(\textstyle\sum_{g=1}^G x^{(\mathrm{p})}_{ng}\big)\,\pi_n.
+\end{align}
+With gene-wise NB total-count parameters $\theta \in \mathbb{R}^G_{>0}$,
+\begin{align}
+  x^{(\mathrm{p})}_n \sim \NB\!\big(\theta,\ \log(\mu_n{+}\varepsilon)-\log\theta\big),
+\end{align}
+where $\varepsilon>0$ is a small stabilizer.
+
+Analogously, the background counts use $z^0_n$:
+\begin{align}
+  \tilde{\ell}_n &= g_\phi(z^0_n),\quad
+  \tilde{\pi}_n = \softmax(\tilde{\ell}_n),\quad
+  \tilde{\mu}_n = \big(\textstyle\sum_{g=1}^G x^{(\mathrm{ntc})}_{ng}\big)\,\tilde{\pi}_n, \\
+  x^{(\mathrm{ntc})}_n \sim \NB\!\big(\theta,\ \log(\tilde{\mu}_n{+}\varepsilon)-\log\theta\big).
+\end{align}
+The two reconstruction terms carry separate weights $\lambda_{\mathrm{ntc}}$ and $\lambda_{p}$,
+allowing the background and perturbed likelihoods to be balanced independently of their differing
+row counts.
+
+An auxiliary classifier $h_\psi:\mathbb{R}^d\to\mathbb{R}^P$ predicts the perturbation label from
+$z_n$:
+\begin{align}
+  y_n \mid z_n \;\sim\; \mathrm{Cat}\!\left(\softmax(h_\psi(z_n))\right),
+\end{align}
+and the model includes a cross-entropy term encouraging $y_n=p_n$.
+
+\paragraph{Priors and stabilizers.}
+\begin{itemize}
+\item $\rho$ prior: for each row $p$, $\rho_p \sim \Normal(0,I_d)$ and $A$ is formed via
+\eqref{eq:row-cov}.
+\item NB totals: $\theta=\softplus(\vartheta)+10^{-3}$ with free $\vartheta\in\mathbb{R}^G$.
+\item Ridge/stabilizers implemented as \emph{log-density factors}:
+  \begin{align}
+    \log p(\sigma) &\propto -\tfrac12 (\sigma/0.05)^2, \\
+    \log p(L) &\propto -\lambda_{\mathrm{cov}}\|L\|_F^2,
+  \end{align}
+  with $\lambda_{\mathrm{cov}}>0$.
+\end{itemize}
+
+\subsection{Variational Inference}
+We use amortized mean-field variational families:
+\begin{align}
+  q(\rho) &= \prod_{p=1}^P \Normal\!\big(\rho_p \mid m_p,\ I_d\big),
+  && m = f_\eta(\text{emb}_p)\in\mathbb{R}^{P\times d},\\
+  q(z^0 \mid x^{(\mathrm{ntc})}) &= \prod_{n=1}^N \Normal\!\big(z^0_n \mid \mu^0_n,\ \diag(\sigma^{0\,2}_n)\big),
+  && [\mu^0_n,\log\sigma^{0\,2}_n] = e_{\phi_0}(x^{(\mathrm{ntc})}_n),\\
+  q(z \mid x^{(\mathrm{p})}) &= \prod_{n=1}^N \Normal\!\big(z_n \mid \mu_n^q,\ \diag(\sigma^{q\,2}_n)\big),
+  && [\mu^q_n,\log\sigma^{q\,2}_n] = e_{\phi}(x^{(\mathrm{p})}_n).
+\end{align}
+Here $f_\eta$ maps the learned perturbation embeddings to row means for $\rho$, while
+$e_{\phi_0},e_\phi$ are separate encoder networks for $z^0$ and $z$; keeping them separate means the
+perturbed-cell encoder receives reconstruction and classification gradients without the background
+encoder's KL term acting on the same weights. For a perturbed cell, $e_{\phi_0}$ is applied to the
+paired NTC cell rather than to $x^{(\mathrm{p})}_n$, so the posterior background is an encoding of
+real control data; for an NTC cell, $z^0_n$ and $z_n$ coincide and both are given by $e_{\phi_0}$.
+Gates $W$ are used \emph{inside the model}; their gradients flow through the Hard Concrete
+reparameterization. The expected L0 in \eqref{eq:expected-l0} provides a differentiable surrogate for
+sparsity.
+
+\subsection{ELBO and regularization}
+Let $x=(x^{(\mathrm{p})}_{1:N},x^{(\mathrm{ntc})}_{1:N})$ and $y=p_{1:N}$.
+The evidence lower bound (ELBO) augmented with stabilizers and gating regularizers is
+\begin{align}
+  \mathcal{L}
+  &= \E_{q}\Big[
+        \underbrace{\lambda_{p}\log p_\phi\big(x^{(\mathrm{p})}\mid z,\theta\big)}_{\text{NB recon (perturbed)}}
+      + \underbrace{\lambda_{\mathrm{ntc}}\log p_\phi\big(x^{(\mathrm{ntc})}\mid z^0,\theta\big)}_{\text{NB recon (background)}}
+      + \underbrace{\log p_\psi\big(y\mid z\big)}_{\text{aux CE}}
+\\[-2pt]&\qquad\qquad
+      + \underbrace{\log p(A\mid L,\sigma)}_{\text{low-rank row-Gaussian}}
+      + \underbrace{\log p(\sigma)}_{\text{half-normal energy}}
+      + \underbrace{\log p(L)}_{\text{cov ridge}}
+      + \underbrace{\log p(\theta)}_{\text{(implicit via parameterization)}}
+\\[-2pt]&\qquad\qquad
+      + \underbrace{\log p(z \mid z^0, W, A)}_{\text{additive transition, Eq.~\eqref{eq:linear-shift}}}
+      + \underbrace{\log p(z^0)}_{\text{standard Gaussian}}
+    \Big]
+\\&\quad
+  - \beta\Big[
+    \underbrace{\KL\!\big(q(\rho)\,\|\,p(\rho)\big)}_{\text{row means}}
+  + \underbrace{\KL\!\big(q(z^0\!\mid x^{(\mathrm{ntc})})\,\|\,p(z^0)\big)}_{\text{background}}
+  + \underbrace{\KL\!\big(q(z\!\mid x^{(\mathrm{p})})\,\|\,p(z\mid z^0,W,A)\big)}_{\text{perturbed}}
+  \Big]
+\\&\quad
+  + \underbrace{\mathcal{R}_{\text{gates}}(W;A)}_{\text{structured sparsity/usage}}
+  \ +\ \text{const}.
+  \label{eq:full-elbo}
+\end{align}
+The KL terms are scaled by an annealing weight $\beta$ that is ramped from $0$ to $1$ over the first
+epochs of training.
+
+\paragraph{Gating regularizers.}
+The model adds the following \emph{log-factor} terms, summed over cells or perturbations as in the
+implementation:
+\begin{align}
+  \mathcal{R}_{\text{gates}}
+  &= \kappa\Big(-\lambda_{0}\,\sum_{p,j}\pi_{pj}
+   \;-\; \lambda_{1}\,\big\|\sigma(\alpha)\big\|_{1}
+   \;-\; \lambda_{2}\,\sum_{p,j} \pi_{pj}\,A_{pj}^2\Big)
+\\&\quad
+   +\ \lambda_{H}\,\underbrace{\Big(-\textstyle\sum_{j=1}^d \bar{p}_j \log(\bar{p}_j+\varepsilon)\Big)}_{\text{column entropy}}
+   \;-\; \lambda_{R}\,\underbrace{\frac{1}{P(P-1)}\sum_{p \neq p'} \Big(\tfrac{W_p^\top W_{p'}}{\|W_p\|\,\|W_{p'}\|}\Big)^{2}}_{\text{row repulsion}},
+  \qquad
+  \bar{p}_j \;=\; \frac{\sum_{p=1}^P \pi_{pj}}{\sum_{p=1}^P\sum_{j'=1}^d \pi_{pj'}}.
+\end{align}
+Here $\pi_{pj}$ is \eqref{eq:expected-l0}. The first term is an L0 surrogate encouraging sparsity; the
+second is an L1 on gate probabilities; the third discourages large gated shifts in proportion to
+expected usage; the fourth promotes balanced usage across latent coordinates via entropy of the
+column-wise normalized usage; and the last penalizes the squared cosine similarity between the gate
+rows of distinct perturbations, encouraging different perturbations to occupy different latent
+coordinates. The sparsity terms carry a weight $\kappa$ that is held at zero until KL annealing has
+finished and is then ramped to one, so that gates are not driven to collapse before the latent space
+has formed. Coefficients $\lambda_0,\lambda_1,\lambda_2,\lambda_H,\lambda_R$ are tunable
+hyperparameters.
+
+\paragraph{Auxiliary cross-entropy.}
+With logits $h_\psi(z_n)$ and labels $p_n$, the contribution is
+\[
+\log p_\psi(y\mid z) \equiv -\lambda_{\mathrm{CE}}\sum_{n=1}^N \mathrm{CE}\!\left(\softmax(h_\psi(z_n)),\,p_n\right),
+\]
+which appears as a factor in the expectation in \eqref{eq:full-elbo}.
+
+\paragraph{Closed-form terms}
+The $\KL$ terms involving Gaussians have closed forms:
+\begin{align}
+\KL\big(\Normal(\mu^q,\diag(\sigma^{q\,2}))\,\|\,\Normal(\mu^p,\diag(\sigma^{p\,2}))\big)
+=\tfrac12\sum_{j=1}^d \Big[
+\log \frac{\sigma^{p\,2}_j}{\sigma^{q\,2}_j}
++\frac{\sigma^{q\,2}_j + (\mu^q_j-\mu^p_j)^2}{\sigma^{p\,2}_j}-1\Big].
+\end{align}
+For $q(\rho)$ vs.\ $p(\rho)=\Normal(0,I)$, $\mu^p=0$, $\sigma^{p\,2}_j=1$.
+For $q(z^0)$ vs.\ $p(z^0)=\Normal(0,I)$, likewise.
+For $q(z)$ vs.\ the transition prior, $\mu^p = z^0_n + \Delta_n$ and
+$\sigma^{p\,2}_j = \sigma_z^2$ from \eqref{eq:linear-shift}.
+
+\paragraph{NB likelihood.}
+With gene-wise total-counts $\theta_g$, the decoder uses logits
+$\log(\mu_{ng}{+}\varepsilon)-\log \theta_g$; this yields the standard NB log-probability for integer
+counts. Gradients flow through $\mu_n$ (via $g_\phi$) and through $\theta$.
+
+\paragraph{Optional components.}
+Two further terms are implemented and disabled in all experiments reported here. A gene-space
+alignment loss supervises the counterfactual path directly, applying the learned shift to the encoded
+NTC backgrounds and penalizing the squared deviation of the decoded effect from the observed
+differential-expression profile. A Gene Ontology prior replaces the zero mean of $p(\rho)$ with a
+learned embedding of each perturbation's annotated terms, turning the row-wise KL into shrinkage
+toward an annotation-informed mean rather than toward the origin.

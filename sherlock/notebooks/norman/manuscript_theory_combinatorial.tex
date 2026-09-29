@@ -1,0 +1,110 @@
+% =====================================================================
+%  Theory — combinatorial extension
+%  Insert into \subsection{Causal Inference of Perturbation Effect},
+%  immediately AFTER the Theorem (Identifiability of SHERLOCK Causal
+%  Estimand) and its proof, before the paragraph beginning "While our
+%  framework establishes theoretical identifiability...".
+%
+%  PREAMBLE ADDITIONS REQUIRED — your \newtheorem list has theorem,
+%  lemma, definition, proposition and assumption but neither of these:
+%     \newtheorem{corollary}[theorem]{Corollary}
+%     \newtheorem{remark}{Remark}
+%
+%  Also add \label{sec:causal} to the subsection heading; the Methods
+%  section references it.
+%
+%  Referenced from: Results 2.5/2.6 and Methods \ref{sec:gi-effects}
+%  via \ref{cor:gi-id}. Compositional transfer is a remark, not a formal
+%  assumption — the framework's assumption count stays at two.
+% =====================================================================
+
+\subsubsection{Extension to combinatorial perturbations}
+
+The Theorem above is stated for an arbitrary set of target perturbations. To apply it to
+combinations we first make explicit that a combination is an intervention in $\mathcal{M_{SH}}$, and
+that the quantification in Lemma~\ref{lem:scm-id} ranges over the perturbations the assay actually
+contains.
+
+\begin{definition}[Combinatorial interventions and observed support]\label{def:combo-int}
+    Let $\mathcal{G}$ denote the set of individual perturbation targets. We take the perturbation
+    variable to be the pair $P = (P_1, P_2)$, with $P_2 = \varnothing$ for singly-perturbed cells,
+    so that the latent mechanism reads $Z = f_p(Z^0, P_1, P_2, \epsilon^z)$. A combination of
+    $a, b \in \mathcal{G}$ is the joint intervention $\doop(P_1 = a, P_2 = b)$, which is admissible
+    under Definition~2 since that definition applies to any $X \subseteq V$; we abbreviate it
+    $\doop(P = ab)$ and write $f_{ab}(\cdot) := f_p(\cdot\,, a, b, \cdot)$ for the induced mechanism.
+    We write
+    \[
+      \mathcal{P}_{\mathrm{obs}} \;=\; \{p : \Pr(P = p) > 0\}
+    \]
+    for the set of perturbations, single or combinatorial, appearing in the data, and take the
+    quantification $\forall p_i \in \mathcal{P}$ in Lemma~\ref{lem:scm-id} to range over
+    $\mathcal{P}_{\mathrm{obs}}$.
+\end{definition}
+
+\begin{corollary}[Identifiability of combinatorial interaction estimands]\label{cor:gi-id}
+    Let $a, b \in \mathcal{G}$ and suppose Assumptions~\ref{ass:latent-id} and \ref{ass:z-id} hold
+    with $a, b, ab \in \mathcal{P}_{\mathrm{obs}}$. Then
+    \begin{enumerate}
+        \item the joint counterfactual distribution $p^{\mathcal{M_{SH}}}(X_a, X_b, X_{ab})$ is
+              uniquely identifiable from the observational distribution $p(X, P)$;
+        \item the marginal interventional means $\mu_q = \mathbb{E}[X_q]$ for
+              $q \in \{a, b, ab, \varnothing\}$ are identifiable; and
+        \item every genetic-interaction metric computed from the effect vectors
+              $\delta_q = \mu_q - \mu_{\varnothing}$ is identifiable.
+    \end{enumerate}
+\end{corollary}
+
+\begin{proof}
+    (i) By Definition~\ref{def:combo-int}, $ab$ is an intervention in $\mathcal{M_{SH}}$, and
+    $a, b, ab \in \mathcal{P}_{\mathrm{obs}}$, so the hypothesis of Lemma~\ref{lem:scm-id} is
+    satisfied for each: the mechanisms $f_a, f_b, f_{ab}$ and the inverse decoder
+    $g = (f^X)^{-1}$ are identified up to the common permutation and scaling $\Pi\Lambda$ fixed by
+    the Lemma. The Theorem then applies verbatim with $\mathbb{P} = \{a, b, ab\}$ and $k = 3$.
+
+    (ii) Marginals of an identified joint distribution are identified; explicitly, taking $k = 1$ in
+    the Theorem's final expression gives
+    $\mu_q = \int_{\mathcal{X}} \mathbb{E}\big[X \mid f_q(g(x'))\big]\, p(x')\, dx'$, in which every
+    term is identified by Lemma~\ref{lem:scm-id} and the observational marginal $p(X)$.
+
+    (iii) Each $\delta_q$ is a difference of identified means, and the Theil--Sen coefficients and
+    every derived metric are fixed measurable functions of $(\delta_a, \delta_b, \delta_{ab})$;
+    identification is preserved under measurable transformation. Since these quantities are defined
+    in gene space, they are moreover invariant to the residual $(\Pi, \Lambda)$ ambiguity of
+    Assumption~\ref{ass:z-id}.
+\end{proof}
+
+\begin{remark}[Estimation]\label{rem:estimation}
+    Part (ii) concerns \emph{marginal} interventional means, so any consistent estimator of those
+    means identifies the metrics of part (iii). Under randomised perturbation assignment,
+    $\mathbb{E}[X \mid P = q] - \mathbb{E}[X \mid P = \varnothing]$ is such an estimator, and it is
+    the one used in our main analysis. The shared-background construction of the Theorem is required
+    only for per-cell counterfactual contrasts---the distribution of individual treatment effects, or
+    the dependence between potential outcomes within a cell---which the interaction metrics do not
+    use.
+\end{remark}
+
+\begin{remark}[Non-identifiability of the interaction decomposition]\label{rem:decomp}
+    Corollary~\ref{cor:gi-id} identifies the total mechanism $f_{ab}$, not its decomposition into
+    parent scaling and interaction residual. The residual is unconstrained in direction, so the map
+    $(c_a, c_b, s) \mapsto \Delta_{ab}$ is not injective and the three components are not separately
+    identified; the quadratic penalties of the training objective select among observationally
+    equivalent decompositions. All reported quantities depend on $\Delta_{ab}$ alone, and we do not
+    interpret $c_a$, $c_b$ or $s$ individually.
+\end{remark}
+
+Corollary~\ref{cor:gi-id} requires $ab \in \mathcal{P}_{\mathrm{obs}}$. For a combination outside the
+observed support the hypothesis of Lemma~\ref{lem:scm-id} is vacuous at $ab$: no observational
+conditional constrains $f_{ab}$, and two models agreeing on all observables may disagree there.
+Identification therefore cannot be recovered, and any prediction for such a combination rests on the
+parametric structure of the mechanism rather than on the identification results above.
+
+\begin{remark}[Compositional transfer]\label{rem:transfer}
+    Let $\Delta_{ab} = c_a(\rho_a,\rho_b)\Delta_a + c_b(\rho_a,\rho_b)\Delta_b + s(\rho_a,\rho_b)$ be
+    the combinatorial mechanism, in which the maps $c$ and $s$ are shared across all pairs. A
+    prediction for $ab \notin \mathcal{P}_{\mathrm{obs}}$ amounts to taking the maps fitted on
+    $\mathcal{P}_{\mathrm{obs}}$ to describe the mechanism of pairs outside it, so that $\Delta_{ab}$
+    evaluated at $(\rho_a, \rho_b)$ is the mechanism of $ab$ for any $a, b \in \mathcal{G}$.  It is not implied by
+    Assumptions~\ref{ass:latent-id} and \ref{ass:z-id},  and therefore we make no identification claim for combinations
+    outside $\mathcal{P}_{\mathrm{obs}}$. It is instead an empirical property of the fitted model, and
+    one that can be measured. 
+\end{remark}
