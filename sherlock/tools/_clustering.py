@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from scipy.cluster.hierarchy import linkage, fcluster, dendrogram
 from matplotlib import pyplot as plt
 import numpy as np

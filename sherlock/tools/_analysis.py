@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 from statsmodels.stats.multitest import multipletests
@@ -59,7 +61,8 @@ def ev_sig(
 
     Side effects
     ------------
-    Stores into:
+    Stores into::
+
         adata.uns[uns_key][store_key][cond_idx] = {
             "pvals": (P, G) array,
             "qvals": (P, G) array,

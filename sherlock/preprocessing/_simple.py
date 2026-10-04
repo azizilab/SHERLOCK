@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from anndata import AnnData
 from .._configs import get_config
 from typing import Any, Dict, List, Literal, Optional

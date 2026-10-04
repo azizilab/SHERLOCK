@@ -287,6 +287,7 @@ def plot_ev_sig(
     pairs for a given condition.
 
     Steps:
+
     1. Read EV + pvals/qvals from adata.uns[uns_key][store_key][cond_idx].
     2. Build long DataFrame (pert, gene, EV, pval, qval).
     3. Filter to qval < alpha.
@@ -294,8 +295,9 @@ def plot_ev_sig(
     5. Retain only perts that have at least min_sig_genes genes passing.
     6. Pivot to pert × gene matrix of q-values.
     7. Plot -log10(q) as either:
-        - seaborn.clustermap with optional row/col clustering, or
-        - plain imshow heatmap with rows sorted by max signal.
+
+       - seaborn.clustermap with optional row/col clustering, or
+       - plain imshow heatmap with rows sorted by max signal.
 
     Parameters
     ----------
