@@ -38,9 +38,12 @@ def ev_sig(
     Null per (p,g): gene g is not a special target of perturbation p,
     so EV[p, g] comes from the background EV distribution of row p.
 
-    We approximate the row-wise null as Normal:
+    We approximate the row-wise null as Normal::
+
         z_{p,g} = (EV_{p,g} - center_p) / scale_p
-    using robust center/scale (median + MAD), then
+
+    using robust center/scale (median + MAD), then::
+
         p_{p,g} = P(Z >= z_{p,g}) under N(0,1).
 
     FDR control is applied *per perturbation* (row-wise BH), yielding q-values.
@@ -59,9 +62,9 @@ def ev_sig(
     store_key : str, default "ev_results"
         Sub-key inside adata.uns[uns_key] where results are stored.
 
-    Side effects
-    ------------
-    Stores into::
+    Notes
+    -----
+    The result is also stored in::
 
         adata.uns[uns_key][store_key][cond_idx] = {
             "pvals": (P, G) array,
