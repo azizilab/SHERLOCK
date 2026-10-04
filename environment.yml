@@ -1,0 +1,20 @@
+# Conda environment for SHERLOCK (tested with Python 3.10 and PyTorch 2.x + CUDA 12).
+#
+#   conda env create -f environment.yml
+#   conda activate sherlock
+#
+# The final `pip install -e .[tutorials]` line installs SHERLOCK itself from this
+# checkout together with the extras used by the tutorials. For a CPU-only machine,
+# replace `pytorch-cuda=12.1` with `cpuonly`.
+name: sherlock
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch>=2.1
+  - pytorch-cuda=12.1
+  - pip:
+      - -e .[tutorials]

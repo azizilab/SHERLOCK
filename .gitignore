@@ -16,3 +16,11 @@ sherlock/notebooks/norman/genetic_interactions.csv
 *.pdf
 *.bak*
 .claude/
+
+# Packaging and docs builds
+build/
+dist/
+*.egg-info/
+docs/_build/
+docs/api/generated/
+.ipynb_checkpoints/

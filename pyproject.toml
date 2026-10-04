@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# The import name is ``sherlock``; ``sherlock`` is already taken on PyPI, so the
+# distribution is published as ``sherlock-perturb``.
+name = "sherlock-perturb"
+version = "0.1.0"
+description = "SHERLOCK: structured representation learning and causal inference of downstream perturbation effects in single-cell data"
+readme = "README.md"
+license = "CC-BY-NC-ND-4.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Mingxuan Zhang" },
+    { name = "Joshua D. Myers" },
+    { name = "Lingting Shi" },
+    { name = "Azizi Lab" },
+]
+requires-python = ">=3.10"
+keywords = ["single-cell", "perturbation", "Perturb-seq", "causal inference", "variational autoencoder"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "torch>=2.1",
+    "pyro-ppl>=1.9",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "scikit-learn>=1.3",
+    "anndata>=0.10",
+    "scanpy>=1.10",
+    "statsmodels>=0.14",
+    "matplotlib>=3.7",
+    "seaborn>=0.13",
+    "networkx>=3.0",
+    "dcor>=0.6",
+    "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+# Baseline models used in the benchmarks: cVAE, sVAE, contrastiveVI and scGen
+# (scvi-tools), and GEARS for combinatorial perturbations.
+benchmarks = ["scvi-tools>=1.1", "cell-gears>=0.1.2"]
+# Extras used by the tutorials: Leiden clustering, UMAP of GI metrics, gene-set enrichment.
+tutorials = ["leidenalg>=0.10", "umap-learn>=0.5", "gseapy>=1.1", "jupyterlab", "ipykernel"]
+docs = ["sphinx>=7,<8", "furo", "nbsphinx", "sphinx-copybutton", "ipython"]
+test = ["pytest"]
+all = ["sherlock-perturb[benchmarks,tutorials,test]"]
+
+[project.urls]
+Homepage = "https://github.com/azizilab/SHERLOCK"
+Documentation = "https://sherlock-perturb.readthedocs.io"
+Source = "https://github.com/azizilab/SHERLOCK"
+Reproducibility = "https://github.com/azizilab/SHERLOCK_Reproducibility"
+
+[tool.setuptools.packages.find]
+include = ["sherlock*"]
+# Analysis notebooks, datasets and cached results live inside the source tree
+# for development but are not part of the installed package.
+exclude = ["sherlock.notebooks*", "sherlock.results*", "sherlock.benchmark*", "sherlock.datasets.gbm*",
+           "sherlock.datasets.norman*", "sherlock.datasets.raefish*"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

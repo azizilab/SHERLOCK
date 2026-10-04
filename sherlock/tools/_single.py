@@ -26,9 +26,6 @@ from torch.utils.data import DataLoader
 
 from ._datasets import PerturbMatchingDataset, PerturbSimpleDataset
 from ._models import VAE, build_treat_effect_map, build_go_term_map
-from ._cvae import cVAE
-from ._svae import sVAE
-from ._scgen import SCGENModel
 from ._trainers import VAETrainer, cVAETrainer, sVAETrainer, SCGENTrainer
 from .._configs import get_config
 
@@ -212,6 +209,8 @@ def run(
             plt.show()
 
     elif key == "cvae":
+        from ._cvae import cVAE  # needs scvi-tools (benchmarks extra)
+
         p_key     = get_config("pert_key")
         ntc_label = get_config("ntc_label")
         combinatorial = kwargs.get("combinatorial", False)
@@ -260,6 +259,8 @@ def run(
         best_model, param_store = trainer.fit()
 
     elif key == "svae":
+        from ._svae import sVAE  # needs scvi-tools (benchmarks extra)
+
         p_key     = get_config("pert_key")
         ntc_label = get_config("ntc_label")
         combinatorial = kwargs.get("combinatorial", False)
@@ -401,6 +402,8 @@ def run(
         param_store = None
 
     elif key == "scgen":
+        from ._scgen import SCGENModel  # needs scvi-tools (benchmarks extra)
+
         p_key     = get_config("pert_key")
         ntc_label = get_config("ntc_label")
         combinatorial = kwargs.pop("combinatorial", False)
