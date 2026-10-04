@@ -1,0 +1,16 @@
+# Documentation build dependencies (used by ReadTheDocs and local builds).
+# The deep-learning and single-cell stack is mocked in conf.py
+# (autodoc_mock_imports), so only Sphinx, the theme and lightweight runtime
+# dependencies are installed here.
+sphinx==7.4.7
+furo
+nbsphinx
+sphinx-copybutton
+ipython          # provides the `ipython3` Pygments lexer nbsphinx uses for code cells
+
+# Lightweight runtime dependencies kept real for autodoc signatures / intersphinx:
+numpy
+pandas
+scipy
+matplotlib
+networkx

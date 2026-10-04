@@ -1,0 +1,89 @@
+combination,genetic_interaction
+CBL+TGFBR2,neomorphic
+KLF1+TGFBR2,neomorphic
+MAP2K6+SPI1,neomorphic
+SAMD1+TGFBR2,neomorphic
+TGFBR2+CBARP,neomorphic
+TGFBR2+ETS2,neomorphic
+CBL+UBASH3A,neomorphic
+CEBPE+KLF1,neomorphic
+DUSP9+MAPK1,neomorphic
+FOSB+PTPN12,neomorphic
+PLK4+STIL,neomorphic
+PTPN12+OSR2,neomorphic
+ZC3HAV1+CEBPE,neomorphic
+AHR+KLF1,epistasis
+MAPK1+TGFBR2,epistasis
+TGFBR2+IGDCC3,epistasis
+TGFBR2+PRTG,epistasis
+UBASH3B+OSR2,epistasis
+DUSP9+ETS2,epistasis
+KLF1+CEBPA,epistasis
+MAP2K6+IKZF3,epistasis
+ZC3HAV1+CEBPA,epistasis
+CNN1+UBASH3A,potentiation
+ETS2+MAP7D1,potentiation
+FEV+CBFA2T3,potentiation
+FEV+ISL2,potentiation
+FEV+MAP7D1,potentiation
+PTPN12+UBASH3A,potentiation
+BPGM+SAMD1,approximately additive
+CEBPB+MAPK1,approximately additive
+CEBPB+OSR2,approximately additive
+DUSP9+PRTG,approximately additive
+FOSB+OSR2,approximately additive
+IRF1+SET,approximately additive
+MAP2K3+ELMSAN1,approximately additive
+MAP2K6+ELMSAN1,approximately additive
+POU3F2+FOXL2,approximately additive
+RHOXF2B+SET,approximately additive
+SAMD1+PTPN12,approximately additive
+SAMD1+UBASH3B,approximately additive
+SAMD1+ZBTB1,approximately additive
+SGK1+TBX2,approximately additive
+TBX3+TBX2,approximately additive
+ZBTB10+SNAI1,approximately additive
+CDKN1C+CDKN1A,redundant
+MAP2K3+MAP2K6,redundant
+CEBPB+CEBPA,redundant
+CEBPE+CEBPA,redundant
+CEBPE+SPI1,redundant
+ETS2+MAPK1,redundant
+FOSB+CEBPE,redundant
+FOXA3+FOXA1,redundant
+CBL+CNN1,synergy (similar phenotype)
+CBL+PTPN12,synergy (similar phenotype)
+CBL+PTPN9,synergy (similar phenotype)
+CBL+UBASH3B,synergy (similar phenotype)
+FOXA3+FOXL2,synergy (similar phenotype)
+FOXA3+HOXB9,synergy (similar phenotype)
+FOXL2+HOXB9,synergy (similar phenotype)
+UBASH3B+CNN1,synergy (similar phenotype)
+UBASH3B+PTPN12,synergy (similar phenotype)
+UBASH3B+PTPN9,synergy (similar phenotype)
+UBASH3B+ZBTB25,synergy (similar phenotype)
+CEBPB+PTPN12,suppression
+CEBPE+CNN1,suppression
+CEBPE+PTPN12,suppression
+CNN1+MAPK1,suppression
+ETS2+CNN1,suppression
+ETS2+IGDCC3,suppression
+ETS2+PRTG,suppression
+FOSB+UBASH3B,suppression
+IGDCC3+MAPK1,suppression
+LYL1+CEBPB,suppression
+MAPK1+PRTG,suppression
+PTPN12+SNAI1,suppression
+AHR+FEV,synergy (dissimilar phenotype)
+DUSP9+SNAI1,synergy (dissimilar phenotype)
+FOXA1+FOXF1,synergy (dissimilar phenotype)
+FOXA1+FOXL2,synergy (dissimilar phenotype)
+FOXA1+HOXB9,synergy (dissimilar phenotype)
+FOXF1+FOXL2,synergy (dissimilar phenotype)
+FOXF1+HOXB9,synergy (dissimilar phenotype)
+FOXL2+MEIS1,synergy (dissimilar phenotype)
+IGDCC3+ZBTB25,synergy (dissimilar phenotype)
+POU3F2+CBFA2T3,synergy (dissimilar phenotype)
+PTPN12+ZBTB25,synergy (dissimilar phenotype)
+SNAI1+DLX2,synergy (dissimilar phenotype)
+SNAI1+UBASH3B,synergy (dissimilar phenotype)

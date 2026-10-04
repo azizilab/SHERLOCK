@@ -1,0 +1,12 @@
+/* Minor furo tweaks for SHERLOCK. */
+
+:root {
+    --color-brand-primary: #2166ac;
+    --color-brand-content: #2166ac;
+}
+
+/* Keep wide API signatures and dataframe outputs readable. */
+div.nbinput div[class*="highlight"],
+div.nboutput div[class*="highlight"] {
+    overflow-x: auto;
+}
