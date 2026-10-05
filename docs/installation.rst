@@ -72,7 +72,7 @@ The two public datasets used in the tutorials are downloaded on first use:
 
 Files are stored in ``$SHERLOCK_DATA_DIR`` (default ``~/.cache/sherlock``). The
 processed versions of the other datasets analysed in the manuscript are available
-from the corresponding authors on request.
+from the first authors on request.
 
 Conda
 -----

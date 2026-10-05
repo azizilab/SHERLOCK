@@ -106,7 +106,7 @@ adata = slk.datasets.norman()     # ~1.7 GB
 Files are stored in `$SHERLOCK_DATA_DIR` (default `~/.cache/sherlock`); pass `path=` to read a
 local copy instead. The processed versions of the other datasets analysed in the manuscript
 (Perturb-RAEFISH, EGFR inhibitor screen, glioblastoma kinome and kinase-inhibitor screens) are
-available from the corresponding authors on request.
+available from the first authors on request.
 
 ## Repository structure
 

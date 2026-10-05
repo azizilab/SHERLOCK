@@ -25,7 +25,7 @@ available, so the analysis can be followed without retraining.
 
 The Replogle and Norman datasets are downloaded by ``slk.datasets.replogle()``
 and ``slk.datasets.norman()``; the glioblastoma dataset is available from the
-corresponding authors on request.
+first authors on request.
 
 .. toctree::
    :maxdepth: 1
