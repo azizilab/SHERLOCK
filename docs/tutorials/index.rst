@@ -1,23 +1,35 @@
 Tutorials
 =========
 
-Each tutorial runs SHERLOCK end to end on a published perturbation screen and
-loads a pretrained checkpoint when one is available, so the analysis can be
-followed without retraining.
+The three tutorials cover the experimental designs SHERLOCK supports. Each one
+runs end to end on a published screen and loads a pretrained model when one is
+available, so the analysis can be followed without retraining.
 
-- :doc:`replogle`: genome-scale CRISPRi Perturb-seq. Perturbation groups, their
-  agreement with annotated pathways, counterfactual effects and downstream
-  targets.
-- :doc:`gbm_drug_conditions`: 11 kinase inhibitors in glioblastoma cells with
-  and without cytotoxic T cells. How each drug's effect depends on the T-cell
-  condition, and which downstream genes two drugs share in each condition.
-- :doc:`norman_combinatorial`: combinatorial CRISPRa Perturb-seq. Prediction of
-  combinations held out from training and classification of genetic
-  interactions.
+.. list-table::
+   :header-rows: 1
+   :widths: 30 35 35
+
+   * - Design
+     - Tutorial
+     - Data
+   * - One perturbation per cell
+     - :doc:`single_perturbations`
+     - Genome-scale CRISPRi Perturb-seq in K562 cells (Replogle et al.)
+   * - One perturbation per cell, under several conditions
+     - :doc:`conditional_perturbations`
+     - 11 kinase inhibitors in glioblastoma cells, with and without cytotoxic
+       T cells (Shi et al.)
+   * - One or two perturbations per cell
+     - :doc:`combinatorial_perturbations`
+     - Combinatorial CRISPRa Perturb-seq in K562 cells (Norman et al.)
+
+The Replogle and Norman datasets are downloaded by ``slk.datasets.replogle()``
+and ``slk.datasets.norman()``; the glioblastoma dataset is available from the
+corresponding authors on request.
 
 .. toctree::
    :maxdepth: 1
 
-   replogle
-   gbm_drug_conditions
-   norman_combinatorial
+   single_perturbations
+   conditional_perturbations
+   combinatorial_perturbations

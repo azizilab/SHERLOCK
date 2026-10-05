@@ -27,17 +27,17 @@ Tutorials at a glance
    :widths: 30 35 35
 
    * - Tutorial
+     - Design
      - Data
-     - Analyses
-   * - :doc:`tutorials/replogle`
-     - Genome-scale CRISPRi Perturb-seq (K562)
-     - perturbation groups, counterfactual effects, downstream targets
-   * - :doc:`tutorials/gbm_drug_conditions`
-     - 11 kinase inhibitors in glioblastoma cells, with and without T cells (sci-Plex)
-     - condition-dependent drug responses
-   * - :doc:`tutorials/norman_combinatorial`
-     - Combinatorial CRISPRa Perturb-seq (K562)
-     - held-out combinations, genetic-interaction classes
+   * - :doc:`tutorials/single_perturbations`
+     - one perturbation per cell
+     - genome-scale CRISPRi Perturb-seq (Replogle et al.)
+   * - :doc:`tutorials/conditional_perturbations`
+     - one perturbation per cell, under several conditions
+     - kinase inhibitors in glioblastoma cells with and without T cells (Shi et al.)
+   * - :doc:`tutorials/combinatorial_perturbations`
+     - one or two perturbations per cell
+     - combinatorial CRISPRa Perturb-seq (Norman et al.)
 
 Reproducing the manuscript
 --------------------------

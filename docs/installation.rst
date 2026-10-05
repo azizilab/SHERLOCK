@@ -54,6 +54,26 @@ From source
    cd SHERLOCK
    pip install -e ".[tutorials]"
 
+The repository folder is itself the ``sherlock`` package. The analysis notebooks
+in ``notebooks/`` import the installed package, so install it this way before
+running them.
+
+Datasets
+--------
+
+The two public datasets used in the tutorials are downloaded on first use:
+
+.. code-block:: python
+
+   import sherlock as slk
+
+   adata = slk.datasets.replogle()   # ~570 MB
+   adata = slk.datasets.norman()     # ~1.7 GB
+
+Files are stored in ``$SHERLOCK_DATA_DIR`` (default ``~/.cache/sherlock``). The
+processed versions of the other datasets analysed in the manuscript are available
+from the corresponding authors on request.
+
 Conda
 -----
 

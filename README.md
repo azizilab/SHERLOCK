@@ -86,36 +86,52 @@ with `combinatorial=True, synergy=True`. See the
 
 ## Tutorials
 
-| Tutorial | Data | Analyses |
+| Design | Tutorial | Data |
 |---|---|---|
-| [Replogle](https://sherlock-perturb.readthedocs.io/en/latest/tutorials/replogle.html) | genome-scale CRISPRi Perturb-seq, K562 (Replogle et al. 2022) | perturbation groups vs annotated pathways, counterfactual effects, downstream targets, enrichment |
-| [Glioblastoma drugs ± T cells](https://sherlock-perturb.readthedocs.io/en/latest/tutorials/gbm_drug_conditions.html) | 11 kinase inhibitors in BT333 cells with and without cytotoxic T cells, sci-Plex (Shi et al. 2026) | condition-dependent drug responses, shared downstream genes per condition |
-| [Norman](https://sherlock-perturb.readthedocs.io/en/latest/tutorials/norman_combinatorial.html) | combinatorial CRISPRa Perturb-seq, K562 (Norman et al. 2019) | held-out combinations, genetic-interaction classification |
+| One perturbation per cell | [Single perturbations](https://sherlock-perturb.readthedocs.io/en/latest/tutorials/single_perturbations.html) | genome-scale CRISPRi Perturb-seq, K562 (Replogle et al. 2022) |
+| One perturbation per cell, under several conditions | [Single perturbations across conditions](https://sherlock-perturb.readthedocs.io/en/latest/tutorials/conditional_perturbations.html) | 11 kinase inhibitors in BT333 glioblastoma cells with and without cytotoxic T cells, sci-Plex (Shi et al. 2026) |
+| One or two perturbations per cell | [Combinatorial perturbations](https://sherlock-perturb.readthedocs.io/en/latest/tutorials/combinatorial_perturbations.html) | combinatorial CRISPRa Perturb-seq, K562 (Norman et al. 2019) |
 
 The tutorial notebooks are in [`docs/tutorials/`](docs/tutorials).
 
+## Datasets
+
+The processed Replogle and Norman datasets are downloaded on first use:
+
+```python
+adata = slk.datasets.replogle()   # ~570 MB
+adata = slk.datasets.norman()     # ~1.7 GB
+```
+
+Files are stored in `$SHERLOCK_DATA_DIR` (default `~/.cache/sherlock`); pass `path=` to read a
+local copy instead. The processed versions of the other datasets analysed in the manuscript
+(Perturb-RAEFISH, EGFR inhibitor screen, glioblastoma kinome and kinase-inhibitor screens) are
+available from the corresponding authors on request.
+
 ## Repository structure
 
+The repository root is the `sherlock` package:
+
 ```
-├── sherlock/            # the package
-│   ├── tools/           #   models, training, evaluation, clustering, interaction scoring (slk.tl)
-│   ├── preprocessing/   #   label preparation and observed treatment effects (slk.pp)
-│   ├── plotting/        #   plots (slk.pl)
-│   ├── datasets/        #   example data loaders (slk.datasets)
-│   └── notebooks/       #   analysis notebooks for every dataset in the manuscript
-│       ├── replogle_analysis.ipynb, benchmarking.ipynb
-│       ├── raefish/     #   spatial CRISPR screen
-│       ├── gbm/         #   glioblastoma: EGFR inhibitors, kinome CRISPRi/a, 11 drugs ± T cells
-│       └── norman/      #   combinatorial CRISPRa screen
-├── docs/                # documentation source: guides, API reference, tutorials
-├── tests/               # unit tests
-├── pyproject.toml       # packaging (pip install)
-└── environment.yml      # conda environment
+├── __init__.py, _configs.py
+├── tools/           # models, training, evaluation, clustering, interaction scoring (slk.tl)
+├── preprocessing/   # label preparation and observed treatment effects (slk.pp)
+├── plotting/        # plots (slk.pl)
+├── datasets/        # dataset loaders (slk.datasets); downloaded data is not tracked
+├── notebooks/       # analysis notebooks for every dataset in the manuscript
+│   ├── replogle_analysis.ipynb, benchmarking.ipynb
+│   ├── raefish/     # spatial CRISPR screen
+│   ├── gbm/         # glioblastoma: EGFR inhibitors, kinome CRISPRi/a, 11 drugs ± T cells
+│   └── norman/      # combinatorial CRISPRa screen
+├── docs/            # documentation source: guides, API reference, tutorials
+├── tests/           # unit tests
+├── pyproject.toml   # packaging (pip install)
+└── environment.yml  # conda environment
 ```
 
-The analysis notebooks in `sherlock/notebooks/` run every analysis in the manuscript; they read
-inputs from `sherlock/datasets/` (not tracked by git). A version organized by figure, with
-instructions for obtaining the data and saved models, is in
+The notebooks import the installed package, so run `pip install -e .` in the repository root
+before opening them. They read their inputs from `datasets/`. A version organized by figure,
+with instructions for obtaining the data and saved models, is in
 [azizilab/SHERLOCK_Reproducibility](https://github.com/azizilab/SHERLOCK_Reproducibility).
 
 ## Citation
