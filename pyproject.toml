@@ -61,15 +61,21 @@ Documentation = "https://sherlock-perturb.readthedocs.io"
 Source = "https://github.com/azizilab/SHERLOCK"
 Reproducibility = "https://github.com/azizilab/SHERLOCK_Reproducibility"
 
-[tool.setuptools.packages.find]
-include = ["sherlock*"]
-# Analysis notebooks, datasets and cached results live inside the source tree
-# for development but are not part of the installed package.
-exclude = ["sherlock.notebooks*", "sherlock.results*", "sherlock.benchmark*", "sherlock.datasets.gbm*",
-           "sherlock.datasets.norman*", "sherlock.datasets.raefish*"]
-
 [tool.setuptools]
+# The repository root is the `sherlock` package. Only the listed subpackages are
+# installed; notebooks, docs, tests and data in the checkout are not.
+package-dir = { "sherlock" = "." }
+packages = [
+    "sherlock",
+    "sherlock.datasets",
+    "sherlock.plotting",
+    "sherlock.preprocessing",
+    "sherlock.tools",
+]
 include-package-data = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The repository root is itself the package, so import test modules without
+# adding their parent directories to sys.path.
+addopts = "--import-mode=importlib"

@@ -5,11 +5,21 @@ import re
 import sys
 
 # -- Path setup --------------------------------------------------------------
-# conf.py lives in docs/; the repository root (which contains the `sherlock`
-# package) is one level up.
+# conf.py lives in docs/, and the repository root one level up *is* the
+# `sherlock` package. The docs build does not install the package, so expose the
+# root under the name `sherlock` through a symlink in the build directory.
+import tempfile
+
 _root = os.path.abspath("..")
-if _root not in sys.path:
-    sys.path.insert(0, _root)
+_shim = os.path.join(tempfile.gettempdir(), "sherlock-docs-path")
+os.makedirs(_shim, exist_ok=True)
+_link = os.path.join(_shim, "sherlock")
+if os.path.realpath(_link) != _root:
+    if os.path.islink(_link):
+        os.unlink(_link)
+    os.symlink(_root, _link)
+if _shim not in sys.path:
+    sys.path.insert(0, _shim)
 
 # -- Project information -----------------------------------------------------
 project = "SHERLOCK"

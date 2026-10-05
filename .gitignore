@@ -1,21 +1,30 @@
 __pycache__/
 .DS_Store
-sherlock/datasets/*
-sherlock/results/*
-sherlock/benchmark/*
-sherlock/notebooks/results/*
-sherlock/notebooks/figures/*
-sherlock/notebooks/norman/results/*
-sherlock/notebooks/gbm/results/*
+.ipynb_checkpoints/
+.claude/
+
+# Datasets are downloaded (slk.datasets) or obtained from the authors; only the loader code is tracked
+datasets/*
+!datasets/__init__.py
+!datasets/_datasets.py
+
+# Saved models and outputs written by the notebooks and tutorials
+results/
+notebooks/results/
+notebooks/figures/
+notebooks/norman/results/
+notebooks/gbm/results/
 
 # Local data, model checkpoints, and reference files
-sherlock/notebooks/data/
-sherlock/notebooks/norman/data/
-sherlock/notebooks/norman/gears_*/
-sherlock/notebooks/norman/genetic_interactions.csv
+notebooks/data/
+notebooks/norman/data/
+notebooks/norman/gears_*/
 *.pdf
 *.bak*
-.claude/
+
+# Older local code that is not part of the package
+benchmark/
+io/
 
 # Packaging and docs builds
 build/
@@ -23,7 +32,3 @@ dist/
 *.egg-info/
 docs/_build/
 docs/api/generated/
-.ipynb_checkpoints/
-
-# Outputs written by the tutorials
-results/
