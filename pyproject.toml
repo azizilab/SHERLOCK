@@ -57,7 +57,7 @@ all = ["sherlock-perturb[benchmarks,tutorials,test]"]
 
 [project.urls]
 Homepage = "https://github.com/azizilab/SHERLOCK"
-Documentation = "https://sherlock-perturb.readthedocs.io"
+Documentation = "https://azizilabsherlock.readthedocs.io"
 Source = "https://github.com/azizilab/SHERLOCK"
 Reproducibility = "https://github.com/azizilab/SHERLOCK_Reproducibility"
 

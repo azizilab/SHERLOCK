@@ -1,6 +1,6 @@
 # SHERLOCK: structured representation learning and causal inference of downstream perturbation effects
 
-[![Documentation Status](https://readthedocs.org/projects/sherlock-perturb/badge/?version=latest)](https://sherlock-perturb.readthedocs.io/en/latest/)
+[![Documentation Status](https://readthedocs.org/projects/azizilabsherlock/badge/?version=latest)](https://azizilabsherlock.readthedocs.io/en/latest/)
 
 SHERLOCK (Single-cell Hierarchical Embedding of peRturbations and Learning Of Causal Knowledge) is
 an interpretable deep generative framework for single-cell perturbation data. It models each
@@ -15,7 +15,7 @@ factors. From the fitted model you can
 - **compose single perturbations** to predict combinations, including unseen ones, and classify
   genetic interactions.
 
-📖 **Documentation:** https://sherlock-perturb.readthedocs.io
+📖 **Documentation:** https://azizilabsherlock.readthedocs.io
 
 ## Installation
 
@@ -47,7 +47,7 @@ pip install -e ".[tutorials]"          # or: conda env create -f environment.yml
 ```
 
 Install PyTorch first if you need a specific CUDA build ([pytorch.org](https://pytorch.org/get-started/locally/)).
-See the [installation guide](https://sherlock-perturb.readthedocs.io/en/latest/installation.html)
+See the [installation guide](https://azizilabsherlock.readthedocs.io/en/latest/installation.html)
 for details.
 
 ## Quickstart
@@ -82,15 +82,15 @@ slk.tl.save_results(out, "sherlock_model.pth")
 For screens with conditions, also pass `treatment_key` and `untreated_label` to
 `slk_prepare_data` and train with `use_conditions=True`. For combinations (`A+B` labels), train
 with `combinatorial=True, synergy=True`. See the
-[API reference](https://sherlock-perturb.readthedocs.io/en/latest/api/index.html).
+[API reference](https://azizilabsherlock.readthedocs.io/en/latest/api/index.html).
 
 ## Tutorials
 
 | Design | Tutorial | Data |
 |---|---|---|
-| One perturbation per cell | [Single perturbations](https://sherlock-perturb.readthedocs.io/en/latest/tutorials/single_perturbations.html) | genome-scale CRISPRi Perturb-seq, K562 (Replogle et al. 2022) |
-| One perturbation per cell, under several conditions | [Single perturbations across conditions](https://sherlock-perturb.readthedocs.io/en/latest/tutorials/conditional_perturbations.html) | 11 kinase inhibitors in BT333 glioblastoma cells with and without cytotoxic T cells, sci-Plex (Shi et al. 2026) |
-| One or two perturbations per cell | [Combinatorial perturbations](https://sherlock-perturb.readthedocs.io/en/latest/tutorials/combinatorial_perturbations.html) | combinatorial CRISPRa Perturb-seq, K562 (Norman et al. 2019) |
+| One perturbation per cell | [Single perturbations](https://azizilabsherlock.readthedocs.io/en/latest/tutorials/single_perturbations.html) | genome-scale CRISPRi Perturb-seq, K562 (Replogle et al. 2022) |
+| One perturbation per cell, under several conditions | [Single perturbations across conditions](https://azizilabsherlock.readthedocs.io/en/latest/tutorials/conditional_perturbations.html) | 11 kinase inhibitors in BT333 glioblastoma cells with and without cytotoxic T cells, sci-Plex (Shi et al. 2026) |
+| One or two perturbations per cell | [Combinatorial perturbations](https://azizilabsherlock.readthedocs.io/en/latest/tutorials/combinatorial_perturbations.html) | combinatorial CRISPRa Perturb-seq, K562 (Norman et al. 2019) |
 
 The tutorial notebooks are in [`docs/tutorials/`](docs/tutorials).
 
