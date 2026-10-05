@@ -9,9 +9,9 @@ Pip
 
 .. code-block:: bash
 
-   pip install sherlock-perturb
+   pip install azizilab-sherlock
 
-The distribution is called ``sherlock-perturb``; the package is imported as
+The distribution is called ``azizilab-sherlock``; the package is imported as
 ``sherlock``:
 
 .. code-block:: python
@@ -43,7 +43,7 @@ Optional extras
 
 .. code-block:: bash
 
-   pip install "sherlock-perturb[tutorials]"
+   pip install "azizilab-sherlock[tutorials]"
 
 From source
 -----------

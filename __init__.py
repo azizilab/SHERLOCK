@@ -5,7 +5,7 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Optional
 
 try:
-    __version__ = version("sherlock-perturb")
+    __version__ = version("azizilab-sherlock")
 except PackageNotFoundError:  # running from a source checkout without `pip install`
     __version__ = "0.1.0"
 

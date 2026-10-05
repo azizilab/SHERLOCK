@@ -19,11 +19,11 @@ factors. From the fitted model you can
 
 ## Installation
 
-SHERLOCK requires Python ≥ 3.10 and is published on PyPI as `sherlock-perturb`; the package is
+SHERLOCK requires Python ≥ 3.10 and is published on PyPI as `azizilab-sherlock`; the package is
 imported as `sherlock`.
 
 ```bash
-pip install sherlock-perturb
+pip install azizilab-sherlock
 ```
 
 Optional extras:
@@ -35,7 +35,7 @@ Optional extras:
 | `all` | `tutorials`, `benchmarks` and `test` |
 
 ```bash
-pip install "sherlock-perturb[tutorials]"
+pip install "azizilab-sherlock[tutorials]"
 ```
 
 To install from source, or with conda:

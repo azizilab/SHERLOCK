@@ -17,7 +17,7 @@ from ._gears import (
 )
 
 # Baseline models (cVAE, sVAE, contrastiveVI, scGen) depend on scvi-tools, which is an
-# optional dependency (`pip install sherlock-perturb[benchmarks]`). They are imported on
+# optional dependency (`pip install azizilab-sherlock[benchmarks]`). They are imported on
 # first use so that `import sherlock` works without it.
 _BASELINES = {
     "cVAE": ("._cvae", "cVAE"),
@@ -37,7 +37,7 @@ def __getattr__(name):
         except ImportError as err:
             raise ImportError(
                 f"sherlock.tl.{name} is a benchmarking baseline and needs scvi-tools. "
-                "Install it with `pip install sherlock-perturb[benchmarks]`."
+                "Install it with `pip install azizilab-sherlock[benchmarks]`."
             ) from err
         globals()[name] = value
         return value

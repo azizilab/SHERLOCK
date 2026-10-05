@@ -1,5 +1,5 @@
 # Runtime dependencies of SHERLOCK (also declared in pyproject.toml).
-# `pip install sherlock-perturb` or `pip install -e .` installs these automatically;
+# `pip install azizilab-sherlock` or `pip install -e .` installs these automatically;
 # this file is provided for environments that install dependencies separately.
 torch>=2.1
 pyro-ppl>=1.9
