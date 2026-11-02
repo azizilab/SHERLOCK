@@ -156,3 +156,6 @@ _SHERLOCK: Structured representation learning and causal inference of downstream
 
 This work is licensed under a [Creative Commons Attribution-NonCommercial-NoDerivatives 4.0
 International License](LICENSE).
+
+## IP Disclosure
+M.Z., J.D.M., L.S., J.L.M and E.A. are inventors on a provisional patent application related to the methods described in this work. 
